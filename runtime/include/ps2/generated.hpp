@@ -8,6 +8,23 @@
 
 #include <cstdint>
 
+// Jumps between generated units must be guaranteed tail calls, or a game that
+// bounces between units grows the host stack until it overflows. Clang has
+// had musttail for years; GCC gained it in version 15, which is what the
+// Switch toolchain (devkitA64) needs to be at least.
+#if defined(__clang__)
+#define PS2_MUSTTAIL [[clang::musttail]]
+#elif defined(__GNUC__) && __GNUC__ >= 15
+#define PS2_MUSTTAIL [[gnu::musttail]]
+#elif defined(PS2_ALLOW_SIBCALL)
+// Opt-in for older compilers: relies on -O2 sibling-call optimization, which
+// is likely but not guaranteed. Only for syntax checks and experiments.
+#define PS2_MUSTTAIL
+#else
+// Fails only where generated code uses it, so the runtime itself still builds.
+#define PS2_MUSTTAIL static_assert(false, "generated code needs guaranteed tail calls: use clang or GCC 15+ (or define PS2_ALLOW_SIBCALL to experiment)");
+#endif
+
 namespace ps2 {
 
 using UnitFn = void (*)(Cpu &, std::uint32_t entry, std::uint32_t depth);

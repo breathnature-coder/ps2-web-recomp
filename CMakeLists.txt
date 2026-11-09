@@ -6,12 +6,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 
+if(NINTENDO_SWITCH)
+    # Set by devkitPro's Switch toolchain file. The generated code needs
+    # guaranteed tail calls ([[gnu::musttail]]), which GCC has from version 15.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15)
+        message(FATAL_ERROR "devkitA64 with GCC 15 or newer is needed (found ${CMAKE_CXX_COMPILER_VERSION}); update with: dkp-pacman -Syu")
+    endif()
+endif()
+
 if(EMSCRIPTEN)
     add_compile_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
     add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
-if(NOT EMSCRIPTEN)
+if(NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     add_executable(eerecomp
         recomp/main.cpp
         recomp/r5900.cpp
@@ -60,7 +68,7 @@ target_include_directories(ps2runtime PUBLIC runtime/include)
 target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
 
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
-if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a"))
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
@@ -84,7 +92,7 @@ if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
 endif()
 
 option(PS2_BUILD_TESTS "Build native synthetic runtime tests (no game data required)" OFF)
-if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN)
+if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     enable_testing()
     foreach(name IN ITEMS sif_scratchpad kernel_exit_delete_thread gt3_initialization gt3_state)
         add_executable(${name}_test tests/${name}_test.cpp)
@@ -92,6 +100,12 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN)
         target_link_libraries(${name}_test PRIVATE ps2runtime)
         add_test(NAME ${name} COMMAND ${name}_test)
     endforeach()
+    # The VU helpers must give bit-identical results on every compiler and CPU
+    # (GT4's replays depend on it); this hash comes from clang and GCC on x86-64.
+    add_executable(vu_ops_diff tests/vu_ops_diff.cpp)
+    target_include_directories(vu_ops_diff PRIVATE runtime/include)
+    add_test(NAME vu_ops_bits COMMAND vu_ops_diff)
+    set_tests_properties(vu_ops_bits PROPERTIES PASS_REGULAR_EXPRESSION "^faeca02bf648188b")
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME gt3_core COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/gt3_core_test.py")
@@ -122,6 +136,20 @@ if(PS2_GENERATED)
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
             --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html --preload-file ${PS2_WEB_ELF}@/game/core.elf)
         set_target_properties(ps2web PROPERTIES SUFFIX ".html" LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/shell.html)
+        return()
+    endif()
+
+    if(NINTENDO_SWITCH)
+        # Homebrew .nro: the desktop runner's main and SDL window, started by
+        # host/switch.cpp with arguments read from the SD card.
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+        add_executable(ps2nx host/switch.cpp host/main.cpp host/window.cpp)
+        target_compile_definitions(ps2nx PRIVATE PS2_WINDOW PS2_MAIN_NAME=ps2_main)
+        target_link_libraries(ps2nx PRIVATE ps2game ps2runtime PkgConfig::SDL2)
+        set(PS2_NX_TITLE "PS2 Recomp" CACHE STRING "Title shown in the homebrew menu")
+        nx_generate_nacp(ps2nx.nacp NAME "${PS2_NX_TITLE}" AUTHOR "ps2-web-recomp" VERSION "0.1")
+        nx_create_nro(ps2nx NACP ps2nx.nacp)
         return()
     endif()
 

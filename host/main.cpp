@@ -30,7 +30,13 @@ int usage() {
 
 }
 
-int main(int argc, char **argv) {
+// The Switch build supplies its own main (host/switch.cpp), which sets up the
+// console and passes its arguments on to this one.
+#ifndef PS2_MAIN_NAME
+#define PS2_MAIN_NAME main
+#endif
+
+int PS2_MAIN_NAME(int argc, char **argv) {
     if (argc < 2) return usage();
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false, fullscreen = false;

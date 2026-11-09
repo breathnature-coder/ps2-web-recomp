@@ -395,8 +395,25 @@ PS2_VU_INLINE v4u vload(const Reg128 &r) {
 PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+// Clang's elementwise builtins are not available in GCC, which devkitA64 (the
+// Switch toolchain) uses; these fall back to plain vector-extension code there.
+PS2_VU_INLINE v4i vmin_i(v4i a, v4i b) {
+#if defined(__clang__)
+    return __builtin_elementwise_min(a, b);
+#else
+    const v4i lt = a < b;
+    return (a & lt) | (b & ~lt);
+#endif
+}
+PS2_VU_INLINE bool vany(v4i m) {
+#if defined(__clang__)
+    return __builtin_reduce_or(m) != 0;
+#else
+    return (m[0] | m[1] | m[2] | m[3]) != 0;
+#endif
+}
 PS2_VU_INLINE v4u vfix(v4u x) {
-    const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
+    const v4i clamped = vmin_i((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
     return (x & 0x80000000u) | (v4u)(clamped & normal);
 }
@@ -441,7 +458,7 @@ PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
 PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
     const v4i v = (v4i)x;
     v4f f = __builtin_convertvector(v, v4f);
-    if (__builtin_reduce_or((v4i)(x + 0x01000000u > 0x02000000u))) {
+    if (vany((v4i)(x + 0x01000000u > 0x02000000u))) {
         const v4i big = f >= 2147483648.0f;
         const v4i back = __builtin_convertvector((v4f)((v4i)f & ~big), v4i);
         const v4i over = big | ((v >= 0) & (back > v)) | ((v < 0) & (back < v));

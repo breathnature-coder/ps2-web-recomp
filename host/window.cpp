@@ -3,9 +3,13 @@
 #include "ps2/system.hpp"
 
 #include <SDL.h>
+#ifdef __SWITCH__
+#include <pthread.h>
+#else
 #include <SDL_syswm.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 #ifdef __APPLE__
 #include <SDL_metal.h>
 #include <mach/mach.h>
@@ -79,6 +83,11 @@ bool create_renderer() {
 }
 
 bool attach_gpu() {
+#ifdef __SWITCH__
+    // No GPU renderer on the Switch yet: frames come from the software GS and
+    // are shown through SDL. The OpenGL compute backend will attach here.
+    return false;
+#else
     if (std::getenv("PS2_SDL_RENDERER")) return false;
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
@@ -118,6 +127,7 @@ bool attach_gpu() {
     default: return false;
     }
     return ps2::attach_window(target);
+#endif
 }
 
 std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
@@ -288,12 +298,19 @@ void pace() {
 }
 
 double process_cpu_seconds() {
+#ifdef __SWITCH__
+    return 0.0;
+#else
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
     return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+#endif
 }
 
 double resident_mb() {
+#ifdef __SWITCH__
+    return 0.0;
+#else
 #ifdef __APPLE__
     mach_task_basic_info_data_t task{};
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
@@ -306,6 +323,7 @@ double resident_mb() {
         std::fclose(f);
     }
     return static_cast<double>(resident) * static_cast<double>(sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
+#endif
 }
 
 void show_speed() {
@@ -362,6 +380,38 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
 
 }
 
+#ifdef __SWITCH__
+// Defined in host/switch.cpp: undoes the CPU boost and the awake state, since
+// the exit below skips everything after ps2_main returns.
+void ps2_switch_before_exit();
+
+// libnx gives new threads small stacks, while the generated code can nest up
+// to kMaxDepth unit calls deep, so the Switch starts its threads explicitly
+// with the 16 MiB stack the browser build uses too.
+static void start_thread(void (*body)(void *), void *arg) {
+    struct Start {
+        void (*body)(void *);
+        void *arg;
+    };
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    pthread_t thread;
+    auto *start = new Start{body, arg};
+    if (pthread_create(&thread, &attr, [](void *p) -> void * {
+            const Start s = *static_cast<Start *>(p);
+            delete static_cast<Start *>(p);
+            s.body(s.arg);
+            return nullptr;
+        }, start) != 0) {
+        std::fprintf(stderr, "[window] cannot start a thread\n");
+        std::abort();
+    }
+    pthread_detach(thread);
+    pthread_attr_destroy(&attr);
+}
+#endif
+
 bool open_window(bool fullscreen) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
@@ -373,7 +423,12 @@ bool open_window(bool fullscreen) {
     const Uint32 metal = 0u;
 #endif
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | metal | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
+#ifdef __SWITCH__
+    // The Switch has one screen: always 1280x720, and SDL letterboxes 4:3.
+    g_window = SDL_CreateWindow("ps2-web-recomp", 0, 0, 1280, 720, SDL_WINDOW_FULLSCREEN);
+#else
     g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
+#endif
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
@@ -412,22 +467,45 @@ int run_window(const std::function<int()> &emulate) {
     ps2::start_render_thread();
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
+#ifdef __SWITCH__
+        start_thread([](void *) { ps2::run_vu_thread(); }, nullptr);
+#else
         std::thread(ps2::run_vu_thread).detach();
+#endif
     }
     std::atomic<bool> done{false};
     int result = 0;
+#ifdef __SWITCH__
+    struct Emulation {
+        const std::function<int()> *emulate;
+        int *result;
+        std::atomic<bool> *done;
+    } job{&emulate, &result, &done};
+    start_thread([](void *p) {
+        auto *j = static_cast<Emulation *>(p);
+        *j->result = (*j->emulate)();
+        j->done->store(true);
+        ps2::wake_render_thread();
+    }, &job);
+#else
     std::thread emulation([&] {
         result = emulate();
         done.store(true);
         ps2::wake_render_thread();
     });
+#endif
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
     while (!done.load()) {
         poll();
         if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);
     }
+#ifndef __SWITCH__
     emulation.join();
+#endif
     SDL_Quit();
     std::fflush(nullptr);
+#ifdef __SWITCH__
+    ps2_switch_before_exit();
+#endif
     std::_Exit(result);
 }
