@@ -214,7 +214,6 @@ bool create_context() {
 using Clock = std::chrono::steady_clock;
 
 struct Stats {
-    bool on = std::getenv("PS2_GL_STATS") != nullptr;
     Clock::time_point since = Clock::now();
     std::uint64_t dispatches = 0, submits = 0, writes = 0, write_bytes = 0, reads = 0, read_bytes = 0, copies = 0, presents = 0, binds = 0,
                   binds_skipped = 0;
@@ -228,6 +227,13 @@ struct Stats {
     std::vector<GLuint> free_queries;
     std::deque<std::pair<GLuint, std::size_t>> queries;  // in flight: query, entry index
 } g_stats;
+
+// Asked at first use, not when the program loads: the Switch launcher sets
+// environment variables from args.txt in main, after global initializers ran.
+bool stats_on() {
+    static const bool on = std::getenv("PS2_GL_STATS") != nullptr;
+    return on;
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -253,7 +259,7 @@ void collect_queries(bool wait) {
 }
 
 void report_stats() {
-    if (!g_stats.on) return;
+    if (!stats_on()) return;
     const double elapsed = ms_since(g_stats.since);
     if (elapsed < 1000.0) return;
     collect_queries(false);
@@ -635,7 +641,7 @@ void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, uint32_t
     p->encoder->ops.push_back([x, y, z, name] {
         GLuint query = 0;
         std::size_t entry = 0;
-        if (g_stats.on) {
+        if (stats_on()) {
             entry = stats_entry(name);
             ++g_stats.entries[entry].count;
             if (g_stats.free_queries.empty()) {
