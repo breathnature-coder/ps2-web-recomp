@@ -14,6 +14,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 usage() {
   cat <<'EOF'
 usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--record] [--title TEXT]
+                               [--docker [IMAGE]] [--gl-driver nvc0|zink]
 
   <name>        the name given to scripts/port.sh; generated/<name> must exist
   --with-disc   also copy games/<name>/disc.iso into the SD folder (large; an
@@ -27,12 +28,22 @@ usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--record]
                 (into vu1/ and misses.txt on the card); bring them back with
                 scripts/import_switch_run.sh to have them compiled in
   --title TEXT  name shown in the homebrew menu
+  --docker [IMAGE]  build inside a container that carries a newer Mesa for the
+                Switch (default ghcr.io/danfromtico/switch-dev: Mesa 26 with
+                nvc0 OpenGL, and Zink on the NVK Vulkan driver) instead of the
+                local devkitPro with Mesa 20.1. Output goes to
+                build/switch-<name>-mesa26. Experimental.
+  --gl-driver D with --docker: which OpenGL driver the console uses, nvc0
+                (default) or zink (OpenGL on Vulkan); it is one line in
+                args.txt (@env MESA_SWITCH_GL_DRIVER=...), so it can also be
+                changed on the card without rebuilding
 EOF
 }
 
 [ $# -ge 1 ] || { usage; exit 2; }
 name="$1"; shift
-with_disc=0; log=0; stats=0; record=0; title=""
+with_disc=0; log=0; stats=0; record=0; title=""; docker_image=""; gl_driver=""; gl="${PS2_SWITCH_GL:-legacy}"; suffix="${PS2_SWITCH_SUFFIX:-}"
+args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-disc) with_disc=1 ;;
@@ -41,15 +52,32 @@ while [ $# -gt 0 ]; do
     --stats) stats=1; log=1 ;;
     --record) record=1 ;;
     --title) title="$2"; shift ;;
+    --docker) docker_image="ghcr.io/danfromtico/switch-dev"; if [ $# -gt 1 ] && [ "${2#--}" = "$2" ]; then docker_image="$2"; shift; fi ;;
+    --gl-driver) gl_driver="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
   shift
 done
 
+if [ -n "$docker_image" ]; then
+  # Run this same script inside the container, on the repository mounted at the same path.
+  inner=()
+  skip=0
+  for a in "${args[@]}"; do
+    if [ "$skip" = 1 ]; then skip=0; [ "${a#--}" = "$a" ] && continue; fi
+    if [ "$a" = "--docker" ]; then skip=1; continue; fi
+    inner+=("$a")
+  done
+  proxy=()
+  for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do [ -n "${!v:-}" ] && proxy+=(-e "$v=${!v}"); done
+  exec docker run --rm "${proxy[@]}" -e PS2_SWITCH_GL=pkgconfig -e PS2_SWITCH_SUFFIX=-mesa26 -u "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$ROOT:$ROOT" -w "$ROOT" "$docker_image" bash "$ROOT/scripts/build_switch.sh" "$name" "${inner[@]}"
+fi
+
 game="$ROOT/games/$name"
 generated="$ROOT/generated/$name"
-out="$ROOT/build/switch-$name"
+out="$ROOT/build/switch-$name$suffix"
 [ -d "$generated" ] && compgen -G "$generated/*.cpp" > /dev/null || {
   echo "generated/$name has no translated code; run scripts/port.sh $name <disc image> --native-only first" >&2; exit 1; }
 
@@ -79,7 +107,7 @@ fi
 [ -f "$elf" ] || { echo "cannot find the translated executable for $name" >&2; exit 1; }
 
 echo "== configure"
-cmake_args=(-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED="$generated")
+cmake_args=(-DCMAKE_BUILD_TYPE=Release -DPS2_GENERATED="$generated" -DPS2_SWITCH_GL="$gl")
 [ -n "$title" ] && cmake_args+=(-DPS2_NX_TITLE="$title")
 cmake -S "$ROOT" -B "$out" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$toolchain" "${cmake_args[@]}" > "$out.configure.log" 2>&1 \
   || { tail -30 "$out.configure.log"; exit 1; }
@@ -106,6 +134,7 @@ cp "$elf" "$sd/$(basename "$elf")"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
   [ "$log" = 1 ] && echo "@log"
   [ "$stats" = 1 ] && echo "@env PS2_GL_STATS=1"
+  [ -n "$gl_driver" ] && echo "@env MESA_SWITCH_GL_DRIVER=$gl_driver"
   if [ "$record" = 1 ]; then echo "@env PS2_VU_RECORD=vu1"; echo "--misses misses.txt"; fi
 } > "$sd/args.txt"
 if [ "$with_disc" = 1 ]; then
