@@ -371,7 +371,12 @@ void show_speed() {
         const std::size_t used = std::strlen(title);
         std::snprintf(title + used, sizeof title - used, "  vu1 interpreted %.0f/s", static_cast<double>(interpreted - interpreted_start) / seconds);
     }
+#ifdef __SWITCH__
+    // No title bar on the console: once a second into the log (args.txt: @log).
+    std::fprintf(stderr, "[speed]%s\n", title + std::strlen("ps2-web-recomp"));
+#else
     SDL_SetWindowTitle(g_window, title);
+#endif
     start = now;
     frames = 0;
     emu_start = emu;
