@@ -38,7 +38,7 @@
 
 ### 第 3 阶段：性能
 - 线程绑核：EE、VU1、GS 线程各占一个 Switch 应用核（0 到 2 号）。
-- 用 1 倍内部分辨率，打开 `@boost`（1785 MHz），视情况调节 GPU 频率。
+- 用 1 倍内部分辨率，用 sys-clk 之类的超频工具提高 CPU 和 GPU 频率。不要用系统的快速加载模式（`@fastload`）：它把 CPU 提到 1785 MHz，但 GPU 会降到 76.8 MHz。
 - 探索阶段要尽量覆盖赛道和车辆，让更多 VU 程序被预编译，少走解释器。
 - 先实测再定目标；在跑出第 1 和第 2 阶段之前，帧率估计没有意义。
 
@@ -54,10 +54,10 @@
    scripts/port.sh gt4 "Gran Turismo 4.iso" --native-only
    ```
    先在电脑上用 `build/native-gt4/ps2run ... --window` 确认能玩，再上 Switch。原生窗口需要 SDL2 开发包。
-2. **装 devkitPro**：`dkp-pacman -S switch-dev switch-sdl2`。devkitA64 的 GCC 必须是 15 以上（`aarch64-none-elf-gcc --version`）。
+2. **装 devkitPro**：`dkp-pacman -S switch-dev switch-sdl2 switch-mesa`。devkitA64 的 GCC 必须是 15 以上（`aarch64-none-elf-gcc --version`）。
 3. **构建 Switch 版**：
    ```bash
-   scripts/build_switch.sh gt4 --boost --log
+   scripts/build_switch.sh gt4 --log
    ```
    然后把 `build/switch-gt4/sd/` 里的内容复制到 SD 卡根目录，再把光盘镜像复制成 `switch/ps2recomp/gt4.iso`。GT4 是双层 DVD，镜像超过 4 GiB，SD 卡要用 exFAT 格式。
 4. **启动**：在任意游戏上按住 R 进入自制程序菜单（应用模式），再打开 ps2recomp。从相册进入的话内存不够。

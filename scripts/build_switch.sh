@@ -5,20 +5,22 @@
 #   scripts/port.sh gt4 "Gran Turismo 4.iso" --native-only   # on the PC, once
 #   scripts/build_switch.sh gt4 [--with-disc]
 #
-# Needs devkitPro with switch-dev and switch-sdl2 (dkp-pacman -S switch-dev
-# switch-sdl2) and a devkitA64 whose GCC is version 15 or newer. Everything it
+# Needs devkitPro with switch-dev, switch-sdl2 and switch-mesa (dkp-pacman -S
+# switch-dev switch-sdl2 switch-mesa) and a devkitA64 whose GCC is version 15 or newer. Everything it
 # produces contains the game's translated code: keep it on your own devices.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
   cat <<'EOF'
-usage: scripts/build_switch.sh <name> [--with-disc] [--boost] [--log] [--title TEXT]
+usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--title TEXT]
 
   <name>        the name given to scripts/port.sh; generated/<name> must exist
   --with-disc   also copy games/<name>/disc.iso into the SD folder (large; an
                 SD card formatted FAT32 cannot hold files over 4 GiB, use exFAT)
-  --boost       run the CPU at 1785 MHz while playing
+  (no clock option: the system's boost mode slows the GPU to 76.8 MHz; raise
+   clocks with an overclocking tool such as sys-clk, or add @fastload to
+   args.txt only to test whether a scene is CPU-bound)
   --log         write the runner's output to log.txt on the SD card
   --title TEXT  name shown in the homebrew menu
 EOF
@@ -26,11 +28,11 @@ EOF
 
 [ $# -ge 1 ] || { usage; exit 2; }
 name="$1"; shift
-with_disc=0; boost=0; log=0; title=""
+with_disc=0; log=0; title=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-disc) with_disc=1 ;;
-    --boost) boost=1 ;;
+    --boost) echo "--boost is gone: the system boost mode slows the GPU to 76.8 MHz; use sys-clk or similar" >&2 ;;
     --log) log=1 ;;
     --title) title="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -96,7 +98,6 @@ cp "$elf" "$sd/$(basename "$elf")"
   echo "# @env PS2_GS=cpu      software renderer, for comparison"
   echo "# @env PS2_SCALE=2     twice the PS2 resolution inside (slower)"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
-  [ "$boost" = 1 ] && echo "@boost"
   [ "$log" = 1 ] && echo "@log"
 } > "$sd/args.txt"
 if [ "$with_disc" = 1 ]; then

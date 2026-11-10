@@ -17,7 +17,10 @@
 // writes this file and lays out the folder.
 //
 // A few lines are understood by this launcher rather than the runner:
-//   @boost            run the CPU at 1785 MHz (the "fast load" boost mode)
+//   @fastload         the system's loading boost: CPU at 1785 MHz but the GPU
+//                     down to 76.8 MHz, so only for telling whether the CPU is
+//                     what holds a scene back. To raise clocks for playing, use
+//                     an overclocking tool such as sys-clk instead.
 //   @log              send stdout/stderr to log.txt in the same folder
 //   @env NAME=VALUE   set an environment variable the runtime reads, such as
 //                     PS2_GS=cpu for the software renderer or PS2_SCALE=2
@@ -58,6 +61,8 @@ std::vector<std::string> split(const std::string &line) {
     return out;
 }
 
+bool g_old_boost = false;  // args.txt from an older build asks for @boost
+
 bool read_args(std::vector<std::string> &args, bool &boost, bool &log) {
     std::FILE *f = std::fopen("args.txt", "r");
     if (!f) return false;
@@ -70,7 +75,8 @@ bool read_args(std::vector<std::string> &args, bool &boost, bool &log) {
         const std::vector<std::string> words = split(line);
         for (std::size_t i = 0; i < words.size(); ++i) {
             const std::string &word = words[i];
-            if (word == "@boost") boost = true;
+            if (word == "@fastload") boost = true;
+            else if (word == "@boost") g_old_boost = true;
             else if (word == "@log") log = true;
             else if (word == "@env" && i + 1 < words.size()) {
                 const std::string &pair = words[++i];
@@ -139,6 +145,7 @@ int main(int, char **) {
         std::freopen("log.txt", "a", stderr);
         std::setvbuf(stderr, nullptr, _IOLBF, 0);
     }
+    if (g_old_boost) std::fprintf(stderr, "[switch] ignoring @boost: it slowed the GPU to 76.8 MHz (see @fastload)\n");
     g_boost = boost;
     if (boost) appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
     // Keep the console awake while a race is on and nobody touches the stick.
