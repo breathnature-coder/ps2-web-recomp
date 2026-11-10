@@ -5,6 +5,7 @@
 #include <SDL.h>
 #ifdef __SWITCH__
 #include <pthread.h>
+#include <switch.h>
 #else
 #include <SDL_syswm.h>
 #include <sys/resource.h>
@@ -84,9 +85,20 @@ bool create_renderer() {
 
 bool attach_gpu() {
 #ifdef __SWITCH__
-    // No GPU renderer on the Switch yet: frames come from the software GS and
-    // are shown through SDL. The OpenGL compute backend will attach here.
+#ifdef PS2_GPU_GL
+    // The OpenGL renderer draws straight into the console's window: a target
+    // with no display and the NWindow as the window is how it is told so.
+    if (std::getenv("PS2_SDL_RENDERER")) return false;
+    ps2::WindowTarget target;
+    target.kind = ps2::WindowTarget::X11;
+    target.display = nullptr;
+    target.window = reinterpret_cast<std::uintptr_t>(nwindowGetDefault());
+    target.width = 1280;
+    target.height = 720;
+    return ps2::attach_window(target);
+#else
     return false;
+#endif
 #else
     if (std::getenv("PS2_SDL_RENDERER")) return false;
     SDL_SysWMinfo info;
@@ -215,6 +227,10 @@ void poll_port(int port) {
 }
 
 void poll() {
+#ifdef __SWITCH__
+    // SDL's video driver answers the HOME menu and exit requests; without an SDL window it is up to us.
+    if (!g_window && !appletMainLoop()) ps2::halt("closed from the HOME menu");
+#endif
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) ps2::halt("window closed");
@@ -413,7 +429,13 @@ static void start_thread(void (*body)(void *), void *arg) {
 #endif
 
 bool open_window(bool fullscreen) {
+#ifdef __SWITCH__
+    // The window is made later, and only if the GPU renderer cannot present:
+    // SDL's renderer and the GPU renderer cannot share the console's window.
+    if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+#else
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+#endif
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
@@ -424,15 +446,14 @@ bool open_window(bool fullscreen) {
 #endif
     const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | metal | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0u);
 #ifdef __SWITCH__
-    // The Switch has one screen: always 1280x720, and SDL letterboxes 4:3.
-    g_window = SDL_CreateWindow("ps2-web-recomp", 0, 0, 1280, 720, SDL_WINDOW_FULLSCREEN);
+    (void)flags;
 #else
     g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, ps2::g_options.widescreen ? 1280 : 960, 720, flags);
-#endif
     if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
+#endif
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_AudioSpec want{}, have{};
     want.freq = 48000;
@@ -453,7 +474,16 @@ bool open_window(bool fullscreen) {
 int run_window(const std::function<int()> &emulate) {
     ps2::init_graphics();
     g_gpu_present = attach_gpu();
-    std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
+    std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through the GPU renderer" : "presenting through SDL");
+#ifdef __SWITCH__
+    if (!g_gpu_present) {
+        // The console has one 1280x720 screen; SDL letterboxes 4:3 into it.
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0 || !(g_window = SDL_CreateWindow("ps2-web-recomp", 0, 0, 1280, 720, SDL_WINDOW_FULLSCREEN))) {
+            std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
+            return 1;
+        }
+    }
+#endif
     if (!g_gpu_present && !create_renderer()) return 1;
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
     if (!threads) {

@@ -68,7 +68,20 @@ target_include_directories(ps2runtime PUBLIC runtime/include)
 target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
 
 set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
-if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a"))
+# The GS GPU renderer: WebGPU (browser, or wgpu-native on the desktop), or the
+# same renderer on OpenGL 4.3 through runtime/src/gs/gpu/gl (the Switch).
+set(PS2_GPU_BACKEND "auto" CACHE STRING "GS GPU renderer: auto, webgpu, gl or none")
+set(PS2_GPU_RESOLVED "${PS2_GPU_BACKEND}")
+if(PS2_GPU_RESOLVED STREQUAL "auto")
+    if(NINTENDO_SWITCH)
+        set(PS2_GPU_RESOLVED gl)
+    elseif(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+        set(PS2_GPU_RESOLVED webgpu)
+    else()
+        set(PS2_GPU_RESOLVED none)
+    endif()
+endif()
+if(NOT PS2_GPU_RESOLVED STREQUAL "none")
     set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
     add_custom_command(OUTPUT "${PS2_GS_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
@@ -79,7 +92,21 @@ if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_na
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
     target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}")
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
-    if(EMSCRIPTEN)
+    if(PS2_GPU_RESOLVED STREQUAL "gl")
+        # Only the WebGPU headers are used; wgpu-native itself is not linked.
+        if(NOT EXISTS "${PS2_WGPU_DIR}/include/webgpu/webgpu.h")
+            message(FATAL_ERROR "The OpenGL renderer needs the WebGPU headers in ${PS2_WGPU_DIR}/include: run scripts/fetch_wgpu.sh")
+        endif()
+        target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gl/webgpu_gl.cpp runtime/src/gs/gpu/gl/glapi.cpp runtime/src/gs/gpu/gl/shaders.cpp)
+        target_include_directories(ps2runtime PRIVATE "${PS2_WGPU_DIR}/include")
+        target_compile_definitions(ps2runtime PUBLIC PS2_GPU_GL)
+        if(NINTENDO_SWITCH)
+            target_link_libraries(ps2runtime PUBLIC EGL glapi drm_nouveau)
+        else()
+            find_library(PS2_EGL_LIBRARY NAMES EGL libEGL.so.1 REQUIRED)
+            target_link_libraries(ps2runtime PUBLIC "${PS2_EGL_LIBRARY}" pthread)
+        endif()
+    elseif(EMSCRIPTEN)
         target_compile_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)
         target_link_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)
     else()
@@ -89,6 +116,7 @@ if(NOT NINTENDO_SWITCH AND (EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_na
             target_link_libraries(ps2runtime PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreFoundation" "-framework IOKit" "-framework IOSurface" objc)
         endif()
     endif()
+    message(STATUS "GS GPU renderer: ${PS2_GPU_RESOLVED}")
 endif()
 
 option(PS2_BUILD_TESTS "Build native synthetic runtime tests (no game data required)" OFF)
@@ -102,6 +130,22 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     endforeach()
     # The VU helpers must give bit-identical results on every compiler and CPU
     # (GT4's replays depend on it); this hash comes from clang and GCC on x86-64.
+    if(TARGET ps2runtime AND PS2_GS_WGSL)
+        # Software rasterizer against the GPU renderer, on synthetic scenes.
+        add_executable(gs_gpu_compare_test tests/gs_gpu_compare_test.cpp)
+        target_include_directories(gs_gpu_compare_test PRIVATE runtime/src)
+        target_link_libraries(gs_gpu_compare_test PRIVATE ps2runtime)
+        # The GPU renderer is not bit-exact with the software one (a few hundred
+        # bytes per scene), so this only checks that it runs; compare two GPU
+        # renderers with each other through scripts/compare_gpu_backends.sh.
+        add_test(NAME gs_gpu_compare COMMAND gs_gpu_compare_test 40)
+        set_tests_properties(gs_gpu_compare PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_COMPARE_MIN_PERCENT=0")
+    endif()
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+        # The OpenGL renderer's GLSL must match gs.wgsl and blit.wgsl.
+        add_test(NAME gl_shaders_current COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/gen_glsl.py" --check)
+    endif()
     add_executable(vu_ops_diff tests/vu_ops_diff.cpp)
     target_include_directories(vu_ops_diff PRIVATE runtime/include)
     add_test(NAME vu_ops_bits COMMAND vu_ops_diff)

@@ -16,14 +16,17 @@
 // Relative paths are taken from sdmc:/switch/ps2recomp. scripts/build_switch.sh
 // writes this file and lays out the folder.
 //
-// Two lines are understood by this launcher rather than the runner:
-//   @boost   run the CPU at 1785 MHz (the "fast load" boost mode)
-//   @log     send stdout/stderr to log.txt in the same folder
+// A few lines are understood by this launcher rather than the runner:
+//   @boost            run the CPU at 1785 MHz (the "fast load" boost mode)
+//   @log              send stdout/stderr to log.txt in the same folder
+//   @env NAME=VALUE   set an environment variable the runtime reads, such as
+//                     PS2_GS=cpu for the software renderer or PS2_SCALE=2
 #include <switch.h>
 
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -64,10 +67,18 @@ bool read_args(std::vector<std::string> &args, bool &boost, bool &log) {
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
         const auto first = line.find_first_not_of(" \t");
         if (first == std::string::npos || line[first] == '#') continue;
-        for (const std::string &word : split(line)) {
+        const std::vector<std::string> words = split(line);
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            const std::string &word = words[i];
             if (word == "@boost") boost = true;
             else if (word == "@log") log = true;
-            else args.push_back(word);
+            else if (word == "@env" && i + 1 < words.size()) {
+                const std::string &pair = words[++i];
+                const auto eq = pair.find('=');
+                if (eq != std::string::npos) setenv(pair.substr(0, eq).c_str(), pair.substr(eq + 1).c_str(), 1);
+            } else {
+                args.push_back(word);
+            }
         }
     }
     std::fclose(f);

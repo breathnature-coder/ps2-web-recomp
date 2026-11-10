@@ -9,7 +9,7 @@
 | EE 重编译器 `eerecomp`、`vurecomp` | `recomp/` | 在 PC 上运行，输出可移植的 C++，不用改 |
 | 运行时：内核 HLE、IOP、DMAC、VIF、VU、SPU2、IPU、软件 GS | `runtime/` | 纯 C++20，已能用 GCC 编译，也能交叉编译成 AArch64 |
 | 窗口、输入、音频 | `host/window.cpp`（SDL2） | 复用 devkitPro 的 switch-sdl2，已加 `__SWITCH__` 分支 |
-| GPU 渲染器 | `runtime/src/gs/gpu/`（WebGPU + WGSL，约 3000 行） | **要重写**，见第 2 阶段 |
+| GPU 渲染器 | `runtime/src/gs/gpu/`（WebGPU + WGSL，约 3000 行） | 原样复用：`gpu/gl/` 用 OpenGL 4.3 实现了它用到的 WebGPU 函数，见第 2 阶段 |
 | VU 即时编译 | `vu_jit*.cpp`（生成 WebAssembly） | 只有网页版用。Switch 用预编译的 VU 程序，没见过的程序走解释器 |
 
 ## 阶段
@@ -21,18 +21,20 @@
 - 新增 `host/switch.cpp`（libnx 入口：从 SD 卡读启动参数，检查是否是应用模式，可选 CPU 超频和日志）、CMake 里的 `ps2nx` 目标、`scripts/build_switch.sh`。
 - 所有合成测试在 clang 和 GCC 下都通过。
 
-### 第 1 阶段：在 Switch 上用软件渲染启动 GT4
-目标是验证正确性，不追求速度：能开机，进菜单，有声音，能读写存档。
-- 预期很慢。原作者在 PC 上用软件 GS 加 VU 解释器只有大约 3 FPS；这里 VU 是预编译的，但 Switch 的 CPU 弱很多。
+### 第 1 阶段：在 Switch 上启动 GT4
+目标是验证正确性：能开机，进菜单，有声音，能读写存档。第 2 阶段做完后默认就走 GPU 渲染；如果画面有问题，可以在 `args.txt` 里加一行 `@env PS2_GS=cpu` 换成软件渲染对照（会非常慢：原作者在 PC 上用软件 GS 加 VU 解释器只有大约 3 FPS）。
 - 要验证：线程栈（16 MiB）、内存（必须用应用模式启动）、光盘流式读取、手柄映射、音频节奏。
 - 调试：在 `args.txt` 里加 `@log`，或者用 nxlink。
 
-### 第 2 阶段：GPU 渲染器（决定能不能玩）
-实现 `runtime/src/gs/gpu/gpu.hpp` 里大约 20 个接口函数，内部改用 Switch 能用的图形接口。
-- **推荐先做 OpenGL 4.3 计算着色器**（devkitPro 的 switch-mesa，通过 EGL）。现有渲染器本来就是"计算着色器光栅化，GS 显存放在 GPU 上"的设计，和 GL 计算着色器一一对应。
-- 着色器可以先试 naga（wgpu 的着色器编译器），把 `gs.wgsl` 自动转成 GLSL，再手工修补，省得从头翻译 1150 行。
-- 以后要压榨性能再考虑 deko3d（Switch 的原生底层 API）。
-- 原生运行器的软件渲染器可以当参照，用来逐帧比对 GPU 输出。
+### 第 2 阶段：GPU 渲染器（已完成，待真机验证）
+没有重写渲染器，而是让原来的渲染器在 OpenGL 上运行：
+- `runtime/src/gs/gpu/gl/webgpu_gl.cpp` 用 OpenGL 4.3（EGL）实现了 `gpu.cpp` 用到的那组 WebGPU 函数。上游的 `gpu.cpp` 一行没改，以后同步上游几乎没有冲突。
+- 着色器由 wgpu 内置的 naga 预先从 WGSL 翻译成 GLSL（`scripts/gen_glsl.py` 生成 `gl/shaders.cpp`）。WGSL 改了之后重新运行它；`gl_shaders_current` 测试会在没同步时报错。
+- 语义和 WebGPU 一致：命令先录制、提交时执行；缓冲区初始为零；每次 dispatch 之后加内存屏障；回读用 fence 异步完成。
+- **验证结果：** 合成测试覆盖纹理上传、CLUT、各种图元、混合、深度和 Alpha 测试、纹理过滤、本地拷贝和渲染到纹理。在 1、2、3 倍内部分辨率下各跑 100 到 200 个场景，OpenGL 版的 GS 显存和显示输出与原版 WebGPU（Vulkan）**逐字节一致**，clang 和 GCC 编译的结果也一样。复查命令：`scripts/compare_gpu_backends.sh`。
+- Switch 上由 OpenGL 后端直接画到主机的原生窗口（NWindow），不经过 SDL 的渲染器；GPU 初始化失败时自动退回 SDL 软件显示（也可以在 `args.txt` 里写 `@env PS2_SDL_RENDERER=1` 强制）。
+- 构建：Switch 默认使用这个后端（CMake 选项 `PS2_GPU_BACKEND=gl`，链接 `EGL glapi drm_nouveau`）。只需要 WebGPU 的头文件，不需要 wgpu-native 库本身。
+- **还没验证的：** 真机上 nouveau 驱动的着色器编译和速度、显示路径（这边没有窗口系统，测不了画到屏幕这一步）、HOME 菜单的挂起和恢复。
 
 ### 第 3 阶段：性能
 - 线程绑核：EE、VU1、GS 线程各占一个 Switch 应用核（0 到 2 号）。

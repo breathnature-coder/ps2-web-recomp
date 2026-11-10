@@ -52,6 +52,10 @@ export PATH="$DEVKITPRO/devkitA64/bin:$DEVKITPRO/tools/bin:$DEVKITPRO/portlibs/s
 gcc_major=$(aarch64-none-elf-gcc -dumpversion | cut -d. -f1)
 [ "$gcc_major" -ge 15 ] || { echo "devkitA64 GCC $gcc_major is too old, 15+ is needed for guaranteed tail calls (dkp-pacman -Syu)" >&2; exit 1; }
 
+# The OpenGL renderer is built from the WebGPU headers (not the library).
+[ -f "$ROOT/third_party/wgpu-native/include/webgpu/webgpu.h" ] || {
+  echo "the WebGPU headers are missing: run scripts/fetch_wgpu.sh (port.sh normally does)" >&2; exit 1; }
+
 # The executable port.sh translated: a patched copy, GT4's unpacked core, or
 # the boot program named in SYSTEM.CNF, in that order of preference.
 elf=""
@@ -89,6 +93,8 @@ cp "$elf" "$sd/$(basename "$elf")"
   echo "$(basename "$elf")"
   echo "--disc $name.iso"
   echo "--memcard $name.ps2"
+  echo "# @env PS2_GS=cpu      software renderer, for comparison"
+  echo "# @env PS2_SCALE=2     twice the PS2 resolution inside (slower)"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
   [ "$boost" = 1 ] && echo "@boost"
   [ "$log" = 1 ] && echo "@log"
