@@ -32,9 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <chrono>
 #include <string>
-#include <thread>
 #include <vector>
 
 int ps2_main(int argc, char **argv);
@@ -110,8 +108,21 @@ void fail(const char *message) {
 }
 
 bool g_boost = false;
+bool g_log = false;
 
 }  // namespace
+
+// The card records a file's new length only when the file is flushed, and
+// closing the game from the HOME menu ends the process on the spot, so
+// host/window.cpp calls this once a second (with the speed line) to keep
+// log.txt readable afterwards.
+void ps2_switch_flush_log() {
+    if (!g_log) return;
+    std::fflush(stderr);
+    std::fflush(stdout);
+    fsync(fileno(stderr));
+    fsync(fileno(stdout));
+}
 
 // Called by host/window.cpp right before it exits the process, which skips the
 // end of main below.
@@ -148,18 +159,8 @@ int main(int, char **) {
         std::freopen("log.txt", "w", stderr);
         std::freopen("stdout.txt", "w", stdout);
         std::setvbuf(stderr, nullptr, _IOLBF, 0);
-        // The card records a file's new length only when the file is flushed,
-        // and closing the game from the HOME menu ends the process on the
-        // spot, so without this the log reads as empty afterwards.
-        std::thread([] {
-            for (;;) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                std::fflush(stderr);
-                std::fflush(stdout);
-                fsync(fileno(stderr));
-                fsync(fileno(stdout));
-            }
-        }).detach();
+        g_log = true;
+        ps2_switch_flush_log();
     }
     if (g_old_boost) std::fprintf(stderr, "[switch] ignoring @boost: it slowed the GPU to 76.8 MHz (see @fastload)\n");
     g_boost = boost;

@@ -6,6 +6,11 @@
 #ifdef __SWITCH__
 #include <pthread.h>
 #include <switch.h>
+// Defined in host/switch.cpp: undoes the CPU boost and the awake state, since
+// the exit at the end of run_window skips everything after ps2_main returns;
+// and commits log.txt to the card.
+void ps2_switch_before_exit();
+void ps2_switch_flush_log();
 #else
 #include <SDL_syswm.h>
 #include <sys/resource.h>
@@ -374,6 +379,7 @@ void show_speed() {
 #ifdef __SWITCH__
     // No title bar on the console: once a second into the log (args.txt: @log).
     std::fprintf(stderr, "[speed]%s\n", title + std::strlen("ps2-web-recomp"));
+    ps2_switch_flush_log();
 #else
     SDL_SetWindowTitle(g_window, title);
 #endif
@@ -402,10 +408,6 @@ void queue_audio(const std::int16_t *samples, std::size_t frames) {
 }
 
 #ifdef __SWITCH__
-// Defined in host/switch.cpp: undoes the CPU boost and the awake state, since
-// the exit below skips everything after ps2_main returns.
-void ps2_switch_before_exit();
-
 // libnx gives new threads small stacks, while the generated code can nest up
 // to kMaxDepth unit calls deep, so the Switch starts its threads explicitly
 // with the 16 MiB stack the browser build uses too.
