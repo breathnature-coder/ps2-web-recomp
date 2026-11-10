@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
   cat <<'EOF'
-usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--title TEXT]
+usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--record] [--title TEXT]
 
   <name>        the name given to scripts/port.sh; generated/<name> must exist
   --with-disc   also copy games/<name>/disc.iso into the SD folder (large; an
@@ -22,18 +22,24 @@ usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--title TEXT]
    clocks with an overclocking tool such as sys-clk, or add @fastload to
    args.txt only to test whether a scene is CPU-bound)
   --log         write the runner's output to log.txt on the SD card
+  --stats       also log where the GPU renderer's time goes, once a second
+  --record      record vector unit programs and code the PC runs never reached
+                (into vu1/ and misses.txt on the card); bring them back with
+                scripts/import_switch_run.sh to have them compiled in
   --title TEXT  name shown in the homebrew menu
 EOF
 }
 
 [ $# -ge 1 ] || { usage; exit 2; }
 name="$1"; shift
-with_disc=0; log=0; title=""
+with_disc=0; log=0; stats=0; record=0; title=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-disc) with_disc=1 ;;
     --boost) echo "--boost is gone: the system boost mode slows the GPU to 76.8 MHz; use sys-clk or similar" >&2 ;;
     --log) log=1 ;;
+    --stats) stats=1; log=1 ;;
+    --record) record=1 ;;
     --title) title="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -99,6 +105,8 @@ cp "$elf" "$sd/$(basename "$elf")"
   echo "# @env PS2_SCALE=2     twice the PS2 resolution inside (slower)"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
   [ "$log" = 1 ] && echo "@log"
+  [ "$stats" = 1 ] && echo "@env PS2_GL_STATS=1"
+  if [ "$record" = 1 ]; then echo "@env PS2_VU_RECORD=vu1"; echo "--misses misses.txt"; fi
 } > "$sd/args.txt"
 if [ "$with_disc" = 1 ]; then
   cp -L "$game/disc.iso" "$sd/$name.iso"

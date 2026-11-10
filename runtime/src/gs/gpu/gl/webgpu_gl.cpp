@@ -24,6 +24,7 @@
 #include "shaders.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,7 @@ struct WGPUShaderModuleImpl {
 
 struct WGPUComputePipelineImpl {
     GLuint program;
+    const char *name;  // entry point, for PS2_GL_STATS
 };
 
 struct WGPURenderPipelineImpl {
@@ -205,6 +207,104 @@ bool create_context() {
     return true;
 }
 
+// PS2_GL_STATS=1 prints, once a second, where the render thread's time went
+// inside OpenGL and how long the GPU spent in each compute entry point (timer
+// queries; Mesa's llvmpipe runs compute inside the dispatch call, so there the
+// GPU times read 0 and the work shows up as issue time instead).
+using Clock = std::chrono::steady_clock;
+
+struct Stats {
+    bool on = std::getenv("PS2_GL_STATS") != nullptr;
+    Clock::time_point since = Clock::now();
+    std::uint64_t dispatches = 0, submits = 0, writes = 0, write_bytes = 0, reads = 0, read_bytes = 0, copies = 0, presents = 0, binds = 0,
+                  binds_skipped = 0;
+    double issue_ms = 0, write_ms = 0, wait_ms = 0, read_ms = 0, swap_ms = 0;
+    struct Entry {
+        const char *name;
+        double gpu_ms;
+        std::uint64_t count;
+    };
+    std::vector<Entry> entries;
+    std::vector<GLuint> free_queries;
+    std::deque<std::pair<GLuint, std::size_t>> queries;  // in flight: query, entry index
+} g_stats;
+
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+std::size_t stats_entry(const char *name) {
+    for (std::size_t i = 0; i < g_stats.entries.size(); ++i)
+        if (g_stats.entries[i].name == name) return i;
+    g_stats.entries.push_back({name, 0.0, 0});
+    return g_stats.entries.size() - 1;
+}
+
+void collect_queries(bool wait) {
+    while (!g_stats.queries.empty()) {
+        const auto [query, entry] = g_stats.queries.front();
+        GLint ready = 0;
+        if (!wait) glGetQueryObjectiv(query, GL_QUERY_RESULT_AVAILABLE, &ready);
+        if (!wait && !ready) return;
+        GLuint64 ns = 0;
+        glGetQueryObjectui64v(query, GL_QUERY_RESULT, &ns);
+        g_stats.entries[entry].gpu_ms += static_cast<double>(ns) / 1e6;
+        g_stats.free_queries.push_back(query);
+        g_stats.queries.pop_front();
+    }
+}
+
+void report_stats() {
+    if (!g_stats.on) return;
+    const double elapsed = ms_since(g_stats.since);
+    if (elapsed < 1000.0) return;
+    collect_queries(false);
+    const double per = 1000.0 / elapsed;
+    double gpu = 0;
+    for (const auto &e : g_stats.entries) gpu += e.gpu_ms;
+    std::fprintf(stderr,
+                 "[gl] per s: %llu dispatches in %llu submits, %llu copies, %llu presents | ms/s: issue %.0f write %.0f (%llux %.1f MB) "
+                 "wait %.0f read %.0f (%llux %.1f MB) swap %.0f | binds %llu skipped %llu | gpu %.0f:",
+                 (unsigned long long)(g_stats.dispatches * per), (unsigned long long)(g_stats.submits * per), (unsigned long long)(g_stats.copies * per),
+                 (unsigned long long)(g_stats.presents * per), g_stats.issue_ms * per, g_stats.write_ms * per, (unsigned long long)(g_stats.writes * per),
+                 g_stats.write_bytes * per / 1048576.0, g_stats.wait_ms * per, g_stats.read_ms * per, (unsigned long long)(g_stats.reads * per),
+                 g_stats.read_bytes * per / 1048576.0, g_stats.swap_ms * per, (unsigned long long)(g_stats.binds * per),
+                 (unsigned long long)(g_stats.binds_skipped * per), gpu * per);
+    auto sorted = g_stats.entries;
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.gpu_ms > b.gpu_ms; });
+    for (const auto &e : sorted)
+        if (e.count) std::fprintf(stderr, " %s %.0f (%llux)", e.name, e.gpu_ms * per, (unsigned long long)(e.count * per));
+    std::fprintf(stderr, "\n");
+    const auto entries = std::move(g_stats.entries);
+    const auto free_queries = std::move(g_stats.free_queries);
+    const auto queries = std::move(g_stats.queries);
+    g_stats = Stats{};
+    g_stats.entries = entries;
+    for (auto &e : g_stats.entries) e.gpu_ms = 0, e.count = 0;
+    g_stats.free_queries = free_queries;
+    g_stats.queries = queries;
+}
+
+// What is bound at each indexed binding, so a dispatch only rebinds what
+// changed: most dispatches use the same buffers as the one before.
+struct Bound {
+    GLuint buffer = 0;
+    std::uint64_t offset = 0, size = 0;
+};
+Bound g_bound_storage[16], g_bound_uniform[16];
+GLuint g_bound_program = 0;
+
+void forget_buffer(GLuint id) {
+    for (Bound &b : g_bound_storage)
+        if (b.buffer == id) b = Bound{};
+    for (Bound &b : g_bound_uniform)
+        if (b.buffer == id) b = Bound{};
+}
+
+void use_program(GLuint program) {
+    if (program == g_bound_program) return;
+    glUseProgram(program);
+    g_bound_program = program;
+}
+
 // Callbacks waiting for the GPU, oldest first.
 struct Pending {
     GLsync fence;
@@ -223,7 +323,11 @@ void process(bool wait) {
     while (!g_pending.empty()) {
         Pending &p = g_pending.front();
         GLenum r = glClientWaitSync(p.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-        while (wait && r == GL_TIMEOUT_EXPIRED) r = glClientWaitSync(p.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000);
+        if (wait && r == GL_TIMEOUT_EXPIRED) {
+            const auto start = Clock::now();
+            while (r == GL_TIMEOUT_EXPIRED) r = glClientWaitSync(p.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000);
+            g_stats.wait_ms += ms_since(start);
+        }
         if (r == GL_TIMEOUT_EXPIRED) return;  // later fences cannot be done either
         if (r == GL_WAIT_FAILED) std::fprintf(stderr, "[gl] fence wait failed\n");
         glDeleteSync(p.fence);
@@ -278,11 +382,18 @@ const char *find_shader(const std::string &entry, std::uint32_t scale) {
 
 std::map<std::pair<std::string, std::uint32_t>, GLuint> g_programs;
 
-void bind(const WGPUBindGroupImpl &group, std::vector<std::uint32_t> dynamic) {
+void bind(const WGPUBindGroupImpl &group, const std::vector<std::uint32_t> &dynamic) {
     std::size_t next = 0;
     for (const auto &e : group.entries) {
         std::uint64_t offset = e.offset;
         if (e.dynamic && next < dynamic.size()) offset += dynamic[next++];
+        Bound &b = (e.uniform ? g_bound_uniform : g_bound_storage)[e.binding & 15u];
+        if (b.buffer == e.buffer && b.offset == offset && b.size == e.size) {
+            ++g_stats.binds_skipped;
+            continue;
+        }
+        b = Bound{e.buffer, offset, e.size};
+        ++g_stats.binds;
         glBindBufferRange(e.uniform ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER, e.binding, e.buffer, static_cast<GLintptr>(offset),
                           static_cast<GLsizeiptr>(e.size));
     }
@@ -349,15 +460,20 @@ WGPUBuffer wgpuDeviceCreateBuffer(WGPUDevice, WGPUBufferDescriptor const *d) {
 void wgpuBufferRelease(WGPUBuffer b) {
     if (!b) return;
     current();
+    forget_buffer(b->id);
     glDeleteBuffers(1, &b->id);
     delete b;
 }
 
 WGPUFuture wgpuBufferMapAsync(WGPUBuffer b, WGPUMapMode, size_t offset, size_t size, WGPUBufferMapCallbackInfo cb) {
     fence([b, offset, size, cb] {
+        const auto start = Clock::now();
         b->shadow.resize(static_cast<std::size_t>(b->size));
         glBindBuffer(GL_COPY_READ_BUFFER, b->id);
         glGetBufferSubData(GL_COPY_READ_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), b->shadow.data() + offset);
+        g_stats.read_ms += ms_since(start);
+        ++g_stats.reads;
+        g_stats.read_bytes += size;
         b->mapped = true;
         cb.callback(WGPUMapAsyncStatus_Success, text(""), cb.userdata1, cb.userdata2);
     });
@@ -376,14 +492,22 @@ WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue, WGPUQueueWorkDoneCallbackInfo
 void wgpuQueueWriteBuffer(WGPUQueue, WGPUBuffer b, uint64_t offset, void const *data, size_t size) {
     if (!size) return;
     current();
+    const auto start = Clock::now();
     glBindBuffer(GL_COPY_WRITE_BUFFER, b->id);
     glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), data);
+    g_stats.write_ms += ms_since(start);
+    ++g_stats.writes;
+    g_stats.write_bytes += size;
 }
 
 void wgpuQueueSubmit(WGPUQueue, size_t count, WGPUCommandBuffer const *commands) {
     current();
+    const auto start = Clock::now();
     for (std::size_t i = 0; i < count; ++i)
         for (const Op &op : commands[i]->ops) op();
+    g_stats.issue_ms += ms_since(start);
+    ++g_stats.submits;
+    report_stats();
 }
 
 WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice, WGPUQuerySetDescriptor const *) { return &g_query_set; }
@@ -447,7 +571,8 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice, WGPUComputePipel
         if (!program) return nullptr;
         it = g_programs.emplace(key, program).first;
     }
-    return new WGPUComputePipelineImpl{it->second};
+    static std::map<std::string, std::string> names;  // keeps the name alive for the stats
+    return new WGPUComputePipelineImpl{it->second, names.emplace(entry, entry).first->second.c_str()};
 }
 
 WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipelineDescriptor const *) {
@@ -476,6 +601,7 @@ void wgpuCommandBufferRelease(WGPUCommandBuffer c) { delete c; }
 void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffer src, uint64_t src_offset, WGPUBuffer dst, uint64_t dst_offset, uint64_t size) {
     const GLuint s = src->id, d = dst->id;
     e->ops.push_back([s, d, src_offset, dst_offset, size] {
+        ++g_stats.copies;
         glBindBuffer(GL_COPY_READ_BUFFER, s);
         glBindBuffer(GL_COPY_WRITE_BUFFER, d);
         glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(src_offset), static_cast<GLintptr>(dst_offset),
@@ -489,9 +615,14 @@ WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder e, 
     return new WGPUComputePassEncoderImpl{e};
 }
 
+namespace {
+const char *g_recording_name = nullptr;  // the pipeline of the dispatches being recorded
+}
+
 void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipeline pipeline) {
     const GLuint program = pipeline->program;
-    p->encoder->ops.push_back([program] { glUseProgram(program); });
+    g_recording_name = pipeline->name;
+    p->encoder->ops.push_back([program] { use_program(program); });
 }
 
 void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, uint32_t, WGPUBindGroup group, size_t count, uint32_t const *offsets) {
@@ -500,10 +631,29 @@ void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, uint32_t, WGPU
 }
 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, uint32_t x, uint32_t y, uint32_t z) {
-    p->encoder->ops.push_back([x, y, z] {
+    const char *name = g_recording_name;
+    p->encoder->ops.push_back([x, y, z, name] {
+        GLuint query = 0;
+        std::size_t entry = 0;
+        if (g_stats.on) {
+            entry = stats_entry(name);
+            ++g_stats.entries[entry].count;
+            if (g_stats.free_queries.empty()) {
+                g_stats.free_queries.push_back(0);
+                glGenQueries(1, &g_stats.free_queries.back());
+            }
+            query = g_stats.free_queries.back();
+            g_stats.free_queries.pop_back();
+            glBeginQuery(GL_TIME_ELAPSED, query);
+        }
         glDispatchCompute(x, y, z);
         // WebGPU orders the storage accesses of successive dispatches; OpenGL needs telling.
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+        ++g_stats.dispatches;
+        if (query) {
+            glEndQuery(GL_TIME_ELAPSED);
+            g_stats.queries.emplace_back(query, entry);
+        }
     });
 }
 
@@ -543,7 +693,7 @@ void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y,
 void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) {
     const GLuint program = pipeline->program, vao = pipeline->vao;
     p->encoder->ops.push_back([program, vao] {
-        glUseProgram(program);
+        use_program(program);
         glBindVertexArray(vao);
     });
 }
@@ -609,7 +759,11 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *out) {
 
 WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
     current();
-    return s->surface && eglSwapBuffers(g.display, s->surface) ? WGPUStatus_Success : WGPUStatus_Error;
+    const auto start = Clock::now();
+    const bool ok = s->surface && eglSwapBuffers(g.display, s->surface);
+    g_stats.swap_ms += ms_since(start);
+    ++g_stats.presents;
+    return ok ? WGPUStatus_Success : WGPUStatus_Error;
 }
 
 void wgpuSurfaceRelease(WGPUSurface s) {

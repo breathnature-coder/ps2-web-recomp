@@ -64,7 +64,8 @@ inline constexpr GLenum GL_NO_ERROR = 0, GL_VENDOR = 0x1F00, GL_RENDERER = 0x1F0
                         GL_CONDITION_SATISFIED = 0x911C, GL_WAIT_FAILED = 0x911D, GL_TRIANGLES = 0x0004, GL_FRAMEBUFFER = 0x8D40,
                         GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_SCISSOR_TEST = 0x0C11,
                         GL_CULL_FACE = 0x0B44, GL_MAX_SHADER_STORAGE_BLOCK_SIZE = 0x90DE, GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT = 0x8A34,
-                        GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT = 0x90DF;
+                        GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT = 0x90DF, GL_TIME_ELAPSED = 0x88BF, GL_QUERY_RESULT = 0x8866,
+                        GL_QUERY_RESULT_AVAILABLE = 0x8867;
 inline constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000, GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200,
                             GL_UNIFORM_BARRIER_BIT = 0x00000004, GL_SYNC_FLUSH_COMMANDS_BIT = 0x00000001;
 inline constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
@@ -109,7 +110,12 @@ inline constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
     X(void, ClearColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a))                                                                        \
     X(void, Clear, (GLbitfield mask))                                                                                                        \
     X(void, BindFramebuffer, (GLenum target, GLuint framebuffer))                                                                            \
-    X(void, Disable, (GLenum cap))
+    X(void, Disable, (GLenum cap))                                                                                                           \
+    X(void, GenQueries, (GLsizei n, GLuint * ids))                                                                                           \
+    X(void, BeginQuery, (GLenum target, GLuint id))                                                                                          \
+    X(void, EndQuery, (GLenum target))                                                                                                       \
+    X(void, GetQueryObjectiv, (GLuint id, GLenum pname, GLint * params))                                                                     \
+    X(void, GetQueryObjectui64v, (GLuint id, GLenum pname, GLuint64 * params))
 
 #define PS2_GL_DECLARE(ret, name, args) extern ret(*gl##name) args;
 PS2_GL_FUNCTIONS(PS2_GL_DECLARE)
