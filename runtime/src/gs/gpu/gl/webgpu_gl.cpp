@@ -222,6 +222,7 @@ struct Stats {
         const char *name;
         double gpu_ms;
         std::uint64_t count;
+        std::uint64_t groups = 0;  // workgroups dispatched: tells fixed cost per dispatch from cost per tile
     };
     std::vector<Entry> entries;
     std::vector<GLuint> free_queries;
@@ -240,7 +241,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 std::size_t stats_entry(const char *name) {
     for (std::size_t i = 0; i < g_stats.entries.size(); ++i)
         if (g_stats.entries[i].name == name) return i;
-    g_stats.entries.push_back({name, 0.0, 0});
+    g_stats.entries.push_back({name, 0.0, 0, 0});
     return g_stats.entries.size() - 1;
 }
 
@@ -277,14 +278,15 @@ void report_stats() {
     auto sorted = g_stats.entries;
     std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.gpu_ms > b.gpu_ms; });
     for (const auto &e : sorted)
-        if (e.count) std::fprintf(stderr, " %s %.0f (%llux)", e.name, e.gpu_ms * per, (unsigned long long)(e.count * per));
+        if (e.count)
+            std::fprintf(stderr, " %s %.0f (%llux %llug)", e.name, e.gpu_ms * per, (unsigned long long)(e.count * per), (unsigned long long)(e.groups * per));
     std::fprintf(stderr, "\n");
     const auto entries = std::move(g_stats.entries);
     const auto free_queries = std::move(g_stats.free_queries);
     const auto queries = std::move(g_stats.queries);
     g_stats = Stats{};
     g_stats.entries = entries;
-    for (auto &e : g_stats.entries) e.gpu_ms = 0, e.count = 0;
+    for (auto &e : g_stats.entries) e.gpu_ms = 0, e.count = 0, e.groups = 0;
     g_stats.free_queries = free_queries;
     g_stats.queries = queries;
 }
@@ -644,6 +646,7 @@ void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, uint32_t
         if (stats_on()) {
             entry = stats_entry(name);
             ++g_stats.entries[entry].count;
+            g_stats.entries[entry].groups += static_cast<std::uint64_t>(x) * y * z;
             if (g_stats.free_queries.empty()) {
                 g_stats.free_queries.push_back(0);
                 glGenQueries(1, &g_stats.free_queries.back());
