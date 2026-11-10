@@ -21,7 +21,8 @@
 //                     down to 76.8 MHz, so only for telling whether the CPU is
 //                     what holds a scene back. To raise clocks for playing, use
 //                     an overclocking tool such as sys-clk instead.
-//   @log              send stdout/stderr to log.txt in the same folder
+//   @log              send stderr to log.txt and stdout to stdout.txt in the
+//                     same folder, committed to the card once a second
 //   @env NAME=VALUE   set an environment variable the runtime reads, such as
 //                     PS2_GS=cpu for the software renderer or PS2_SCALE=2
 #include <switch.h>
@@ -31,7 +32,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 int ps2_main(int argc, char **argv);
@@ -141,9 +144,22 @@ int main(int, char **) {
         return 1;
     }
     if (log) {
-        std::freopen("log.txt", "w", stdout);
-        std::freopen("log.txt", "a", stderr);
+        // Separate files: two streams writing one file would overwrite each other.
+        std::freopen("log.txt", "w", stderr);
+        std::freopen("stdout.txt", "w", stdout);
         std::setvbuf(stderr, nullptr, _IOLBF, 0);
+        // The card records a file's new length only when the file is flushed,
+        // and closing the game from the HOME menu ends the process on the
+        // spot, so without this the log reads as empty afterwards.
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::fflush(stderr);
+                std::fflush(stdout);
+                fsync(fileno(stderr));
+                fsync(fileno(stdout));
+            }
+        }).detach();
     }
     if (g_old_boost) std::fprintf(stderr, "[switch] ignoring @boost: it slowed the GPU to 76.8 MHz (see @fastload)\n");
     g_boost = boost;
