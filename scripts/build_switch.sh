@@ -71,7 +71,7 @@ if [ -n "$docker_image" ]; then
   done
   proxy=()
   for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do [ -n "${!v:-}" ] && proxy+=(-e "$v=${!v}"); done
-  exec docker run --rm "${proxy[@]}" -e PS2_SWITCH_GL=pkgconfig -e PS2_SWITCH_SUFFIX=-mesa26 -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  exec docker run --rm "${proxy[@]}" -e PS2_SWITCH_GL=mesa-switch -e PS2_SWITCH_SUFFIX=-mesa26 -u "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$ROOT:$ROOT" -w "$ROOT" "$docker_image" bash "$ROOT/scripts/build_switch.sh" "$name" "${inner[@]}"
 fi
 

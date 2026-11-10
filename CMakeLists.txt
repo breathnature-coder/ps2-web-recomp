@@ -101,18 +101,33 @@ if(NOT PS2_GPU_RESOLVED STREQUAL "none")
         target_include_directories(ps2runtime PRIVATE "${PS2_WGPU_DIR}/include")
         target_compile_definitions(ps2runtime PUBLIC PS2_GPU_GL)
         if(NINTENDO_SWITCH)
-            # devkitPro's switch-mesa (Mesa 20.1) by default. PS2_SWITCH_GL=pkgconfig
-            # takes EGL and what it needs from pkg-config instead, for a newer Mesa
-            # port such as mesa-switch (Mesa 26: nvc0, or Zink on NVK Vulkan).
-            set(PS2_SWITCH_GL "legacy" CACHE STRING "Switch OpenGL libraries: legacy or pkgconfig")
-            if(PS2_SWITCH_GL STREQUAL "pkgconfig")
-                find_package(PkgConfig REQUIRED)
-                pkg_check_modules(PS2_EGL REQUIRED egl)
-                target_link_directories(ps2runtime PUBLIC ${PS2_EGL_STATIC_LIBRARY_DIRS})
-                target_link_libraries(ps2runtime PUBLIC ${PS2_EGL_STATIC_LIBRARIES})
-                message(STATUS "Switch OpenGL from pkg-config: egl ${PS2_EGL_VERSION}: ${PS2_EGL_STATIC_LIBRARIES}")
-            else()
+            # devkitPro's switch-mesa (Mesa 20.1) by default. PS2_SWITCH_GL=mesa-switch
+            # links a newer Mesa port instead (danfromtico/mesa-switch, Mesa 26: nvc0,
+            # or Zink on NVK Vulkan), through the CMake package it installs. Its
+            # pkg-config files are not used: egl.pc requires a libelf.pc that the
+            # switch-dev image does not carry.
+            set(PS2_SWITCH_GL "legacy" CACHE STRING "Switch OpenGL libraries: legacy or mesa-switch")
+            if(PS2_SWITCH_GL STREQUAL "legacy")
                 target_link_libraries(ps2runtime PUBLIC EGL glapi drm_nouveau)
+            else()
+                find_package(OpenGL CONFIG QUIET)
+                if(TARGET OpenGL::EGL)
+                    target_link_libraries(ps2runtime PUBLIC OpenGL::EGL)
+                    message(STATUS "Switch OpenGL: mesa-switch through its CMake package (${OpenGL_DIR})")
+                else()
+                    # No usable package: name the archives, as a group since they refer to each other.
+                    set(PS2_MESA_ARCHIVES EGL GL glapi vulkan vulkan_util nvk nak nak_rs nil libnil_format_table nir vtn compiler compiler_c_helpers
+                        nouveau_mme nouveau_ws nouveau_horizon nvidia_headers_c xmlconfig mesa_util mesa_util_c11 mesa_util_simd blake3 expat zstd z)
+                    set(PS2_MESA_FOUND "")
+                    foreach(lib IN LISTS PS2_MESA_ARCHIVES)
+                        find_library(PS2_MESA_${lib} NAMES ${lib})
+                        if(PS2_MESA_${lib})
+                            list(APPEND PS2_MESA_FOUND "${PS2_MESA_${lib}}")
+                        endif()
+                    endforeach()
+                    target_link_libraries(ps2runtime PUBLIC -Wl,--start-group ${PS2_MESA_FOUND} -Wl,--end-group stdc++ m)
+                    message(STATUS "Switch OpenGL: mesa-switch archives by name: ${PS2_MESA_FOUND}")
+                endif()
             endif()
         else()
             find_library(PS2_EGL_LIBRARY NAMES EGL libEGL.so.1 REQUIRED)
