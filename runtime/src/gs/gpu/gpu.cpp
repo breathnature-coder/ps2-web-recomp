@@ -23,6 +23,7 @@
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
+extern const char kNativeShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
@@ -32,8 +33,9 @@ namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode"};
+// kNative is not a compute pipeline: such a command is a render pass of the native renderer (g_native_passes).
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kStoreColor, kStoreDepth, kPipelines, kNative = kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "store_color", "store_depth"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -78,10 +80,13 @@ WGPUPipelineLayout g_pipeline_layout = nullptr;
 WGPUBindGroup g_group = nullptr;
 WGPUComputePipeline g_pipelines[kPipelines] = {};
 
+struct Surface;
+
 struct Command {
     Pipeline pipeline;
     std::uint32_t x, y;
     std::uint32_t param;
+    Surface *target = nullptr;  // the texture a store writes back
 };
 
 struct CommandInfo {
@@ -148,6 +153,7 @@ struct Batch {
     std::uint32_t texflushes = 0;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
+    bool native = false;
 } g_batch;
 
 struct SetupCache {
@@ -157,6 +163,7 @@ struct SetupCache {
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
+    bool native = false, alpha_factor = false;
 } g_setup_cache;
 
 struct PreOp {
@@ -581,6 +588,412 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+
+// The native renderer. Triangles and sprites whose state the GPU's fixed functions can express are drawn by its own
+// rasterizer (native.wgsl) into textures standing for the frame and Z buffers, which is several times cheaper than
+// rasterizing in a compute shader. GS memory stays the meeting point: a texture is written back (stored) before
+// anything else reads or writes the memory under it, and loaded again before it is drawn to once something else has
+// written there. Textures a draw samples are still read from GS memory. Everything else, and every state not listed
+// in native_state, goes through the compute rasterizer as before, a whole batch at a time.
+struct Surface {
+    std::uint32_t bp = 0, bw = 0, width = 0, height = 0;  // block pointer, buffer width in 64s, size in pixels
+    bool depth = false;
+    WGPUTexture texture = nullptr;
+    WGPUTextureView view = nullptr;
+    WGPUBindGroup group = nullptr;
+    bool dirty = false;  // the texture is newer than GS memory inside this rectangle
+    int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
+    int stale0 = 0, stale1 = -1;  // GS memory is newer than the texture in these rows
+    std::uint64_t used = 0;
+};
+
+struct NativeDraw {
+    WGPURenderPipeline pipeline;
+    std::uint32_t param, vertices, x, y, w, h;
+    float constant;
+};
+
+struct NativePass {
+    Surface *color, *depth;
+    std::vector<NativeDraw> draws;
+};
+
+struct NativeState {
+    std::uint32_t key = 0, flags = 0;
+    std::uint32_t premultiply = 0;  // the shader multiplies the colour by C itself: 1, with 2 C is FIX, with 4 rounding up
+    float constant = 0.0f;
+    bool draws = true;
+    bool alpha_factor = false;  // the source alpha is a blend factor, which the blender clamps to one (0x80)
+};
+
+constexpr std::size_t kMaxSurfaces = 24;
+
+bool g_native = false;
+std::vector<std::unique_ptr<Surface>> g_surfaces, g_retired;
+std::vector<NativePass> g_native_passes;
+std::uint64_t g_surface_clock = 0;
+std::uint64_t g_native_batches = 0, g_native_prims = 0, g_compute_batches = 0, g_compute_prims = 0, g_stores = 0, g_loads = 0, g_native_draws = 0;
+WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
+WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr;
+WGPUBindGroup g_native_group = nullptr;
+WGPUShaderModule g_native_module = nullptr;
+WGPURenderPipeline g_load_pipelines[2] = {};
+std::unordered_map<std::uint32_t, WGPURenderPipeline> g_native_pipelines;
+
+// Whether the GPU's rasterizer and fixed functions can draw this setup, and with which pipeline state. The key: bit 0
+// a depth attachment, 1-2 the depth test (never, always, >=, >), 3 depth writes, 4-7 the channels written, 8 blending,
+// 9-10 its operation (add, source minus destination, destination minus source), 11-12 and 13-14 the source and
+// destination factors (0, 1, C, 1 - C), 15 C is FIX and not the source alpha, 16 the shader writes the depth.
+// PS2_NATIVE_SKIP=<sum>: leave a kind of draw to the compute rasterizer, to find which one a wrong picture comes from.
+// 1 blending by a factor, 2 any blending, 4 textures, 8 alpha tests, 16 depth tests, 32 triangles, 64 sprites,
+// 128 blending by a factor that has a texture's alpha in it (see draw).
+std::uint32_t native_skip() {
+    static const std::uint32_t skip = std::getenv("PS2_NATIVE_SKIP") ? static_cast<std::uint32_t>(std::atoi(std::getenv("PS2_NATIVE_SKIP"))) : 0u;
+    return skip;
+}
+
+bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
+    const std::uint32_t flags = w[0], fpsm = w[3], modes = w[7];
+    const std::uint32_t skip = native_skip();
+    if (((skip & 2u) && (flags & 8u)) || ((skip & 4u) && (flags & 2u)) || ((skip & 8u) && (flags & 64u)) || ((skip & 16u) && (flags & 512u))) return false;
+    if ((fpsm != PSMCT32 && fpsm != PSMCT24) || w[2] == 0) return false;
+    if (flags & 128u) return false;        // destination alpha test
+    if ((modes >> 28) & 2u) return false;  // every other line masked
+    const bool zte = flags & 512u;
+    if (zte && w[6] != PSMZ24) return false;
+    std::uint32_t mask = 0;
+    for (int ch = 0; ch < (fpsm == PSMCT24 ? 3 : 4); ++ch) {
+        const std::uint32_t m = (w[4] >> (ch * 8)) & 0xFFu;
+        if (m == 0) mask |= 1u << ch;
+        else if (m != 0xFFu) return false;  // a mask inside a channel
+    }
+    bool write_z = zte && !(flags & 32u);
+    out.flags = flags;
+    if (flags & 64u) {
+        const std::uint32_t atst = modes & 7u, afail = (modes >> 4) & 3u;
+        if (atst == 1) {
+            out.flags &= ~64u;
+        } else if (atst == 0) {
+            // The test never passes, so what a failed test leaves alone is known here.
+            out.flags &= ~64u;
+            if (afail == 0) mask = 0;
+            if (afail == 2) mask = 0;
+            else write_z = false;
+            if (afail == 3) mask &= 7u;
+        } else if (afail != 0) {
+            return false;  // a failed test writes some of the pixel: needs the test per pixel and two write masks
+        }
+    }
+    const std::uint32_t ztst = (modes >> 8) & 3u;
+    std::uint32_t blend = 0;
+    out.constant = 0.0f;
+    out.premultiply = 0;
+    out.alpha_factor = false;
+    if ((flags & 8u) && (mask & 7u)) {
+        if ((flags & 1024u) || !(flags & 2048u)) return false;  // blending per pixel alpha, or colours that wrap
+        const std::uint32_t a = (modes >> 12) & 3u, b = (modes >> 14) & 3u, c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
+        // (A - B) * C + D as what multiplies the source and the destination colour: so many times C, plus one or not.
+        const int source_c = (a == 0) - (b == 0), dest_c = (a == 1) - (b == 1);
+        const int source_1 = d == 0, dest_1 = d == 1;
+        std::uint32_t op = 0;
+        int sf, df;
+        if (!source_c && !dest_c) {
+            sf = source_1;
+            df = dest_1;
+        } else if (c == 1) {
+            return false;  // destination alpha: the texture keeps alpha, not alpha as a factor
+        } else if (!dest_c && !source_1) {
+            // C only scales the source colour: the shader does it, with the GS's own rounding and for any C.
+            out.premultiply = 1u | (c >= 2 ? 2u : 0u) | (source_c < 0 ? 4u : 0u);
+            sf = 1;
+            df = dest_1;
+            op = source_c < 0 ? 2u : 0u;
+        } else {
+            if ((c >= 2 && w[9] > 0x80u) || (skip & 1u)) return false;  // a factor above one
+            bool source_minus = false, dest_minus = false;
+            const auto factor = [](int times, int one, bool &minus) {
+                if (!times) return one;
+                if (times == 1 && !one) return 2;
+                if (times == -1 && one) return 3;
+                if (times == -1) {
+                    minus = true;
+                    return 2;
+                }
+                return -1;  // 1 + C
+            };
+            sf = factor(source_c, source_1, source_minus);
+            df = factor(dest_c, dest_1, dest_minus);
+            if (sf < 0 || df < 0 || (source_minus && dest_minus)) return false;
+            op = source_minus ? 2u : dest_minus ? 1u : 0u;
+            out.alpha_factor = c == 0;
+            if (c >= 2) {
+                blend |= 1u << 7;
+                out.constant = static_cast<float>(w[9]) / 128.0f;
+            }
+        }
+        if (sf != 1 || df != 0 || op) blend |= 1u | (op << 1) | (static_cast<std::uint32_t>(sf) << 3) | (static_cast<std::uint32_t>(df) << 5);
+        else blend = 0;
+        if (!(blend & 1u)) out.constant = 0.0f;
+    }
+    out.draws = !(zte && ztst == 0) && (mask || write_z);
+    // PS2_NATIVE_Z=fast leaves depth to the rasterizer's interpolation: quicker where much is hidden, and a step off
+    // the compute rasterizer's depth here and there, which shows where both draw surfaces lying on each other.
+    static const bool exact = !std::getenv("PS2_NATIVE_Z") || std::strcmp(std::getenv("PS2_NATIVE_Z"), "fast") != 0;
+    out.key = (has_depth ? 1u : 0u) | ((zte ? ztst : 1u) << 1) | (write_z ? 8u : 0u) | (mask << 4) | (blend << 8) | (has_depth && zte && exact ? 1u << 16 : 0u);
+    return true;
+}
+
+WGPURenderPipeline native_pipeline(std::uint32_t key) {
+    const auto found = g_native_pipelines.find(key);
+    if (found != g_native_pipelines.end()) return found->second;
+    WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
+    constant.key = view("SCALE");
+    constant.value = static_cast<double>(g_scale);
+    const bool from_fix = (key >> 15) & 1u;
+    const WGPUBlendFactor factors[4] = {WGPUBlendFactor_Zero, WGPUBlendFactor_One, from_fix ? WGPUBlendFactor_Constant : WGPUBlendFactor_Src1Alpha,
+                                        from_fix ? WGPUBlendFactor_OneMinusConstant : WGPUBlendFactor_OneMinusSrc1Alpha};
+    const WGPUBlendOperation ops[3] = {WGPUBlendOperation_Add, WGPUBlendOperation_Subtract, WGPUBlendOperation_ReverseSubtract};
+    WGPUBlendState blend = WGPU_BLEND_STATE_INIT;
+    blend.color.operation = ops[std::min((key >> 9) & 3u, 2u)];
+    blend.color.srcFactor = factors[(key >> 11) & 3u];
+    blend.color.dstFactor = factors[(key >> 13) & 3u];
+    blend.alpha.operation = WGPUBlendOperation_Add;  // the GS writes the source alpha, blended or not
+    blend.alpha.srcFactor = WGPUBlendFactor_One;
+    blend.alpha.dstFactor = WGPUBlendFactor_Zero;
+    WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+    target.format = WGPUTextureFormat_RGBA8Unorm;
+    target.writeMask = (key >> 4) & 0xFu;
+    if ((key >> 8) & 1u) target.blend = &blend;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = g_native_module;
+    fragment.entryPoint = view((key >> 16) & 1u ? "native_depth_fs" : "native_fs");
+    fragment.constantCount = 1;
+    fragment.constants = &constant;
+    fragment.targetCount = 1;
+    fragment.targets = &target;
+    static const WGPUCompareFunction compares[4] = {WGPUCompareFunction_Never, WGPUCompareFunction_Always, WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Greater};
+    WGPUDepthStencilState depth = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depth.format = WGPUTextureFormat_Depth32Float;
+    depth.depthWriteEnabled = (key & 8u) ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+    depth.depthCompare = compares[(key >> 1) & 3u];
+    WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    rd.layout = g_native_pipeline_layout;
+    rd.vertex.module = g_native_module;
+    rd.vertex.entryPoint = view("native_vs");
+    rd.vertex.constantCount = 1;
+    rd.vertex.constants = &constant;
+    rd.fragment = &fragment;
+    if (key & 1u) rd.depthStencil = &depth;
+    const WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    g_native_pipelines.emplace(key, pipeline);
+    return pipeline;
+}
+
+// The pages of GS memory under rows y0 to y1 of a surface. Colour and Z24 pages are both 64 by 32 pixels.
+Range surface_range(const Surface &s, int y0, int y1) { return pages(s.bp, s.bw, PSMCT32, 0, y0, static_cast<int>(s.width) - 1, y1); }
+
+bool surface_rows(const Surface &s, const Range &r, int &y0, int &y1) {
+    const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, row = static_cast<std::uint64_t>(s.bw) * 8192;
+    const std::uint64_t lo = std::max(r.lo, base), hi = std::min(r.hi, base + row * ((s.height + 31) / 32));
+    if (lo >= hi) return false;
+    y0 = static_cast<int>((lo - base) / row) * 32;
+    y1 = std::min(static_cast<int>((hi - 1 - base) / row) * 32 + 31, static_cast<int>(s.height) - 1);
+    return true;
+}
+
+void store_surface(Surface &s) {
+    if (!s.dirty) return;
+    s.dirty = false;
+    const std::uint32_t w = static_cast<std::uint32_t>(s.dx1 - s.dx0 + 1), h = static_cast<std::uint32_t>(s.dy1 - s.dy0 + 1);
+    Command c{s.depth ? kStoreDepth : kStoreColor, (w * g_scale + 7) / 8, (h * g_scale + 7) / 8,
+              push_params({s.bp, s.bw, static_cast<std::uint32_t>(s.dx0), static_cast<std::uint32_t>(s.dy0), w, h})};
+    c.target = &s;
+    g_commands.push_back(c);
+    ++g_stores;
+}
+
+// Something other than a native draw to `self` is about to read, or write, this GS memory: textures holding newer
+// pixels there are written back first, and after a write they are stale where it landed.
+void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
+    for (const auto &p : g_surfaces) {
+        Surface &s = *p;
+        if (&s == self) continue;
+        if (s.dirty && surface_range(s, s.dy0, s.dy1).overlaps(r.lo, r.hi)) store_surface(s);
+        int y0, y1;
+        if (write && surface_rows(s, r, y0, y1)) {
+            // One span of stale rows is kept, so it can take in rows nothing wrote to. They are loaded again all the
+            // same: pixels only the texture has in them are written back before that.
+            if (s.stale1 >= s.stale0) {
+                y0 = std::min(y0, s.stale0);
+                y1 = std::max(y1, s.stale1);
+            }
+            if (s.dirty && y0 <= s.dy1 && s.dy0 <= y1) store_surface(s);
+            s.stale0 = y0;
+            s.stale1 = y1;
+        }
+    }
+}
+
+void sync_all() {
+    for (const auto &p : g_surfaces) store_surface(*p);
+}
+
+void retire_surface(std::size_t index) {
+    store_surface(*g_surfaces[index]);
+    g_retired.push_back(std::move(g_surfaces[index]));  // commands not yet submitted may still name it
+    g_surfaces.erase(g_surfaces.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+void release_retired() {
+    for (const auto &s : g_retired) {
+        wgpuBindGroupRelease(s->group);
+        wgpuTextureViewRelease(s->view);
+        wgpuTextureRelease(s->texture);
+    }
+    g_retired.clear();
+}
+
+Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32_t rows, const Surface *keep) {
+    for (std::size_t i = 0; i < g_surfaces.size(); ++i) {
+        Surface &s = *g_surfaces[i];
+        if (s.bp != bp || s.bw != bw || s.depth != depth) continue;
+        if (s.height >= rows) {
+            s.used = ++g_surface_clock;
+            return &s;
+        }
+        retire_surface(i);  // too short: a taller one takes over
+        break;
+    }
+    // Whole pages, and no further than GS memory goes.
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(bw) * 8192, base = static_cast<std::uint64_t>(bp) * 256;
+    if (!bw || base >= kMemorySize) return nullptr;
+    const std::uint32_t most = static_cast<std::uint32_t>(std::min<std::uint64_t>((kMemorySize - base) / row_bytes * 32, 2048));
+    const std::uint32_t height = std::min((rows + 63) & ~63u, most);
+    if (height < rows) return nullptr;
+    if (g_surfaces.size() >= kMaxSurfaces) {
+        std::size_t oldest = g_surfaces.size();
+        for (std::size_t i = 0; i < g_surfaces.size(); ++i)
+            if (g_surfaces[i].get() != keep && (oldest == g_surfaces.size() || g_surfaces[i]->used < g_surfaces[oldest]->used)) oldest = i;
+        retire_surface(oldest);
+    }
+    auto s = std::make_unique<Surface>();
+    s->bp = bp;
+    s->bw = bw;
+    s->depth = depth;
+    s->width = bw * 64;
+    s->height = height;
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    td.size = WGPUExtent3D{s->width * g_scale, s->height * g_scale, 1};
+    td.format = depth ? WGPUTextureFormat_Depth32Float : WGPUTextureFormat_RGBA8Unorm;
+    s->texture = wgpuDeviceCreateTexture(g_device, &td);
+    s->view = wgpuTextureCreateView(s->texture, nullptr);
+    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = 0;
+    entry.textureView = s->view;
+    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bd.layout = g_target_layout;
+    bd.entryCount = 1;
+    bd.entries = &entry;
+    s->group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    s->stale0 = 0;
+    s->stale1 = static_cast<int>(height) - 1;  // nothing of GS memory is in it yet
+    s->used = ++g_surface_clock;
+    g_surfaces.push_back(std::move(s));
+    return g_surfaces.back().get();
+}
+
+void load_surface(Surface &s) {
+    if (s.stale1 < s.stale0) return;
+    NativePass pass{s.depth ? nullptr : &s, s.depth ? &s : nullptr, {}};
+    pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw}), 3, 0, static_cast<std::uint32_t>(s.stale0), s.width,
+                          static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), 0.0f});
+    g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
+    g_native_passes.push_back(std::move(pass));
+    s.stale0 = 0;
+    s.stale1 = -1;
+    ++g_loads;
+}
+
+void plan_decodes(std::uint32_t prims);
+
+// Draws the pending batch with the GPU's rasterizer; false leaves it to the compute rasterizer.
+bool flush_native(std::uint32_t prims) {
+    Batch &b = g_batch;
+    const std::uint32_t rows = static_cast<std::uint32_t>(b.maxy) + 1;
+    Surface *color = surface_for(b.fbp, b.fbw, false, rows, nullptr);
+    if (!color) return false;
+    Surface *depth = b.zte ? surface_for(b.zbp, b.fbw, true, rows, color) : nullptr;
+    if (b.zte && !depth) return false;
+    const Range fb = surface_range(*color, b.miny, b.maxy);
+    const Range z = depth ? surface_range(*depth, b.miny, b.maxy) : Range{};
+    if (depth && fb.overlaps(z.lo, z.hi)) return false;
+    // The textures are read from GS memory as it is before the batch: whichever target holds them newer writes them
+    // back, the batch's own included (a draw reading the frame it draws to).
+    for (const Range &t : g_batch_reads) sync_memory(t, false);
+    sync_memory(fb, true, color);
+    if (depth) sync_memory(z, b.zwrite, depth);
+    // PS2_NATIVE_SYNC=1 reloads the targets before every batch and writes them back after it: slow, and what the
+    // picture should be if the tracking of who holds the newer pixels were at fault.
+    static const bool paranoid = std::getenv("PS2_NATIVE_SYNC") != nullptr;
+    if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 1) {
+        color->stale0 = 0;
+        color->stale1 = static_cast<int>(color->height) - 1;
+        if (depth) depth->stale0 = 0, depth->stale1 = static_cast<int>(depth->height) - 1;
+    }
+    load_surface(*color);
+    if (depth) load_surface(*depth);
+    plan_decodes(prims);
+    const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
+    const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
+    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
+    NativePass pass{color, depth, {}};
+    if (std::getenv("PS2_NATIVE_DEBUG")) std::fprintf(stderr, "[batch] %llu: %u prims, fbp %X zbp %X\n", static_cast<unsigned long long>(g_native_batches), prims, b.fbp, b.zbp);
+    for (std::uint32_t i = 0; i < prims;) {
+        const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+        std::uint32_t j = i + 1;
+        while (j < prims && b.prims[j * kPrimWords] == rec[0] && b.prims[j * kPrimWords + 1] == rec[1]) ++j;
+        const std::uint32_t *w = b.setups.data() + rec[0] * kSetupWords;
+        NativeState state;
+        native_state(w, depth != nullptr, state);
+        const std::uint32_t x0 = std::min(w[10] & 0xFFFFu, color->width), x1 = std::min((w[10] >> 16) + 1, color->width);
+        const std::uint32_t y0 = std::min(w[11] & 0xFFFFu, color->height), y1 = std::min((w[11] >> 16) + 1, color->height);
+        if (std::getenv("PS2_NATIVE_DEBUG")) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
+        if (std::getenv("PS2_NATIVE_DEBUG")) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
+        if (state.draws && x0 < x1 && y0 < y1) {
+            std::array<std::uint32_t, kParamStride / 4> record{};
+            std::memcpy(record.data(), w, kSetupWords * 4);
+            record[0] = state.flags;
+            record[32] = prim_offset + i * kPrimWords;
+            record[33] = rec[1];
+            record[34] = color->width;
+            record[35] = color->height;
+            record[36] = state.premultiply;
+            g_param_records.push_back(record);
+            pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
+                                  y1 - y0, state.constant});
+        }
+        i = j;
+    }
+    g_native_draws += pass.draws.size();
+    if (!pass.draws.empty()) {
+        g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
+        g_native_passes.push_back(std::move(pass));
+    }
+    const auto touched = [&](Surface &s) {
+        const int x1 = std::min(b.maxx, static_cast<int>(s.width) - 1);
+        s.dx0 = s.dirty ? std::min(s.dx0, b.minx) : b.minx;
+        s.dy0 = s.dirty ? std::min(s.dy0, b.miny) : b.miny;
+        s.dx1 = s.dirty ? std::max(s.dx1, x1) : x1;
+        s.dy1 = s.dirty ? std::max(s.dy1, b.maxy) : b.maxy;
+        s.dirty = true;
+    };
+    touched(*color);
+    if (depth && b.zwrite) touched(*depth);
+    if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 2) sync_all();
+    return true;
+}
+
 // PS2_GPU_CENSUS=1 (or a number of seconds): every ten seconds, which draw states the game used and how much screen each covered. It is the
 // shopping list for a renderer that draws with the GPU's own rasterizer: the states at the top are the ones worth
 // supporting first.
@@ -661,13 +1074,17 @@ void census(std::uint32_t prims, bool feedback) {
     g_census_since = std::chrono::steady_clock::now();
 }
 
-void flush_batch() {
+// The pending batch through the compute rasterizer.
+void raster_batch(std::uint32_t prims) {
     Batch &b = g_batch;
-    if (b.prims.empty()) {
-        b.key = ~0ull;
-        return;
+    ++g_compute_batches;
+    g_compute_prims += prims;
+    if (!g_surfaces.empty()) {
+        // It reads and writes GS memory itself: native targets under it go back there first.
+        sync_memory(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy), true);
+        if (b.zte) sync_memory(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy), b.zwrite);
+        for (const Range &r : g_batch_reads) sync_memory(r, false);
     }
-    const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
     g_touched.clear();
     g_spans.clear();
     g_span_start.resize(prims + 1);
@@ -720,6 +1137,25 @@ void flush_batch() {
     note_raster(prims, tiles, total, snapshot);
     census(prims, snapshot != 0);
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+}
+
+void flush_batch() {
+    Batch &b = g_batch;
+    if (b.prims.empty()) {
+        b.key = ~0ull;
+        return;
+    }
+    const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
+    // PS2_NATIVE_LIMIT=<n>: only the first n batches that could go to the native renderer do, to find the batch a
+    // wrong picture starts with.
+    static const std::uint64_t limit = std::getenv("PS2_NATIVE_LIMIT") ? std::strtoull(std::getenv("PS2_NATIVE_LIMIT"), nullptr, 10) : ~0ull;
+    if (b.native && g_native_batches < limit && flush_native(prims)) {
+        ++g_native_batches;
+        g_native_prims += prims;
+        census(prims, false);
+    } else {
+        raster_batch(prims);
+    }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     b.prims.clear();
@@ -730,6 +1166,7 @@ void flush_batch() {
     b.minx = b.miny = 1 << 30;
     b.maxx = b.maxy = -1;
 }
+
 
 void batch_ranges() {
     Batch &b = g_batch;
@@ -755,6 +1192,8 @@ bool batch_conflict(const Range &r, bool clut) {
 }
 
 void emit_pre() {
+    if (!g_surfaces.empty())
+        for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -909,6 +1348,13 @@ void rebuild_group() {
     d.entryCount = 8;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
+    if (!g_native) return;
+    // The same buffers for the native renderer's shaders, without the upload cache they do not read.
+    if (g_native_group) wgpuBindGroupRelease(g_native_group);
+    e[6] = e[7];
+    d.layout = g_native_layout;
+    d.entryCount = 7;
+    g_native_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
 
 void ensure_capacity() {
@@ -930,6 +1376,81 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
+// The render passes of the native renderer from command i on; successive ones on the same targets share a pass.
+// Returns the last command taken.
+std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
+    const NativePass &first = g_native_passes[g_commands[i].x];
+    WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+    WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    if (first.color) {
+        color.view = first.color->view;
+        color.loadOp = WGPULoadOp_Load;
+        color.storeOp = WGPUStoreOp_Store;
+        rd.colorAttachmentCount = 1;
+        rd.colorAttachments = &color;
+    }
+    if (first.depth) {
+        depth.view = first.depth->view;
+        depth.depthLoadOp = WGPULoadOp_Load;
+        depth.depthStoreOp = WGPUStoreOp_Store;
+        rd.depthStencilAttachment = &depth;
+    }
+    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+    WGPURenderPipeline current = nullptr;
+    float constant = 0.0f;
+    for (;;) {
+        for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
+            if (d.pipeline != current) {
+                wgpuRenderPassEncoderSetPipeline(rp, d.pipeline);
+                current = d.pipeline;
+            }
+            const std::uint32_t offset = d.param * kParamStride;
+            wgpuRenderPassEncoderSetBindGroup(rp, 0, g_native_group, 1, &offset);
+            wgpuRenderPassEncoderSetScissorRect(rp, d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale);
+            if (d.constant != constant) {
+                constant = d.constant;
+                const WGPUColor c{constant, constant, constant, constant};
+                wgpuRenderPassEncoderSetBlendConstant(rp, &c);
+            }
+            wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
+        }
+        if (!merge || i + 1 >= g_commands.size() || g_commands[i + 1].pipeline != kNative) break;
+        const NativePass &next = g_native_passes[g_commands[i + 1].x];
+        if (next.color != first.color || next.depth != first.depth) break;
+        ++i;
+    }
+    wgpuRenderPassEncoderEnd(rp);
+    wgpuRenderPassEncoderRelease(rp);
+    return i;
+}
+
+void submitted() {
+    g_commands.clear();
+    g_command_info.clear();
+    ++g_serial;
+    g_param_records.clear();
+    g_arena.clear();
+    g_decoded_used = 0;
+    g_clut_loads = 0;
+    g_native_passes.clear();
+    release_retired();
+    // PS2_GL_STATS (the Switch build's --stats) or PS2_NATIVE_STATS: once a second, how much each rasterizer drew
+    // and how often a target went to GS memory and back. What stays with the compute rasterizer is what costs.
+    static const bool report = g_native && (std::getenv("PS2_GL_STATS") || std::getenv("PS2_NATIVE_STATS"));
+    if (!report) return;
+    static auto since = std::chrono::steady_clock::now();
+    static std::uint64_t last[6] = {};
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+    if (seconds < 1.0) return;
+    const std::uint64_t now[6] = {g_native_batches, g_native_prims, g_compute_batches, g_compute_prims, g_stores, g_loads};
+    std::fprintf(stderr, "[native] per second: %.0f batches (%.0f prims) native, %.0f batches (%.0f prims) compute, %.0f stores, %.0f loads\n",
+                 static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(now[2] - last[2]) / seconds,
+                 static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds, static_cast<double>(now[5] - last[5]) / seconds);
+    std::copy(now, now + 6, last);
+    since = std::chrono::steady_clock::now();
+}
+
 void profile_submit() {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
@@ -947,6 +1468,10 @@ void profile_submit() {
     const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        if (c.pipeline == kNative) {
+            encode_native(enc, i, false);  // not timed
+            continue;
+        }
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
         writes.querySet = g_profile_queries;
         writes.beginningOfPassWriteIndex = i * 2;
@@ -957,6 +1482,7 @@ void profile_submit() {
         wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        if (c.target) wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
@@ -981,7 +1507,8 @@ void profile_submit() {
         std::size_t info = 0;
         for (std::uint32_t i = 0; t && i < n; ++i) {
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
-            std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i, kEntryPoints[g_commands[i].pipeline],
+            std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i,
+                         g_commands[i].pipeline == kNative ? "native" : kEntryPoints[g_commands[i].pipeline],
                          static_cast<unsigned long long>(t[i * 2 + 1] > t[i * 2] ? t[i * 2 + 1] - t[i * 2] : 0), g_commands[i].x, g_commands[i].y);
             if (info < g_command_info.size() && g_command_info[info].index == i)
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
@@ -989,13 +1516,7 @@ void profile_submit() {
         }
         wgpuBufferUnmap(g_profile_read);
     }
-    g_commands.clear();
-    g_command_info.clear();
-    ++g_serial;
-    g_param_records.clear();
-    g_arena.clear();
-    g_decoded_used = 0;
-    g_clut_loads = 0;
+    submitted();
 }
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
@@ -1030,10 +1551,25 @@ void submit(WGPUTextureView present_view = nullptr) {
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+    cd.timestampWrites = nullptr;  // a submit with native passes in it has several compute passes: the first is the one timed
     Pipeline current = kPipelines;
     ++g_submits;
     ++g_total_passes;
-    for (const Command &c : g_commands) {
+    for (std::size_t i = 0; i < g_commands.size(); ++i) {
+        const Command &c = g_commands[i];
+        if (c.pipeline == kNative) {
+            if (pass) {
+                wgpuComputePassEncoderEnd(pass);
+                wgpuComputePassEncoderRelease(pass);
+                pass = nullptr;
+            }
+            i = encode_native(enc, i, true);
+            continue;
+        }
+        if (!pass) {
+            pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            current = kPipelines;
+        }
         ++g_dispatches[c.pipeline];
         if (c.pipeline != current) {
             wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
@@ -1041,10 +1577,13 @@ void submit(WGPUTextureView present_view = nullptr) {
         }
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
+        if (c.target) wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
-    wgpuComputePassEncoderEnd(pass);
-    wgpuComputePassEncoderRelease(pass);
+    if (pass) {
+        wgpuComputePassEncoderEnd(pass);
+        wgpuComputePassEncoderRelease(pass);
+    }
     if (measure) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
@@ -1088,13 +1627,7 @@ void submit(WGPUTextureView present_view = nullptr) {
 #else
     wgpuDevicePoll(g_device, false, nullptr);
 #endif
-    g_commands.clear();
-    g_command_info.clear();
-    ++g_serial;
-    g_param_records.clear();
-    g_arena.clear();
-    g_decoded_used = 0;
-    g_clut_loads = 0;
+    submitted();
 }
 
 void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
@@ -1295,12 +1828,21 @@ bool init(Mode m) {
     limits.maxBufferSize = supported.maxBufferSize;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
-    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
     g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
-    if (g_timestamps) {
-        dd.requiredFeatureCount = 1;
-        dd.requiredFeatures = &timestamp_feature;
-    }
+    // PS2_GPU_NATIVE=1 or 0: draw what it can with the GPU's own rasterizer. On by default on OpenGL (the Switch),
+    // where the compute rasterizer is too slow to play with; elsewhere it is there to be compared against.
+    const char *native_spec = std::getenv("PS2_GPU_NATIVE");
+#ifdef PS2_GPU_GL
+    const bool want_native = !native_spec || std::atoi(native_spec) != 0;
+#else
+    const bool want_native = native_spec && std::atoi(native_spec) != 0;
+#endif
+    g_native = want_native && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+    if (want_native && !g_native) std::fprintf(stderr, "[gpu] no dual source blending: everything goes through the compute rasterizer\n");
+    WGPUFeatureName features[2];
+    if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
+    if (g_native) features[dd.requiredFeatureCount++] = WGPUFeatureName_DualSourceBlending;
+    dd.requiredFeatures = features;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -1379,14 +1921,85 @@ bool init(Mode m) {
     pld.bindGroupLayouts = &g_layout;
     g_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
 
+    if (g_native) {
+        // The compute pipelines that write a target back take its texture as a second group. Unfilterable float
+        // fits a colour and a depth texture alike.
+        WGPUBindGroupLayoutEntry te = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        te.binding = 0;
+        te.visibility = WGPUShaderStage_Compute;
+        te.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        te.texture.viewDimension = WGPUTextureViewDimension_2D;
+        WGPUBindGroupLayoutDescriptor tld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        tld.entryCount = 1;
+        tld.entries = &te;
+        g_target_layout = wgpuDeviceCreateBindGroupLayout(g_device, &tld);
+        const WGPUBindGroupLayout both[2] = {g_layout, g_target_layout};
+        WGPUPipelineLayoutDescriptor spd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        spd.bindGroupLayoutCount = 2;
+        spd.bindGroupLayouts = both;
+        g_store_layout = wgpuDeviceCreatePipelineLayout(g_device, &spd);
+        // The render pipelines see the compute pipelines' buffers, but for the upload cache: GS memory, the tables,
+        // the CLUTs, the snapshot and the decoded textures in the fragment stage, the parameters and the data in both.
+        WGPUBindGroupLayoutEntry ne[7] = {};
+        const std::uint32_t bindings[7] = {0, 1, 2, 3, 4, 5, 7};
+        for (int i = 0; i < 7; ++i) {
+            ne[i] = le[bindings[i]];
+            ne[i].visibility = bindings[i] == 2 || bindings[i] == 3 ? WGPUShaderStage_Vertex | WGPUShaderStage_Fragment : WGPUShaderStage_Fragment;
+        }
+        WGPUBindGroupLayoutDescriptor nld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        nld.entryCount = 7;
+        nld.entries = ne;
+        g_native_layout = wgpuDeviceCreateBindGroupLayout(g_device, &nld);
+        WGPUPipelineLayoutDescriptor npd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        npd.bindGroupLayoutCount = 1;
+        npd.bindGroupLayouts = &g_native_layout;
+        g_native_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &npd);
+        const std::string text = std::string("enable dual_source_blending;\n") + kGsShader + kNativeShader;
+        WGPUShaderSourceWGSL native_source = WGPU_SHADER_SOURCE_WGSL_INIT;
+        native_source.code = view(text.c_str());
+        WGPUShaderModuleDescriptor nmd = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+        nmd.nextInChain = &native_source.chain;
+        g_native_module = wgpuDeviceCreateShaderModule(g_device, &nmd);
+        WGPUConstantEntry scale = WGPU_CONSTANT_ENTRY_INIT;
+        scale.key = view("SCALE");
+        scale.value = static_cast<double>(g_scale);
+        for (int k = 0; k < 2 && g_native_module; ++k) {
+            WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+            target.format = WGPUTextureFormat_RGBA8Unorm;
+            WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+            fragment.module = g_native_module;
+            fragment.entryPoint = view(k ? "load_depth_fs" : "load_color_fs");
+            fragment.constantCount = 1;
+            fragment.constants = &scale;
+            fragment.targetCount = k ? 0 : 1;
+            fragment.targets = k ? nullptr : &target;
+            WGPUDepthStencilState depth = WGPU_DEPTH_STENCIL_STATE_INIT;
+            depth.format = WGPUTextureFormat_Depth32Float;
+            depth.depthWriteEnabled = WGPUOptionalBool_True;
+            depth.depthCompare = WGPUCompareFunction_Always;
+            WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+            rd.layout = g_native_pipeline_layout;
+            rd.vertex.module = g_native_module;
+            rd.vertex.entryPoint = view("load_vs");
+            rd.fragment = &fragment;
+            if (k) rd.depthStencil = &depth;
+            g_load_pipelines[k] = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+        }
+        if (!g_native_module || !g_load_pipelines[0] || !g_load_pipelines[1] || !native_pipeline(1u | (2u << 1) | 8u | (0xFu << 4))) {
+            std::fprintf(stderr, "[gpu] the native renderer's shaders did not build: everything goes through the compute rasterizer\n");
+            g_native = false;
+        }
+    }
+
     WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
     source.code = view(kGsShader);
     WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
     md.nextInChain = &source.chain;
     WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
     for (int i = 0; i < kPipelines; ++i) {
+        if (i >= kStoreColor && !g_native) continue;
         WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
-        cd.layout = g_pipeline_layout;
+        cd.layout = i >= kStoreColor ? g_store_layout : g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[i]);
         WGPUConstantEntry constants[2] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
@@ -1397,10 +2010,12 @@ bool init(Mode m) {
         cd.compute.constantCount = 2;
         cd.compute.constants = constants;
         g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
-        if (!g_pipelines[i]) return false;
+        if (!g_pipelines[i] && i >= kStoreColor) g_native = false;
+        else if (!g_pipelines[i]) return false;
     }
     wgpuShaderModuleRelease(module);
     ensure_capacity();
+    if (g_native) std::fprintf(stderr, "[gpu] native renderer on (PS2_GPU_NATIVE=0 turns it off)\n");
     g_mode = m;
     return true;
 }
@@ -1425,6 +2040,16 @@ void draw(const State &st, const Vertex *v, int count) {
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
         }
+        NativeState state;
+        cache.native = g_native && native_state(w, true, state);
+        // The source alpha as a blend factor must not pass 0x80. The vertices' alpha is known here; a texture's is
+        // not, and is taken to keep to 0x80, as games' textures do (one that does not blends as if it were 0x80).
+        // With a texture's alpha in it: modulate gives at most the vertices' alpha, decal and highlight 2 the
+        // texture's own, and highlight the sum of both, which is left to the compute rasterizer.
+        const bool texture_alpha = (cache.flags & (2u | 8192u)) == (2u | 8192u);
+        const std::uint32_t tfx = (w[7] >> 20) & 3u;
+        if (state.alpha_factor && texture_alpha && (tfx == 2 || (native_skip() & 128u))) cache.native = false;
+        cache.alpha_factor = state.alpha_factor && (!texture_alpha || tfx == 0);
     }
     const std::uint32_t *setup = cache.setup;
     const std::uint32_t flags = cache.flags;
@@ -1521,9 +2146,16 @@ void draw(const State &st, const Vertex *v, int count) {
     maxy = std::min(maxy, 2047);
     if (minx > maxx || miny > maxy) return;
 
+    rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
+    rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
     Batch &b = g_batch;
     const bool zte = flags & 512u;
-    const std::uint64_t key = cache.key;
+    // Triangles and sprites inside the buffer's width, with depths a Z24 buffer holds without clamping.
+    bool native = cache.native && prim >= 3 && maxx < static_cast<int>(setup[2] * 64) && !(native_skip() & (prim == 6 ? 64u : 32u));
+    if (native && zte) native = (prim == 6 ? v[1].z : std::max({v[0].z, v[1].z, v[2].z})) <= 0xFFFFFFu;
+    // A source alpha above 0x80 is a blend factor above one, which only the compute rasterizer has.
+    if (native && cache.alpha_factor) native = (prim == 6 ? v[1].a : iip ? std::max({v[0].a, v[1].a, v[2].a}) : v[2].a) <= 0x80u;
+    const std::uint64_t key = cache.key | (native ? 1ull << 63 : 0ull);
     if (b.key != ~0ull && b.key != key) emit_all();
     const Range &tex = cache.tex;
     if (flags & 2u) {
@@ -1537,7 +2169,9 @@ void draw(const State &st, const Vertex *v, int count) {
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);
                     const bool small = rect[2] - rect[0] < 64 && rect[3] - rect[1] < 64;
-                    const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b);
+                    // A native batch reads its textures from GS memory, which holds the frame as it was before the batch:
+                    // what the compute rasterizer's snapshot gives, but for a sprite reading the very pixels it writes.
+                    const bool cached = b.texflushes == g_texflushes && small && shares_frame(setup, b) && !(b.native && reads_own_word(rec, setup));
                     const bool frame = !cached && (shares_frame(setup, b) ? drawn_under(b, rect) : used.overlaps(b.fb_range.lo, b.fb_range.hi));
                     if (frame || (b.zwrite && used.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
                 }
@@ -1555,6 +2189,7 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zte = false;
         b.zwrite = false;
         b.rx1 = -2;
+        b.native = native;
     }
     b.zte = b.zte || zte;
     b.zwrite = b.zwrite || (zte && !(flags & 32u));
@@ -1574,8 +2209,6 @@ void draw(const State &st, const Vertex *v, int count) {
         }
     }
     rec[0] = setup_index;
-    rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
-    rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
     b.prims.insert(b.prims.end(), rec, rec + kPrimWords);
     b.boxes.push_back(rec[2]);
     b.boxes.push_back(rec[3]);
@@ -1622,6 +2255,13 @@ void local_copy(const State &s) {
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
     if (!w || !h) return;
+    if (!g_surfaces.empty()) {
+        const int sx = static_cast<int>(pos) & 0x7FF, sy = static_cast<int>(pos >> 16) & 0x7FF, dx = static_cast<int>(pos >> 32) & 0x7FF, dy = static_cast<int>(pos >> 48) & 0x7FF;
+        sync_memory(pages(static_cast<std::uint32_t>(buf) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 16) & 0x3Fu, static_cast<std::uint32_t>(buf >> 24) & 0x3Fu, sx, sy,
+                          sx + static_cast<int>(w) - 1, sy + static_cast<int>(h) - 1), false);
+        sync_memory(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu, dx, dy,
+                          dx + static_cast<int>(w) - 1, dy + static_cast<int>(h) - 1), true);
+    }
     mark_rendered(pages(static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu, static_cast<std::uint32_t>(buf >> 48) & 0x3Fu, static_cast<std::uint32_t>(buf >> 56) & 0x3Fu,
                         static_cast<int>(pos >> 32) & 0x7FF, static_cast<int>(pos >> 48) & 0x7FF, (static_cast<int>(pos >> 32) & 0x7FF) + static_cast<int>(w) - 1,
                         (static_cast<int>(pos >> 48) & 0x7FF) + static_cast<int>(h) - 1));
@@ -1677,6 +2317,18 @@ void wait_idle() {
     wait_until(done);
 }
 
+void sync_bytes(std::uint32_t offset, std::uint32_t bytes) {
+    Range r;
+    r.add(offset, static_cast<std::uint64_t>(offset) + bytes);
+    sync_memory(r, false);
+}
+
+void sync_display(const DisplaySource &src) {
+    if (g_surfaces.empty()) return;
+    sync_memory(pages(src.fbp, src.fbw, src.psm, static_cast<int>(src.dbx), static_cast<int>(src.dby), static_cast<int>(src.dbx + src.width) - 1,
+                      static_cast<int>(src.dby + src.height) - 1), false);
+}
+
 struct PendingDownload {
     WGPUBuffer buffer = nullptr;
     std::uint64_t capacity = 0;
@@ -1702,6 +2354,7 @@ bool download_async(std::uint8_t *memory, std::uint32_t offset, std::uint32_t by
         g_pending.buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     flush_all();
+    sync_bytes(offset, bytes);
     if (g_scale != 1) dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
@@ -1735,6 +2388,7 @@ bool finish_download(std::uint32_t serial) {
 
 void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     flush_all();
+    sync_bytes(offset, bytes);
     if (g_scale == 1) {
         submit();
         read_back(g_vram, bytes, memory + offset, offset);
@@ -1747,6 +2401,7 @@ void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
     flush_all();
+    sync_all();
     submit();
     scale = g_scale;
     vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
@@ -1757,6 +2412,9 @@ void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vec
 
 void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
     wait_idle();
+    // GS memory is replaced whole: the native targets hold nothing worth keeping.
+    for (const auto &s : g_surfaces) s->dirty = false;
+    while (!g_surfaces.empty()) retire_surface(0);
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
@@ -1777,6 +2435,11 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    if (g_native)
+        std::fprintf(stderr, "[gpu] native: %llu batches (%llu prims, %llu draws), compute: %llu batches (%llu prims); %llu stores, %llu loads, %zu targets, %zu pipelines\n",
+                     static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
+                     static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
+                     static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
 }
 
 void configure_surface() {
@@ -1904,6 +2567,7 @@ bool has_surface() { return g_surface != nullptr; }
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     flush_all();
+    sync_display(src);
     const std::uint32_t current = field_base(g_field), previous = field_base(g_field + 1);
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
@@ -1986,6 +2650,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
             slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
         }
         flush_all();
+        sync_display(src);
         const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
         g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
         submit();
@@ -2014,6 +2679,7 @@ bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, s
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     flush_all();
+    sync_display(src);
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
     g_commands.push_back({kDisplay, (src.width * g_scale + 7) / 8, (src.height * g_scale + 7) / 8, param});
     submit();

@@ -2,7 +2,19 @@
 // software rasterizer and the GPU renderer both draw everything, and compares
 // the 4 MiB of GS memory they end up with. No game data is involved.
 //
-//   gs_gpu_compare_test [scenes] [--dump file]
+//   gs_gpu_compare_test [scenes] [--dump file] [--race] [--against file [--tolerance n] [--allow n]]
+//
+// --race draws scenes with the states a 3D game's race mostly uses (32-bit
+// frames, a 24-bit Z buffer, alpha tests that discard, a handful of blend
+// equations) with some of everything else mixed in: what the native renderer
+// (PS2_GPU_NATIVE) takes, next to what it leaves to the compute rasterizer.
+//
+// --against compares this run with the dump of another one that drew the same
+// scenes, byte by byte within a tolerance (2 by default), and fails when a
+// scene has more bytes outside it than --allow (64 by default). That is how the
+// native renderer is checked against the compute rasterizer: fixed-function
+// blending rounds where the GS truncates, so most blended pixels are one step
+// off, and a texel exactly on a triangle's edge can go either way.
 //
 // It prints, per scene, how many bytes differ and where the first differences
 // are. --dump writes the GPU's final memory, so two GPU backends can be
@@ -33,6 +45,7 @@ std::uint32_t rnd() {
     return static_cast<std::uint32_t>(g_rng >> 11);
 }
 std::uint32_t pick(std::uint32_t n) { return rnd() % n; }
+bool g_race = false;
 bool chance(std::uint32_t percent) { return pick(100) < percent; }
 
 std::uint64_t bits(std::uint64_t v, int shift) { return v << shift; }
@@ -71,6 +84,9 @@ void upload(std::uint32_t dbp, std::uint32_t dbw, std::uint32_t psm, std::uint32
     const std::uint32_t seed = rnd();
     for (std::size_t i = 0; i < data.size(); ++i)
         data[i] = static_cast<std::uint8_t>((i * 7 + (i / 64) * 13 + seed) ^ (chance(10) ? rnd() : 0u));
+    // Games keep alpha at or below 0x80 (which is 1.0) nearly everywhere.
+    if (g_race && bpp == 32)
+        for (std::size_t i = 3; i < data.size(); i += 4) data[i] = static_cast<std::uint8_t>(data[i] > 0x80 ? data[i] >> 1 : data[i]);
     write_image(data.data(), static_cast<std::uint32_t>(data.size() / 16));
 }
 
@@ -90,10 +106,12 @@ struct Scene {
 
 std::uint32_t frame_psm() {
     static const std::uint32_t psms[] = {PSMCT32, PSMCT32, PSMCT24, PSMCT16, PSMCT16S};
+    if (g_race) return pick(100) < 80 ? PSMCT32 : PSMCT24;
     return psms[pick(5)];
 }
 std::uint32_t z_psm() {
     static const std::uint32_t psms[] = {PSMZ32, PSMZ24, PSMZ16, PSMZ16S};
+    if (g_race) return pick(100) < 95 ? PSMZ24 : PSMZ32;
     return psms[pick(4)];
 }
 std::uint32_t tex_psm() {
@@ -107,7 +125,12 @@ std::uint32_t tex_psm() {
 void setup_context(const Scene &sc) {
     write(PRMODECONT, 1);
     std::uint64_t frame = bits(kFrameBp / 32, 0) | bits(kW / 64, 16) | bits(sc.fpsm, 24);
-    if (chance(15)) frame |= bits(rnd() & 0x00FF00FFu, 32);
+    if (g_race) {
+        static const std::uint32_t masks[] = {0xFF000000u, 0x00FFFFFFu, 0x00FF0000u, 0xFF00FF00u};
+        // Whole channels only: under a mask inside a channel, a blend the native renderer rounds one step
+        // differently can change the bits kept, and the comparison's tolerance would mean nothing.
+        if (chance(30)) frame |= bits(masks[pick(4)], 32);
+    } else if (chance(15)) frame |= bits(rnd() & 0x00FF00FFu, 32);
     write(FRAME_1, frame);
     write(ZBUF_1, bits(kZBp / 32, 0) | bits(sc.zpsm & 0xF, 24) | (chance(10) ? bits(1, 32) : 0));
     write(XYOFFSET_1, bits(kOff, 0) | bits(kOff, 32));
@@ -116,25 +139,41 @@ void setup_context(const Scene &sc) {
     const std::uint32_t x1 = kW - 1 - (chance(20) ? pick(100) : 0);
     const std::uint32_t y1 = kH - 1 - (chance(20) ? pick(100) : 0);
     write(SCISSOR_1, bits(x0, 0) | bits(x1, 16) | bits(y0, 32) | bits(y1, 48));
-    const bool ate = chance(30);
-    const bool date = chance(10);
-    const bool zte = chance(70);
-    const std::uint32_t atst = pick(8), aref = pick(256), afail = pick(4), datm = pick(2), ztst = pick(4);
+    bool ate = chance(30);
+    bool date = chance(10);
+    bool zte = chance(70);
+    std::uint32_t atst = pick(8), aref = pick(256), afail = pick(4), datm = pick(2), ztst = pick(4);
+    if (g_race) {
+        static const std::uint32_t tests[] = {6, 6, 6, 5, 1, 0, 0, 7};
+        ate = chance(50);
+        date = chance(3);
+        zte = chance(85);
+        atst = tests[pick(8)];
+        if (chance(75)) afail = atst == 0 ? 2 : 0;
+        if (chance(80)) ztst = chance(75) ? 2 : 1 + pick(3);
+    }
     write(TEST_1, (ate ? 1u : 0u) | bits(atst, 1) | bits(aref, 4) | bits(afail, 12) | (date ? bits(1, 14) : 0) | bits(datm, 15) | (zte ? bits(1, 16) : 0) |
                       bits(ztst, 17));
-    const std::uint32_t a = pick(3), b = pick(3), c = pick(3), d = pick(3), fix = pick(256);
+    std::uint32_t a = pick(3), b = pick(3), c = pick(3), d = pick(3), fix = pick(256);
+    if (g_race && chance(85)) {
+        // (Cs - Cd) * As + Cd, Cd * FIX, Cs * FIX + Cd, (Cs - Cd) * FIX + Cd, Cs * Ad + Cd
+        static const std::uint32_t equations[][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {1, 2, 2, 2}, {0, 2, 2, 1}, {0, 1, 2, 1}, {0, 2, 1, 1}};
+        const std::uint32_t *e = equations[pick(6)];
+        a = e[0], b = e[1], c = e[2], d = e[3];
+        fix = pick(129);
+    }
     write(ALPHA_1, bits(a, 0) | bits(b, 2) | bits(c, 4) | bits(d, 6) | bits(fix, 32));
     write(FBA_1, chance(15) ? 1 : 0);
-    write(COLCLAMP, chance(85) ? 1 : 0);
-    write(PABE, chance(10) ? 1 : 0);
+    write(COLCLAMP, chance(g_race ? 97 : 85) ? 1 : 0);
+    write(PABE, chance(g_race ? 3 : 10) ? 1 : 0);
     write(DTHE, chance(10) ? 1 : 0);
     const std::uint64_t dimx_lo = rnd();
     const std::uint64_t dimx_hi = rnd();
     write(DIMX, dimx_lo | (dimx_hi << 32));
     write(FOGCOL, rnd() & 0xFFFFFFu);
-    const std::uint32_t ta0 = pick(256);
+    const std::uint32_t ta0 = pick(g_race ? 129 : 256);
     const bool aem = chance(30);
-    const std::uint32_t ta1 = pick(256);
+    const std::uint32_t ta1 = pick(g_race ? 129 : 256);
     write(TEXA, bits(ta0, 0) | (aem ? bits(1, 15) : 0) | bits(ta1, 32));
     if (sc.texture) {
         const std::uint32_t tw = 4 + pick(5);  // 16..256
@@ -154,7 +193,8 @@ void setup_context(const Scene &sc) {
             else upload(kClutBp, 1, cpsm, 0, 0, four ? 8 : 16, four ? 2 : 16);
             if (csm) write(TEXCLUT, bits(4, 0) | bits(0, 6) | bits(0, 12));
         }
-        const std::uint32_t tcc = pick(2), tfx = pick(4);
+        std::uint32_t tcc = pick(2), tfx = pick(4);
+        if (g_race && chance(85)) tfx = pick(2);
         const std::uint32_t csa = csm ? 0 : pick(2) * 16 / (four ? 1 : 16);
         const std::uint64_t tex0 = bits(kTexBp, 0) | bits(tbw_reg, 14) | bits(sc.tpsm, 20) | bits(tw, 26) | bits(th, 30) | bits(tcc, 34) | bits(tfx, 35) |
                                    bits(kClutBp, 37) | bits(cpsm, 51) | bits(csm, 55) | bits(csa, 56) | bits(clut ? 1 : 0, 61);
@@ -180,7 +220,7 @@ void vertex(bool fst, bool fog, bool texture, int x, int y) {
     const std::uint32_t r = pick(256);
     const std::uint32_t g = pick(256);
     const std::uint32_t b = pick(256);
-    const std::uint32_t a = pick(256);
+    const std::uint32_t a = pick(g_race && chance(95) ? 129 : 256);
     const float q = texture && !fst ? 0.5f + static_cast<float>(pick(1000)) / 500.0f : 1.0f;
     write(RGBAQ, r | (g << 8) | (b << 16) | (static_cast<std::uint64_t>(a) << 24) | (static_cast<std::uint64_t>(f2u(q)) << 32));
     if (texture) {
@@ -194,7 +234,7 @@ void vertex(bool fst, bool fog, bool texture, int x, int y) {
             write(ST, f2u(s) | (static_cast<std::uint64_t>(f2u(t)) << 32));
         }
     }
-    const std::uint32_t z = rnd();
+    const std::uint32_t z = g_race ? rnd() & 0xFFFFFFu : rnd();
     const std::uint32_t xx = static_cast<std::uint32_t>(x + 2048 * 16) & 0xFFFFu, yy = static_cast<std::uint32_t>(y + 2048 * 16) & 0xFFFFu;
     if (fog) {
         const std::uint64_t f = pick(256);
@@ -206,7 +246,8 @@ void vertex(bool fst, bool fog, bool texture, int x, int y) {
 
 void draw_prims(const Scene &sc, int count) {
     for (int n = 0; n < count; ++n) {
-        const std::uint32_t type = pick(10) < 2 ? 6u : pick(7);  // sprites are common in PS2 games
+        std::uint32_t type = pick(10) < 2 ? 6u : pick(7);  // sprites are common in PS2 games
+        if (g_race && type < 3 && chance(80)) type = 3 + pick(3);
         const bool iip = chance(60);
         const bool fge = chance(15);
         const bool abe = chance(40);
@@ -242,9 +283,14 @@ int differences(const std::uint8_t *a, const std::uint8_t *b, std::size_t n, std
 
 int main(int argc, char **argv) {
     int scenes = 40;
-    const char *dump = nullptr;
+    const char *dump = nullptr, *against = nullptr;
+    int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--race") == 0) g_race = true;
+        else if (std::strcmp(argv[i], "--against") == 0 && i + 1 < argc) against = argv[++i];
+        else if (std::strcmp(argv[i], "--tolerance") == 0 && i + 1 < argc) tolerance = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--allow") == 0 && i + 1 < argc) allow = std::atoi(argv[++i]);
         else scenes = std::atoi(argv[i]);
     }
     setenv("PS2_GS", "both", 0);
@@ -255,6 +301,14 @@ int main(int argc, char **argv) {
     }
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
+    std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;
+    if (against && !against_file) {
+        std::fprintf(stderr, "cannot open %s\n", against);
+        return 2;
+    }
+    std::vector<std::uint8_t> other;
+    long long near_bytes = 0, far_bytes = 0;
+    int far_scenes = 0, worst = 0;
     int matched = 0;
     for (int s = 0; s < scenes; ++s) {
         Scene sc{};
@@ -281,6 +335,7 @@ int main(int argc, char **argv) {
             write(TEX0_1, bits(kFrameBp, 0) | bits(kW / 64, 14) | bits(next.tpsm, 20) | bits(8, 26) | bits(8, 30) | bits(1, 34));
             draw_prims(next, 20);
         }
+        if (std::getenv("PS2_NATIVE_DEBUG")) std::fprintf(stderr, "[scene %d]\n", s);
         gpu::download(gpu_memory.data());
         if (dump_file) std::fwrite(gpu_memory.data(), 1, gpu_memory.size(), dump_file);
         // The picture the display circuit would show, as the renderer converts it for the screen.
@@ -288,6 +343,31 @@ int main(int argc, char **argv) {
         std::uint32_t width = 0, height = 0;
         gpu::display(gpu::DisplaySource{kFrameBp, kW / 64, sc.fpsm, 0, 0, kW, kH, false}, rgba, width, height);
         if (dump_file) std::fwrite(rgba.data(), 4, rgba.size(), dump_file);
+        if (against_file) {
+            // The other run's GS memory and picture for this scene.
+            const std::size_t picture = rgba.size() * 4;
+            other.resize(kMemorySize + picture);
+            if (std::fread(other.data(), 1, other.size(), against_file) != other.size()) {
+                std::fprintf(stderr, "%s ends before scene %d\n", against, s);
+                return 2;
+            }
+            int far = 0;
+            const auto compare = [&](const std::uint8_t *mine, const std::uint8_t *theirs, std::size_t bytes) {
+                for (std::size_t i = 0; i < bytes; ++i) {
+                    const int d = std::abs(static_cast<int>(mine[i]) - static_cast<int>(theirs[i]));
+                    if (d > tolerance) ++far;
+                    else if (d) ++near_bytes;
+                }
+            };
+            compare(gpu_memory.data(), other.data(), kMemorySize);
+            compare(reinterpret_cast<const std::uint8_t *>(rgba.data()), other.data() + kMemorySize, picture);
+            far_bytes += far;
+            worst = std::max(worst, far);
+            if (far > allow) {
+                ++far_scenes;
+                std::printf("scene %2d: %d bytes more than %d away from %s\n", s, far, tolerance, against);
+            }
+        }
         std::size_t first = 0;
         const int diff = differences(memory(), gpu_memory.data(), kMemorySize, first);
         if (!diff) ++matched;
@@ -296,6 +376,13 @@ int main(int argc, char **argv) {
         std::printf("\n");
     }
     if (dump_file) std::fclose(dump_file);
+    gpu::stats();
+    if (against_file) {
+        std::fclose(against_file);
+        std::printf("against %s: %lld bytes within %d, %lld further off (%d in the worst scene), %d of %d scenes over the %d allowed\n", against, near_bytes, tolerance,
+                    far_bytes, worst, far_scenes, scenes, allow);
+        return far_scenes ? 1 : 0;
+    }
     const char *min = std::getenv("PS2_COMPARE_MIN_PERCENT");
     const int need = min ? std::atoi(min) : 100;
     std::printf("%d of %d scenes identical to the software renderer\n", matched, scenes);

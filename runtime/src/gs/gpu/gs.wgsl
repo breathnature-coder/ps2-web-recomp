@@ -11,6 +11,10 @@ struct Params {
 @group(0) @binding(6) var<storage, read> cache: array<u32>;
 @group(0) @binding(7) var<storage, read_write> decoded: array<u32>;
 
+// A render target of the native renderer (see native.wgsl), bound when it is written back to GS memory. A depth
+// target is read through the same binding, as an unfilterable float texture with the depth in its first component.
+@group(1) @binding(0) var target_texture: texture_2d<f32>;
+
 override SCALE: u32 = 1u;
 // Side of a raster tile in samples; the renderer bins primitives into tiles of this size.
 override TILE: u32 = 16u;
@@ -698,48 +702,8 @@ struct Attr {
     z: u32,
 }
 
-fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
-    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
-        return;
-    }
-    let scanmsk = mode(s, 28u, 2u);
-    if (scanmsk == 2u && (y & 1) == 0) {
-        return;
-    }
-    if (scanmsk == 3u && (y & 1) != 0) {
-        return;
-    }
-    let ux = u32(x);
-    let uy = u32(y);
-    let z = min(at.z, s.zmax);
-    let fl = addr(s.ff, ux, uy);
-    var zl = Loc(0u, 0u, 0u);
-
-    var dst = 0u;
-    var have_dst = false;
-    if (has(s, F_DATE)) {
-        dst = read_frame(s, fl, k);
-        have_dst = true;
-        if (((dst & 0x80000000u) != 0u) != has(s, F_DATM)) {
-            return;
-        }
-    }
-
-    let zte = has(s, F_ZTE);
-    if (zte) {
-        let ztst = mode(s, 8u, 2u);
-        if (ztst == 0u) {
-            return;
-        }
-        zl = addr(s.zf, ux, uy);
-        if (ztst != 1u) {
-            let old = load_at(zl, k) & s.zmax;
-            if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
-                return;
-            }
-        }
-    }
-
+// The colour a primitive gives a pixel before the tests and blending: vertex colour, texture function and fog.
+fn shade_color(s: Setup, at: Attr, k: u32) -> vec4<i32> {
     var r = i32(at.r);
     var g = i32(at.g);
     var b = i32(at.b);
@@ -808,39 +772,94 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         g = (f * g + (255 - f) * fg) >> 8u;
         b = (f * b + (255 - f) * fb) >> 8u;
     }
+    return vec4<i32>(r, g, b, a);
+}
+
+fn alpha_test(s: Setup, a: i32) -> bool {
+    let av = u32(a);
+    var ok = false;
+    switch mode(s, 0u, 3u) {
+        case 0u {
+            ok = false;
+        }
+        case 1u {
+            ok = true;
+        }
+        case 2u {
+            ok = av < s.aref;
+        }
+        case 3u {
+            ok = av <= s.aref;
+        }
+        case 4u {
+            ok = av == s.aref;
+        }
+        case 5u {
+            ok = av >= s.aref;
+        }
+        case 6u {
+            ok = av > s.aref;
+        }
+        default {
+            ok = av != s.aref;
+        }
+    }
+    return ok;
+}
+
+fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
+    if (x < s.scax0 || x > s.scax1 || y < s.scay0 || y > s.scay1) {
+        return;
+    }
+    let scanmsk = mode(s, 28u, 2u);
+    if (scanmsk == 2u && (y & 1) == 0) {
+        return;
+    }
+    if (scanmsk == 3u && (y & 1) != 0) {
+        return;
+    }
+    let ux = u32(x);
+    let uy = u32(y);
+    let z = min(at.z, s.zmax);
+    let fl = addr(s.ff, ux, uy);
+    var zl = Loc(0u, 0u, 0u);
+
+    var dst = 0u;
+    var have_dst = false;
+    if (has(s, F_DATE)) {
+        dst = read_frame(s, fl, k);
+        have_dst = true;
+        if (((dst & 0x80000000u) != 0u) != has(s, F_DATM)) {
+            return;
+        }
+    }
+
+    let zte = has(s, F_ZTE);
+    if (zte) {
+        let ztst = mode(s, 8u, 2u);
+        if (ztst == 0u) {
+            return;
+        }
+        zl = addr(s.zf, ux, uy);
+        if (ztst != 1u) {
+            let old = load_at(zl, k) & s.zmax;
+            if ((ztst == 2u && z < old) || (ztst == 3u && z <= old)) {
+                return;
+            }
+        }
+    }
+
+    let shaded = shade_color(s, at, k);
+    var r = shaded.x;
+    var g = shaded.y;
+    var b = shaded.z;
+    let a = shaded.w;
 
     var write_fb = true;
     var write_z = !has(s, F_ZMSK);
     var write_alpha = true;
     if (has(s, F_ATE)) {
-        let av = u32(a);
-        var ok = false;
-        switch mode(s, 0u, 3u) {
-            case 0u {
-                ok = false;
-            }
-            case 1u {
-                ok = true;
-            }
-            case 2u {
-                ok = av < s.aref;
-            }
-            case 3u {
-                ok = av <= s.aref;
-            }
-            case 4u {
-                ok = av == s.aref;
-            }
-            case 5u {
-                ok = av >= s.aref;
-            }
-            case 6u {
-                ok = av > s.aref;
-            }
-            default {
-                ok = av != s.aref;
-            }
-        }
+        let ok = alpha_test(s, a);
         if (!ok) {
             switch mode(s, 4u, 2u) {
                 case 0u {
@@ -943,7 +962,10 @@ fn vertex_tex(p: u32, n: u32) -> vec4<f32> {
 }
 
 fn z_at(p: u32, d: f32) -> u32 {
-    let z0 = data[p + 24u];
+    return z_step(data[p + 24u], d);
+}
+
+fn z_step(z0: u32, d: f32) -> u32 {
     let step = floor(d);
     if (step >= 0.0) {
         return z0 + u32(min(step, f32(0xFFFFFFFFu - z0)));
@@ -955,75 +977,93 @@ fn edge_in(w: f32, inclusive: u32) -> bool {
     return w > 0.0 || (w == 0.0 && inclusive != 0u);
 }
 
+// What a primitive gives the sample at (px, py) of pixel (x, y), if it covers it. The compute rasterizer takes the
+// primitive from its record in the data buffer; the native renderer hands the same values over from its vertex stage.
+struct Covered {
+    inside: bool,
+    at: Attr,
+}
+
+// pa: x0, y0, x1, y1. pb: x2, y2, 1 / area. c and t: the vertices' colours and S, T, Q, fog. dz: Z of vertices 1 and 2 less z0.
+fn triangle_at(pa: vec4<f32>, pb: vec4<f32>, inclusive: u32, c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, t0: vec4<f32>, t1: vec4<f32>, t2: vec4<f32>,
+               z0: u32, dz: vec2<f32>, px: f32, py: f32) -> Covered {
+    var out: Covered;
+    let w0 = ((pa.z - px) * (pb.y - py) - (pb.x - px) * (pa.w - py)) * pb.z;
+    let w1 = ((pb.x - px) * (pa.y - py) - (pa.x - px) * (pb.y - py)) * pb.z;
+    let e2 = ((pa.x - px) * (pa.w - py) - (pa.z - px) * (pa.y - py)) * pb.z;
+    out.inside = edge_in(w0, inclusive & 1u) && edge_in(w1, inclusive & 2u) && edge_in(e2, inclusive & 4u);
+    let w2 = 1.0 - w0 - w1;
+    let c = c0 * w0 + c1 * w1 + c2 * w2;
+    let t = t0 * w0 + t1 * w1 + t2 * w2;
+    out.at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_step(z0, dz.x * w1 + dz.y * w2));
+    return out;
+}
+
+// pa: x0, y0 and the size. a and b: S, T, Q, fog of the two corners. c: the colour.
+fn sprite_at(s: Setup, pa: vec4<f32>, a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, z: u32, x: i32, y: i32, px: f32, py: f32) -> Covered {
+    var out: Covered;
+    let x0 = pa.x;
+    let y0 = pa.y;
+    let dx = pa.z;
+    let dy = pa.w;
+    var du = b.x - a.x;
+    var dv = b.y - a.y;
+    if (has(s, F_FST)) {
+        du = du / 16.0;
+        dv = dv / 16.0;
+    } else {
+        var q = b.z;
+        if (q == 0.0) {
+            q = 1.0;
+        }
+        du = du / q * f32(1u << s.tw);
+        dv = dv / q * f32(1u << s.th);
+    }
+    var ux = px;
+    var uy = py;
+    let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
+    let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+    if (point && abs(du) >= abs(dx) * 0.999) {
+        ux = f32(x);
+    }
+    if (point && abs(dv) >= abs(dy) * 0.999) {
+        uy = f32(y);
+    }
+    let cx = f32(x);
+    let cy = f32(y);
+    out.inside = !(SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy)));
+    var tx = 0.0;
+    var ty = 0.0;
+    if (dx != 0.0) {
+        tx = (ux - x0) / dx;
+    }
+    if (dy != 0.0) {
+        ty = (uy - y0) / dy;
+    }
+    out.at = Attr(c.x, c.y, c.z, c.w, a.x + (b.x - a.x) * tx, a.y + (b.y - a.y) * ty, b.z, b.w, z);
+    return out;
+}
+
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     let kind = data[p + 1u];
     var at: Attr;
     switch kind {
         case 0u {
-            let x0 = fat(p + 4u);
-            let y0 = fat(p + 5u);
-            let x1 = fat(p + 6u);
-            let y1 = fat(p + 7u);
-            let x2 = fat(p + 8u);
-            let y2 = fat(p + 9u);
-            let inv = fat(p + 10u);
-            let w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) * inv;
-            let w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) * inv;
-            let c2 = ((x0 - px) * (y1 - py) - (x1 - px) * (y0 - py)) * inv;
-            let inclusive = data[p + 27u];
-            if (!edge_in(w0, inclusive & 1u) || !edge_in(w1, inclusive & 2u) || !edge_in(c2, inclusive & 4u)) {
+            let hit = triangle_at(vec4<f32>(fat(p + 4u), fat(p + 5u), fat(p + 6u), fat(p + 7u)), vec4<f32>(fat(p + 8u), fat(p + 9u), fat(p + 10u), 0.0), data[p + 27u],
+                                  vertex_attr(p, 0u), vertex_attr(p, 1u), vertex_attr(p, 2u), vertex_tex(p, 0u), vertex_tex(p, 1u), vertex_tex(p, 2u),
+                                  data[p + 24u], vec2<f32>(fat(p + 25u), fat(p + 26u)), px, py);
+            if (!hit.inside) {
                 return;
             }
-            let w2 = 1.0 - w0 - w1;
-            let c = vertex_attr(p, 0u) * w0 + vertex_attr(p, 1u) * w1 + vertex_attr(p, 2u) * w2;
-            let t = vertex_tex(p, 0u) * w0 + vertex_tex(p, 1u) * w1 + vertex_tex(p, 2u) * w2;
-            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, fat(p + 25u) * w1 + fat(p + 26u) * w2));
+            at = hit.at;
         }
         case 1u {
-            let x0 = fat(p + 4u);
-            let y0 = fat(p + 5u);
-            let dx = fat(p + 6u);
-            let dy = fat(p + 7u);
-            let a = vertex_tex(p, 0u);
-            let b = vertex_tex(p, 1u);
-            var du = b.x - a.x;
-            var dv = b.y - a.y;
-            if (has(s, F_FST)) {
-                du = du / 16.0;
-                dv = dv / 16.0;
-            } else {
-                var q = b.z;
-                if (q == 0.0) {
-                    q = 1.0;
-                }
-                du = du / q * f32(1u << s.tw);
-                dv = dv / q * f32(1u << s.th);
-            }
-            var ux = px;
-            var uy = py;
-            let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
-            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
-            if (point && abs(du) >= abs(dx) * 0.999) {
-                ux = f32(x);
-            }
-            if (point && abs(dv) >= abs(dy) * 0.999) {
-                uy = f32(y);
-            }
-            let cx = f32(x);
-            let cy = f32(y);
-            if (SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy))) {
+            let hit = sprite_at(s, vec4<f32>(fat(p + 4u), fat(p + 5u), fat(p + 6u), fat(p + 7u)), vertex_tex(p, 0u), vertex_tex(p, 1u), vertex_attr(p, 1u), data[p + 24u],
+                                x, y, px, py);
+            if (!hit.inside) {
                 return;
             }
-            var tx = 0.0;
-            var ty = 0.0;
-            if (dx != 0.0) {
-                tx = (ux - x0) / dx;
-            }
-            if (dy != 0.0) {
-                ty = (uy - y0) / dy;
-            }
-            let c = vertex_attr(p, 1u);
-            at = Attr(c.x, c.y, c.z, c.w, a.x + (b.x - a.x) * tx, a.y + (b.y - a.y) * ty, b.z, b.w, data[p + 24u]);
+            at = hit.at;
         }
         case 2u {
             let x0 = fat(p + 4u);
@@ -1106,6 +1146,31 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
+}
+
+// Native render targets back into GS memory. Parameters: block pointer, buffer width, then the rectangle in pixels.
+// A colour target holds whole 32-bit words (a CT24 draw leaves its alpha alone); a depth target holds Z24.
+@compute @workgroup_size(8, 8)
+fn store_color(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(4u) * SCALE || gid.y >= prm(5u) * SCALE) {
+        return;
+    }
+    let sx = prm(2u) * SCALE + gid.x;
+    let sy = prm(3u) * SCALE + gid.y;
+    let c = vec4<u32>(textureLoad(target_texture, vec2<i32>(i32(sx), i32(sy)), 0) * 255.0 + vec4<f32>(0.5));
+    store(addr(fmt_of(PSMCT32, prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE, c.x | (c.y << 8u) | (c.z << 16u) | (c.w << 24u));
+}
+
+@compute @workgroup_size(8, 8)
+fn store_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(4u) * SCALE || gid.y >= prm(5u) * SCALE) {
+        return;
+    }
+    let sx = prm(2u) * SCALE + gid.x;
+    let sy = prm(3u) * SCALE + gid.y;
+    // A Z24 value is exact in a 32-bit float and so is this product; adding a half to round would not be.
+    let z = u32(clamp(textureLoad(target_texture, vec2<i32>(i32(sx), i32(sy)), 0).x * 16777216.0, 0.0, 16777215.0));
+    store(addr(fmt_of(PSMZ24, prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE, z);
 }
 
 @compute @workgroup_size(TILE, TILE)

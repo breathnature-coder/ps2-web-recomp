@@ -5,6 +5,8 @@
 # byte. Needs third_party/wgpu-native, Vulkan (lavapipe is fine) and EGL with
 # OpenGL 4.3 (llvmpipe is fine). No game data is involved. On a machine without
 # a Vulkan GPU, point VK_ICD_FILENAMES at lavapipe's ICD file.
+# The native renderer is off for this (its blending is not byte for byte the
+# same on two GPUs); scripts/compare_native.sh checks it.
 #
 #   scripts/compare_gpu_backends.sh [scenes] [scale...]
 set -euo pipefail
@@ -19,7 +21,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 status=0
 for scale in "${scales[@]}"; do
   for backend in webgpu gl; do
-    PS2_SCALE=$scale PS2_COMPARE_MIN_PERCENT=0 "$ROOT/build/compare-$backend/gs_gpu_compare_test" "$scenes" --dump "$tmp/$backend.bin" > "$tmp/$backend.log" 2>&1 \
+    PS2_SCALE=$scale PS2_GPU_NATIVE=0 PS2_COMPARE_MIN_PERCENT=0 "$ROOT/build/compare-$backend/gs_gpu_compare_test" "$scenes" --dump "$tmp/$backend.bin" > "$tmp/$backend.log" 2>&1 \
       || { echo "$backend failed:"; tail -5 "$tmp/$backend.log"; exit 1; }
   done
   if cmp -s "$tmp/webgpu.bin" "$tmp/gl.bin"; then

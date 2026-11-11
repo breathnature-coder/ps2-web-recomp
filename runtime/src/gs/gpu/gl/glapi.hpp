@@ -65,7 +65,13 @@ inline constexpr GLenum GL_NO_ERROR = 0, GL_VENDOR = 0x1F00, GL_RENDERER = 0x1F0
                         GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_SCISSOR_TEST = 0x0C11,
                         GL_CULL_FACE = 0x0B44, GL_MAX_SHADER_STORAGE_BLOCK_SIZE = 0x90DE, GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT = 0x8A34,
                         GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT = 0x90DF, GL_TIME_ELAPSED = 0x88BF, GL_QUERY_RESULT = 0x8866,
-                        GL_QUERY_RESULT_AVAILABLE = 0x8867;
+                        GL_QUERY_RESULT_AVAILABLE = 0x8867, GL_TEXTURE_2D = 0x0DE1, GL_RGBA8 = 0x8058, GL_DEPTH_COMPONENT32F = 0x8CAC,
+                        GL_TEXTURE0 = 0x84C0, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
+                        GL_NONE = 0, GL_TEXTURE_MAG_FILTER = 0x2800, GL_TEXTURE_MIN_FILTER = 0x2801, GL_NEAREST = 0x2600, GL_ZERO = 0, GL_ONE = 1,
+                        GL_CONSTANT_COLOR = 0x8001, GL_ONE_MINUS_CONSTANT_COLOR = 0x8002, GL_SRC1_ALPHA = 0x8589,
+                        GL_ONE_MINUS_SRC1_ALPHA = 0x88FB, GL_FUNC_ADD = 0x8006, GL_FUNC_SUBTRACT = 0x800A, GL_FUNC_REVERSE_SUBTRACT = 0x800B,
+                        GL_NEVER = 0x0200, GL_GREATER = 0x0204, GL_GEQUAL = 0x0206, GL_ALWAYS = 0x0207, GL_LOWER_LEFT = 0x8CA1,
+                        GL_ZERO_TO_ONE = 0x935F, GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS = 0x90D6, GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS = 0x90DA;
 inline constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000, GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200,
                             GL_UNIFORM_BARRIER_BIT = 0x00000004, GL_SYNC_FLUSH_COMMANDS_BIT = 0x00000001;
 inline constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
@@ -115,7 +121,26 @@ inline constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
     X(void, BeginQuery, (GLenum target, GLuint id))                                                                                          \
     X(void, EndQuery, (GLenum target))                                                                                                       \
     X(void, GetQueryObjectiv, (GLuint id, GLenum pname, GLint * params))                                                                     \
-    X(void, GetQueryObjectui64v, (GLuint id, GLenum pname, GLuint64 * params))
+    X(void, GetQueryObjectui64v, (GLuint id, GLenum pname, GLuint64 * params))                                                               \
+    X(void, GenTextures, (GLsizei n, GLuint * textures))                                                                                     \
+    X(void, DeleteTextures, (GLsizei n, const GLuint *textures))                                                                             \
+    X(void, BindTexture, (GLenum target, GLuint texture))                                                                                    \
+    X(void, TexStorage2D, (GLenum target, GLsizei levels, GLenum format, GLsizei width, GLsizei height))                                     \
+    X(void, TexParameteri, (GLenum target, GLenum pname, GLint param))                                                                       \
+    X(void, ActiveTexture, (GLenum texture))                                                                                                 \
+    X(void, GenFramebuffers, (GLsizei n, GLuint * framebuffers))                                                                             \
+    X(void, DeleteFramebuffers, (GLsizei n, const GLuint *framebuffers))                                                                     \
+    X(void, FramebufferTexture2D, (GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level))                         \
+    X(GLenum, CheckFramebufferStatus, (GLenum target))                                                                                       \
+    X(void, DrawBuffers, (GLsizei n, const GLenum *buffers))                                                                                 \
+    X(void, Enable, (GLenum cap))                                                                                                            \
+    X(void, BlendFuncSeparate, (GLenum src_rgb, GLenum dst_rgb, GLenum src_alpha, GLenum dst_alpha))                                         \
+    X(void, BlendEquationSeparate, (GLenum rgb, GLenum alpha))                                                                               \
+    X(void, BlendColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a))                                                                        \
+    X(void, ColorMask, (GLboolean r, GLboolean g, GLboolean b, GLboolean a))                                                                 \
+    X(void, DepthFunc, (GLenum func))                                                                                                        \
+    X(void, DepthMask, (GLboolean flag))                                                                                                     \
+    X(void, Scissor, (GLint x, GLint y, GLsizei width, GLsizei height))
 
 #define PS2_GL_DECLARE(ret, name, args) extern ret(*gl##name) args;
 PS2_GL_FUNCTIONS(PS2_GL_DECLARE)

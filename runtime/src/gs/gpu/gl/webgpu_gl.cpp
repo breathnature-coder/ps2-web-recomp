@@ -13,6 +13,13 @@
 // work-done callbacks fire from wgpuDevicePoll or wgpuInstanceProcessEvents
 // once a fence says the GPU got there. Timestamp queries are not offered.
 //
+// The native renderer (gpu.cpp, native.wgsl) adds render passes into textures:
+// a texture is an OpenGL texture, a pass binds a framebuffer object made of its
+// attachments, and a render pipeline is a program (GLSL from shaders.cpp, by
+// its fragment entry point) with the blend, depth and mask state to set. It is
+// offered, as the dual source blending feature gpu.cpp asks for, when the
+// driver has glClipControl and storage buffers in vertex and fragment shaders.
+//
 // Presenting: a surface is created from a WGPUSurfaceSourceXlibWindow whose
 // display is null, and its window field is then taken as the platform's EGL
 // native window (the Switch's NWindow *). Desktop X11 and Wayland windows are
@@ -56,10 +63,11 @@ struct WGPUPipelineLayoutImpl {
     int unused;
 };
 struct WGPUTextureImpl {
-    int unused;
+    GLuint id = 0;  // 0: the window
+    std::uint32_t width = 0, height = 0;
 };
 struct WGPUTextureViewImpl {
-    int unused;
+    WGPUTextureImpl *texture;
 };
 
 struct WGPUBufferImpl {
@@ -75,7 +83,7 @@ struct WGPUBindGroupLayoutImpl {
         std::uint32_t binding;
         bool uniform, dynamic;
     };
-    std::vector<Entry> entries;
+    std::vector<Entry> entries;  // buffers only: a texture binding needs nothing from its layout
 };
 
 struct WGPUBindGroupImpl {
@@ -84,12 +92,20 @@ struct WGPUBindGroupImpl {
         GLuint buffer;
         std::uint64_t offset, size;
         bool uniform, dynamic;
+        GLuint texture = 0;  // not a buffer: this texture, on the unit of its binding number
     };
     std::vector<Entry> entries;  // in binding order, which is the order of dynamic offsets
 };
 
 struct WGPUShaderModuleImpl {
     bool blit;
+};
+
+// Fixed-function state of a native render pipeline; the blit pipeline has none.
+struct RenderState {
+    bool native = false, color = false, blend = false, depth = false, depth_write = false;
+    GLenum equation = GL_FUNC_ADD, source = GL_ONE, dest = GL_ZERO, depth_func = GL_ALWAYS;
+    std::uint32_t mask = 0xF;
 };
 
 struct WGPUComputePipelineImpl {
@@ -99,6 +115,7 @@ struct WGPUComputePipelineImpl {
 
 struct WGPURenderPipelineImpl {
     GLuint program, vao;
+    RenderState state;
 };
 
 using Op = std::function<void()>;
@@ -131,6 +148,11 @@ struct Context {
     EGLSurface draw = nullptr;  // the window surface once presenting, else a pbuffer or none
     std::string renderer, version;
     GLint max_storage = 0;
+    bool native = false;  // what the native renderer needs is there
+    // Mesa's software rasterizer keeps draws back and can run a later compute dispatch ahead of them, so a draw whose
+    // fragment shader reads a storage buffer sees what the dispatch wrote. There the draws are finished first.
+    bool finish_draws = false;
+    bool drawn = false;  // a draw since the last dispatch
 } g;
 
 WGPUInstanceImpl g_instance;
@@ -140,7 +162,7 @@ WGPUQueueImpl g_queue;
 WGPUQuerySetImpl g_query_set;
 WGPUPipelineLayoutImpl g_pipeline_layout;
 WGPUTextureImpl g_texture;
-WGPUTextureViewImpl g_view;
+WGPUTextureViewImpl g_view{&g_texture};
 std::uint64_t g_futures = 0;
 
 WGPUStringView text(const char *s) { return WGPUStringView{s, s ? std::strlen(s) : 0}; }
@@ -201,9 +223,22 @@ bool create_context() {
     }
     if (!load_functions()) return false;
     g.renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
+    g.finish_draws = g.renderer.find("llvmpipe") != std::string::npos || g.renderer.find("softpipe") != std::string::npos;
     g.version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
     glGetIntegerv(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &g.max_storage);
     std::fprintf(stderr, "[gl] %s, OpenGL %s\n", g.renderer.c_str(), g.version.c_str());
+    // The native renderer: depth from 0 to 1 as in WebGPU (a Z24 value then keeps every bit through the viewport
+    // transform), and the storage buffers its shaders read, which OpenGL 4.3 only promises to compute shaders.
+    using ClipControl = void (*)(GLenum, GLenum);
+    const auto clip_control = reinterpret_cast<ClipControl>(eglGetProcAddress("glClipControl"));
+    GLint vertex_blocks = 0, fragment_blocks = 0;
+    glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &vertex_blocks);
+    glGetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, &fragment_blocks);
+    g.native = clip_control && vertex_blocks >= 1 && fragment_blocks >= 5;
+    if (g.native) clip_control(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    else
+        std::fprintf(stderr, "[gl] no native renderer here: glClipControl %s, storage buffers in a vertex shader %d (1 needed), in a fragment shader %d (5 needed)\n",
+                     clip_control ? "yes" : "no", vertex_blocks, fragment_blocks);
     return true;
 }
 
@@ -313,6 +348,53 @@ void use_program(GLuint program) {
     g_bound_program = program;
 }
 
+GLuint g_bound_texture[4] = {};
+
+void bind_texture(std::uint32_t unit, GLuint id) {
+    if (g_bound_texture[unit & 3u] == id) return;
+    glActiveTexture(GL_TEXTURE0 + (unit & 3u));
+    glBindTexture(GL_TEXTURE_2D, id);
+    g_bound_texture[unit & 3u] = id;
+}
+
+// A framebuffer object per pair of attachments a render pass used.
+std::map<std::pair<GLuint, GLuint>, GLuint> g_framebuffers;
+
+GLuint framebuffer(GLuint color, GLuint depth) {
+    const auto found = g_framebuffers.find({color, depth});
+    if (found != g_framebuffers.end()) return found->second;
+    GLuint id = 0;
+    glGenFramebuffers(1, &id);
+    glBindFramebuffer(GL_FRAMEBUFFER, id);
+    if (color) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    if (depth) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+    const GLenum buffer = color ? GL_COLOR_ATTACHMENT0 : GL_NONE;
+    glDrawBuffers(1, &buffer);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) std::fprintf(stderr, "[gl] a render target's framebuffer is incomplete\n");
+    g_framebuffers.emplace(std::make_pair(color, depth), id);
+    return id;
+}
+
+void apply(const RenderState &s) {
+    if (!s.native) return;
+    glColorMask(s.mask & 1u, (s.mask >> 1) & 1u, (s.mask >> 2) & 1u, (s.mask >> 3) & 1u);
+    if (s.blend) {
+        glEnable(GL_BLEND);
+        glBlendEquationSeparate(s.equation, GL_FUNC_ADD);
+        glBlendFuncSeparate(s.source, s.dest, GL_ONE, GL_ZERO);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    // OpenGL writes depth only with the test on.
+    if (s.depth) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(s.depth_func);
+        glDepthMask(s.depth_write);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+}
+
 // Callbacks waiting for the GPU, oldest first.
 struct Pending {
     GLsync fence;
@@ -394,6 +476,10 @@ void bind(const WGPUBindGroupImpl &group, const std::vector<std::uint32_t> &dyna
     std::size_t next = 0;
     for (const auto &e : group.entries) {
         std::uint64_t offset = e.offset;
+        if (e.texture) {
+            bind_texture(e.binding, e.texture);
+            continue;
+        }
         if (e.dynamic && next < dynamic.size()) offset += dynamic[next++];
         Bound &b = (e.uniform ? g_bound_uniform : g_bound_storage)[e.binding & 15u];
         if (b.buffer == e.buffer && b.offset == offset && b.size == e.size) {
@@ -438,7 +524,7 @@ WGPUStatus wgpuAdapterGetLimits(WGPUAdapter, WGPULimits *limits) {
     return WGPUStatus_Success;
 }
 
-WGPUBool wgpuAdapterHasFeature(WGPUAdapter, WGPUFeatureName) { return false; }
+WGPUBool wgpuAdapterHasFeature(WGPUAdapter, WGPUFeatureName feature) { return feature == WGPUFeatureName_DualSourceBlending && g.native; }
 
 WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *, WGPURequestDeviceCallbackInfo cb) {
     cb.callback(WGPURequestDeviceStatus_Success, &g_device, text(""), cb.userdata1, cb.userdata2);
@@ -524,6 +610,7 @@ WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice, WGPUBindGroupLay
     auto *l = new WGPUBindGroupLayoutImpl;
     for (std::size_t i = 0; i < d->entryCount; ++i) {
         const WGPUBindGroupLayoutEntry &e = d->entries[i];
+        if (e.texture.sampleType != WGPUTextureSampleType_BindingNotUsed) continue;
         l->entries.push_back({e.binding, e.buffer.type == WGPUBufferBindingType_Uniform, e.buffer.hasDynamicOffset != 0});
     }
     return l;
@@ -539,11 +626,15 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor cons
     auto *group = new WGPUBindGroupImpl;
     for (std::size_t i = 0; i < d->entryCount; ++i) {
         const WGPUBindGroupEntry &e = d->entries[i];
+        if (e.textureView) {
+            group->entries.push_back({e.binding, 0, 0, 0, false, false, e.textureView->texture->id});
+            continue;
+        }
         bool uniform = false, dynamic = false;
         for (const auto &le : d->layout->entries)
             if (le.binding == e.binding) uniform = le.uniform, dynamic = le.dynamic;
         const std::uint64_t size = e.size == WGPU_WHOLE_SIZE ? e.buffer->size - e.offset : e.size;
-        group->entries.push_back({e.binding, e.buffer->id, e.offset, size, uniform, dynamic});
+        group->entries.push_back({e.binding, e.buffer->id, e.offset, size, uniform, dynamic, 0});
     }
     std::sort(group->entries.begin(), group->entries.end(), [](const auto &a, const auto &b) { return a.binding < b.binding; });
     return group;
@@ -585,15 +676,74 @@ WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice, WGPUComputePipel
     return new WGPUComputePipelineImpl{it->second, names.emplace(entry, entry).first->second.c_str()};
 }
 
-WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipelineDescriptor const *) {
+WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipelineDescriptor const *d) {
     current();
-    const GLuint vs = compile(GL_VERTEX_SHADER, find_shader("blit_vs", 0), "blit vertex shader");
-    const GLuint fs = compile(GL_FRAGMENT_SHADER, find_shader("blit_fs", 0), "blit fragment shader");
-    const GLuint program = vs && fs ? link({vs, fs}, "blit") : 0;
-    if (!program) return nullptr;
-    GLuint vao = 0;
-    glGenVertexArrays(1, &vao);  // a core profile draws nothing without one
-    return new WGPURenderPipelineImpl{program, vao};
+    static GLuint vao = 0;
+    if (!vao) glGenVertexArrays(1, &vao);  // a core profile draws nothing without one
+    if (d->vertex.module->blit) {
+        const GLuint vs = compile(GL_VERTEX_SHADER, find_shader("blit_vs", 0), "blit vertex shader");
+        const GLuint fs = compile(GL_FRAGMENT_SHADER, find_shader("blit_fs", 0), "blit fragment shader");
+        const GLuint program = vs && fs ? link({vs, fs}, "blit") : 0;
+        if (!program) return nullptr;
+        return new WGPURenderPipelineImpl{program, vao, {}};
+    }
+    // A pipeline of the native renderer: the program by its fragment entry point, and the state to draw with.
+    const std::string entry = str(d->fragment->entryPoint);
+    std::uint32_t scale = 1;
+    for (std::size_t i = 0; i < d->fragment->constantCount; ++i)
+        if (str(d->fragment->constants[i].key) == "SCALE") scale = static_cast<std::uint32_t>(d->fragment->constants[i].value);
+    const auto key = std::make_pair(entry, scale * 100);
+    auto it = g_programs.find(key);
+    if (it == g_programs.end()) {
+        const char *vertex = find_shader(entry + "@vs", scale), *fragment = find_shader(entry, scale);
+        if (!vertex || !fragment) {
+            std::fprintf(stderr, "[gl] no GLSL for %s at scale %u; run scripts/gen_glsl.py\n", entry.c_str(), scale);
+            return nullptr;
+        }
+        const GLuint vs = compile(GL_VERTEX_SHADER, vertex, (entry + " (vertex)").c_str());
+        const GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, entry.c_str());
+        const GLuint program = vs && fs ? link({vs, fs}, entry.c_str()) : 0;
+        if (!program) return nullptr;
+        it = g_programs.emplace(key, program).first;
+    }
+    RenderState s;
+    s.native = true;
+    if (d->fragment->targetCount) {
+        const WGPUColorTargetState &target = d->fragment->targets[0];
+        s.color = true;
+        s.mask = static_cast<std::uint32_t>(target.writeMask);
+        if (target.blend) {
+            const auto factor = [](WGPUBlendFactor f) -> GLenum {
+                switch (f) {
+                case WGPUBlendFactor_Zero: return GL_ZERO;
+                case WGPUBlendFactor_Constant: return GL_CONSTANT_COLOR;
+                case WGPUBlendFactor_OneMinusConstant: return GL_ONE_MINUS_CONSTANT_COLOR;
+                case WGPUBlendFactor_Src1Alpha: return GL_SRC1_ALPHA;
+                case WGPUBlendFactor_OneMinusSrc1Alpha: return GL_ONE_MINUS_SRC1_ALPHA;
+                default: return GL_ONE;
+                }
+            };
+            s.blend = true;
+            s.source = factor(target.blend->color.srcFactor);
+            s.dest = factor(target.blend->color.dstFactor);
+            s.equation = target.blend->color.operation == WGPUBlendOperation_Subtract          ? GL_FUNC_SUBTRACT
+                         : target.blend->color.operation == WGPUBlendOperation_ReverseSubtract ? GL_FUNC_REVERSE_SUBTRACT
+                                                                                               : GL_FUNC_ADD;
+        }
+    } else {
+        s.mask = 0;
+    }
+    if (d->depthStencil) {
+        s.depth = true;
+        s.depth_write = d->depthStencil->depthWriteEnabled == WGPUOptionalBool_True;
+        switch (d->depthStencil->depthCompare) {
+        case WGPUCompareFunction_Never: s.depth_func = GL_NEVER; break;
+        case WGPUCompareFunction_GreaterEqual: s.depth_func = GL_GEQUAL; break;
+        case WGPUCompareFunction_Greater: s.depth_func = GL_GREATER; break;
+        default: s.depth_func = GL_ALWAYS; break;
+        }
+    }
+    return new WGPURenderPipelineImpl{it->second, vao, s};
 }
 
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice, WGPUCommandEncoderDescriptor const *) { return new WGPUCommandEncoderImpl; }
@@ -657,6 +807,8 @@ void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, uint32_t
             g_stats.free_queries.pop_back();
             glBeginQuery(GL_TIME_ELAPSED, query);
         }
+        if (g.finish_draws && g.drawn) glFinish();
+        g.drawn = false;
         glDispatchCompute(x, y, z);
         // WebGPU orders the storage accesses of successive dispatches; OpenGL needs telling.
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -673,6 +825,24 @@ void wgpuComputePassEncoderEnd(WGPUComputePassEncoder) {}
 void wgpuComputePassEncoderRelease(WGPUComputePassEncoder p) { delete p; }
 
 WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WGPURenderPassDescriptor const *d) {
+    const WGPUTextureImpl *color = d->colorAttachmentCount ? d->colorAttachments[0].view->texture : nullptr;
+    const WGPUTextureImpl *depth = d->depthStencilAttachment ? d->depthStencilAttachment->view->texture : nullptr;
+    if ((color && color->id) || depth) {
+        // Into textures (the native renderer); what they hold is kept, as its passes ask.
+        const GLuint color_id = color ? color->id : 0, depth_id = depth ? depth->id : 0;
+        const std::uint32_t width = color ? color->width : depth->width, height = color ? color->height : depth->height;
+        e->ops.push_back([color_id, depth_id, width, height] {
+            // Neither attachment may stay bound for reading from the last time it was written back.
+            for (std::uint32_t unit = 0; unit < 4; ++unit)
+                if (g_bound_texture[unit] && (g_bound_texture[unit] == color_id || g_bound_texture[unit] == depth_id)) bind_texture(unit, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer(color_id, depth_id));
+            glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+            glEnable(GL_SCISSOR_TEST);
+            glDisable(GL_CULL_FACE);
+            glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);  // a WebGPU pass starts with this constant, and gpu.cpp counts on it
+        });
+        return new WGPURenderPassEncoderImpl{e};
+    }
     const WGPUColor c = d->colorAttachmentCount ? d->colorAttachments[0].clearValue : WGPUColor{0, 0, 0, 1};
     e->ops.push_back([c] {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -680,6 +850,7 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
+        glColorMask(1, 1, 1, 1);
         glClearColor(static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b), static_cast<float>(c.a));
         glClear(GL_COLOR_BUFFER_BIT);
     });
@@ -703,10 +874,21 @@ void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y,
 
 void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipeline pipeline) {
     const GLuint program = pipeline->program, vao = pipeline->vao;
-    p->encoder->ops.push_back([program, vao] {
+    p->encoder->ops.push_back([program, vao, state = pipeline->state] {
         use_program(program);
         glBindVertexArray(vao);
+        apply(state);
     });
+}
+
+// Only passes into textures set these, and a texture's first row is OpenGL's row 0: nothing to flip.
+void wgpuRenderPassEncoderSetScissorRect(WGPURenderPassEncoder p, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    p->encoder->ops.push_back([x, y, w, h] { glScissor(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h)); });
+}
+
+void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor const *color) {
+    const WGPUColor c = *color;
+    p->encoder->ops.push_back([c] { glBlendColor(static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b), static_cast<float>(c.a)); });
 }
 
 void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, uint32_t, WGPUBindGroup group, size_t count, uint32_t const *offsets) {
@@ -715,7 +897,10 @@ void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, uint32_t, WGPUBi
 }
 
 void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, uint32_t vertices, uint32_t, uint32_t first, uint32_t) {
-    p->encoder->ops.push_back([vertices, first] { glDrawArrays(GL_TRIANGLES, static_cast<GLint>(first), static_cast<GLsizei>(vertices)); });
+    p->encoder->ops.push_back([vertices, first] {
+        glDrawArrays(GL_TRIANGLES, static_cast<GLint>(first), static_cast<GLsizei>(vertices));
+        g.drawn = true;
+    });
 }
 
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder) {}
@@ -789,8 +974,41 @@ void wgpuSurfaceRelease(WGPUSurface s) {
     delete s;
 }
 
-WGPUTextureView wgpuTextureCreateView(WGPUTexture, WGPUTextureViewDescriptor const *) { return &g_view; }
-void wgpuTextureRelease(WGPUTexture) {}
-void wgpuTextureViewRelease(WGPUTextureView) {}
+WGPUTexture wgpuDeviceCreateTexture(WGPUDevice, WGPUTextureDescriptor const *d) {
+    current();
+    auto *t = new WGPUTextureImpl;
+    t->width = d->size.width;
+    t->height = d->size.height;
+    glGenTextures(1, &t->id);
+    bind_texture(0, t->id);
+    glTexStorage2D(GL_TEXTURE_2D, 1, d->format == WGPUTextureFormat_Depth32Float ? GL_DEPTH_COMPONENT32F : GL_RGBA8, static_cast<GLsizei>(t->width),
+                   static_cast<GLsizei>(t->height));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(GL_NEAREST));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(GL_NEAREST));
+    return t;
+}
+
+WGPUTextureView wgpuTextureCreateView(WGPUTexture t, WGPUTextureViewDescriptor const *) { return t == &g_texture ? &g_view : new WGPUTextureViewImpl{t}; }
+
+void wgpuTextureRelease(WGPUTexture t) {
+    if (!t || t == &g_texture) return;
+    current();
+    for (auto it = g_framebuffers.begin(); it != g_framebuffers.end();) {
+        if (it->first.first == t->id || it->first.second == t->id) {
+            glDeleteFramebuffers(1, &it->second);
+            it = g_framebuffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (std::uint32_t unit = 0; unit < 4; ++unit)
+        if (g_bound_texture[unit] == t->id) bind_texture(unit, 0);
+    glDeleteTextures(1, &t->id);
+    delete t;
+}
+
+void wgpuTextureViewRelease(WGPUTextureView v) {
+    if (v != &g_view) delete v;
+}
 
 }  // extern "C"

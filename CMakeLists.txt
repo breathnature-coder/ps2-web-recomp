@@ -90,7 +90,11 @@ if(NOT PS2_GPU_RESOLVED STREQUAL "none")
     add_custom_command(OUTPUT "${PS2_BLIT_WGSL}"
         COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/blit.wgsl -DOUT=${PS2_BLIT_WGSL} -DNAME=kBlitShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
         DEPENDS runtime/src/gs/gpu/blit.wgsl cmake/embed.cmake)
-    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}")
+    set(PS2_NATIVE_WGSL "${CMAKE_BINARY_DIR}/native_wgsl.cpp")
+    add_custom_command(OUTPUT "${PS2_NATIVE_WGSL}"
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/native.wgsl -DOUT=${PS2_NATIVE_WGSL} -DNAME=kNativeShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS runtime/src/gs/gpu/native.wgsl cmake/embed.cmake)
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}" "${PS2_BLIT_WGSL}" "${PS2_NATIVE_WGSL}")
     target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
     if(PS2_GPU_RESOLVED STREQUAL "gl")
         # Only the WebGPU headers are used; wgpu-native itself is not linked.

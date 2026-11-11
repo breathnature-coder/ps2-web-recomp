@@ -5,6 +5,9 @@
 //
 //   wgsl_to_glsl <file.wgsl> <SCALE> <entry point>...   compute pipelines
 //   wgsl_to_glsl <file.wgsl> 1 --blit                   the vs/fs render pipeline
+//   wgsl_to_glsl <file.wgsl> <SCALE> --store            the compute pipelines that read a native target's texture
+//   wgsl_to_glsl <file.wgsl> <SCALE> --native           the native renderer's render pipelines (gs.wgsl and
+//                                                       native.wgsl in one file, after "enable dual_source_blending;")
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -60,6 +63,11 @@ int main(int argc, char **argv) {
             (unsigned long long)sup.maxStorageBufferBindingSize);
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &lim;
+    const WGPUFeatureName dual = WGPUFeatureName_DualSourceBlending;
+    if (wgpuAdapterHasFeature(ad, dual)) {
+        dd.requiredFeatureCount = 1;
+        dd.requiredFeatures = &dual;
+    }
     WGPUDevice dev = nullptr;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     dcb.mode = WGPUCallbackMode_AllowSpontaneous;
@@ -130,6 +138,82 @@ int main(int argc, char **argv) {
         fprintf(stdout, "@@ENTRY blit\n");
         WGPURenderPipeline p = wgpuDeviceCreateRenderPipeline(dev, &rd);
         fprintf(stderr, "blit: %p\n", (void *)p);
+        return 0;
+    }
+    WGPUConstantEntry scale_constant = WGPU_CONSTANT_ENTRY_INIT;
+    scale_constant.key = sv("SCALE");
+    scale_constant.value = scale;
+    if (argc > 3 && std::string(argv[3]) == "--store") {
+        const char *names[2] = {"store_color", "store_depth"};
+        for (int k = 0; k < 2; k++) {
+            WGPUBindGroupLayoutEntry te = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+            te.binding = 0;
+            te.visibility = WGPUShaderStage_Compute;
+            te.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            te.texture.viewDimension = WGPUTextureViewDimension_2D;
+            WGPUBindGroupLayoutDescriptor tld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+            tld.entryCount = 1;
+            tld.entries = &te;
+            const WGPUBindGroupLayout both[2] = {bgl, wgpuDeviceCreateBindGroupLayout(dev, &tld)};
+            WGPUPipelineLayoutDescriptor spd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+            spd.bindGroupLayoutCount = 2;
+            spd.bindGroupLayouts = both;
+            WGPUComputePipelineDescriptor cd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+            cd.layout = wgpuDeviceCreatePipelineLayout(dev, &spd);
+            cd.compute.module = mod;
+            cd.compute.entryPoint = sv(names[k]);
+            cd.compute.constantCount = 1;
+            cd.compute.constants = &scale_constant;
+            fprintf(stdout, "@@ENTRY %s\n", names[k]);
+            WGPUComputePipeline p = wgpuDeviceCreateComputePipeline(dev, &cd);
+            fprintf(stderr, "%s: %p\n", names[k], (void *)p);
+        }
+        return 0;
+    }
+    if (argc > 3 && std::string(argv[3]) == "--native") {
+        WGPUBindGroupLayoutEntry ne[7] = {};
+        const int bindings[7] = {0, 1, 2, 3, 4, 5, 7};
+        for (int i = 0; i < 7; i++) {
+            ne[i] = le[bindings[i]];
+            ne[i].visibility = bindings[i] == 2 || bindings[i] == 3 ? WGPUShaderStage_Vertex | WGPUShaderStage_Fragment : WGPUShaderStage_Fragment;
+        }
+        WGPUBindGroupLayoutDescriptor nld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        nld.entryCount = 7;
+        nld.entries = ne;
+        WGPUBindGroupLayout nl = wgpuDeviceCreateBindGroupLayout(dev, &nld);
+        WGPUPipelineLayoutDescriptor npd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        npd.bindGroupLayoutCount = 1;
+        npd.bindGroupLayouts = &nl;
+        WGPUPipelineLayout np = wgpuDeviceCreatePipelineLayout(dev, &npd);
+        // vertex entry, fragment entry, a colour target, a depth target
+        const struct { const char *vs, *fs; bool color, depth; } pipelines[4] = {{"native_vs", "native_fs", true, false}, {"native_vs", "native_depth_fs", true, true},
+                                                                                {"load_vs", "load_color_fs", true, false}, {"load_vs", "load_depth_fs", false, true}};
+        for (const auto &d : pipelines) {
+            WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
+            color.format = WGPUTextureFormat_RGBA8Unorm;
+            WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+            fs.module = mod;
+            fs.entryPoint = sv(d.fs);
+            fs.constantCount = 1;
+            fs.constants = &scale_constant;
+            fs.targetCount = d.color ? 1 : 0;
+            fs.targets = d.color ? &color : nullptr;
+            WGPUDepthStencilState depth = WGPU_DEPTH_STENCIL_STATE_INIT;
+            depth.format = WGPUTextureFormat_Depth32Float;
+            depth.depthWriteEnabled = WGPUOptionalBool_True;
+            depth.depthCompare = WGPUCompareFunction_Always;
+            WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+            rd.layout = np;
+            rd.vertex.module = mod;
+            rd.vertex.entryPoint = sv(d.vs);
+            rd.vertex.constantCount = 1;
+            rd.vertex.constants = &scale_constant;
+            rd.fragment = &fs;
+            if (d.depth) rd.depthStencil = &depth;
+            fprintf(stdout, "@@ENTRY %s\n", d.fs);
+            WGPURenderPipeline p = wgpuDeviceCreateRenderPipeline(dev, &rd);
+            fprintf(stderr, "%s: %p\n", d.fs, (void *)p);
+        }
         return 0;
     }
     for (int i = 3; i < argc; i++) {
