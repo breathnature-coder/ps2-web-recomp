@@ -111,7 +111,7 @@ std::uint32_t frame_psm() {
 }
 std::uint32_t z_psm() {
     static const std::uint32_t psms[] = {PSMZ32, PSMZ24, PSMZ16, PSMZ16S};
-    if (g_race) return pick(100) < 95 ? PSMZ24 : PSMZ32;
+    if (g_race) return pick(100) < 80 ? PSMZ24 : psms[pick(4)];
     return psms[pick(4)];
 }
 std::uint32_t tex_psm() {

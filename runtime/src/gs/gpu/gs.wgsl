@@ -1168,9 +1168,13 @@ fn store_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let sx = prm(2u) * SCALE + gid.x;
     let sy = prm(3u) * SCALE + gid.y;
-    // A Z24 value is exact in a 32-bit float and so is this product; adding a half to round would not be.
-    let z = u32(clamp(textureLoad(target_texture, vec2<i32>(i32(sx), i32(sy)), 0).x * 16777216.0, 0.0, 16777215.0));
-    store(addr(fmt_of(PSMZ24, prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE, z);
+    let depth = textureLoad(target_texture, vec2<i32>(i32(sx), i32(sy)), 0).x;
+    if (depth >= 1.0) {
+        return;  // what load_depth_fs could not hold: GS memory still has it
+    }
+    // A value of 24 bits is exact in a 32-bit float and so is this product; adding a half to round would not be.
+    let z = u32(clamp(depth * 16777216.0, 0.0, 16777215.0));
+    store(addr(fmt_of(prm(6u), prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE, z);
 }
 
 @compute @workgroup_size(TILE, TILE)

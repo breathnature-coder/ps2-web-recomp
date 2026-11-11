@@ -599,6 +599,7 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
 struct Surface {
     std::uint32_t bp = 0, bw = 0, width = 0, height = 0;  // block pointer, buffer width in 64s, size in pixels
     bool depth = false;
+    std::uint32_t psm = PSMCT32;  // a depth buffer's format; colour is kept as CT32 words
     WGPUTexture texture = nullptr;
     WGPUTextureView view = nullptr;
     WGPUBindGroup group = nullptr;
@@ -660,9 +661,9 @@ std::uint64_t g_store_cause[6] = {};
 std::uint32_t g_sync_cause = 0;
 
 // Why a draw is left to the compute rasterizer, counted for the [native] line.
-const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "Z not Z24",
+const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "",         
                             "mask in channel", "alpha fail writes part", "PABE or no clamp",  "blend by Ad",    "FIX above 0x80",    "blend 1+C",
-                            "highlight alpha", "line or point",          "wider than buffer", "Z above 24 bit", "vertex alpha>0x80"};
+                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80"};
 constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
 std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
 
@@ -679,7 +680,6 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     if (flags & 128u) return why(3);       // destination alpha test
     if ((modes >> 28) & 2u) return why(4); // every other line masked
     const bool zte = flags & 512u;
-    if (zte && w[6] != PSMZ24) return why(5);
     std::uint32_t mask = 0;
     for (int ch = 0; ch < (fpsm == PSMCT24 ? 3 : 4); ++ch) {
         const std::uint32_t m = (w[4] >> (ch * 8)) & 0xFFu;
@@ -808,15 +808,18 @@ WGPURenderPipeline native_pipeline(std::uint32_t key) {
     return pipeline;
 }
 
-// The pages of GS memory under rows y0 to y1 of a surface. Colour and Z24 pages are both 64 by 32 pixels.
-Range surface_range(const Surface &s, int y0, int y1) { return pages(s.bp, s.bw, PSMCT32, 0, y0, static_cast<int>(s.width) - 1, y1); }
+// The pages of GS memory under rows y0 to y1 of a surface. Pages are 64 by 32 pixels, and 64 by 64 of a 16-bit format.
+Range surface_range(const Surface &s, int y0, int y1) { return pages(s.bp, s.bw, s.psm, 0, y0, static_cast<int>(s.width) - 1, y1); }
+
+int page_rows(std::uint32_t psm) { return psm == PSMZ16 || psm == PSMZ16S ? 64 : 32; }
 
 bool surface_rows(const Surface &s, const Range &r, int &y0, int &y1) {
     const std::uint64_t base = static_cast<std::uint64_t>(s.bp) * 256, row = static_cast<std::uint64_t>(s.bw) * 8192;
-    const std::uint64_t lo = std::max(r.lo, base), hi = std::min(r.hi, base + row * ((s.height + 31) / 32));
+    const int tall = page_rows(s.psm);
+    const std::uint64_t lo = std::max(r.lo, base), hi = std::min(r.hi, base + row * ((s.height + tall - 1) / tall));
     if (lo >= hi) return false;
-    y0 = static_cast<int>((lo - base) / row) * 32;
-    y1 = std::min(static_cast<int>((hi - 1 - base) / row) * 32 + 31, static_cast<int>(s.height) - 1);
+    y0 = static_cast<int>((lo - base) / row) * tall;
+    y1 = std::min(static_cast<int>((hi - 1 - base) / row) * tall + tall - 1, static_cast<int>(s.height) - 1);
     return true;
 }
 
@@ -825,7 +828,7 @@ void store_surface(Surface &s) {
     s.dirty = false;
     const std::uint32_t w = static_cast<std::uint32_t>(s.dx1 - s.dx0 + 1), h = static_cast<std::uint32_t>(s.dy1 - s.dy0 + 1);
     Command c{s.depth ? kStoreDepth : kStoreColor, (w * g_scale + 7) / 8, (h * g_scale + 7) / 8,
-              push_params({s.bp, s.bw, static_cast<std::uint32_t>(s.dx0), static_cast<std::uint32_t>(s.dy0), w, h})};
+              push_params({s.bp, s.bw, static_cast<std::uint32_t>(s.dx0), static_cast<std::uint32_t>(s.dy0), w, h, s.psm})};
     c.target = &s;
     g_commands.push_back(c);
     ++g_stores;
@@ -873,10 +876,10 @@ void release_retired() {
     g_retired.clear();
 }
 
-Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32_t rows, const Surface *keep) {
+Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32_t psm, std::uint32_t rows, const Surface *keep) {
     for (std::size_t i = 0; i < g_surfaces.size(); ++i) {
         Surface &s = *g_surfaces[i];
-        if (s.bp != bp || s.bw != bw || s.depth != depth) continue;
+        if (s.bp != bp || s.bw != bw || s.depth != depth || s.psm != psm) continue;
         if (s.height >= rows) {
             s.used = ++g_surface_clock;
             return &s;
@@ -887,7 +890,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     // Whole pages, and no further than GS memory goes.
     const std::uint64_t row_bytes = static_cast<std::uint64_t>(bw) * 8192, base = static_cast<std::uint64_t>(bp) * 256;
     if (!bw || base >= kMemorySize) return nullptr;
-    const std::uint32_t most = static_cast<std::uint32_t>(std::min<std::uint64_t>((kMemorySize - base) / row_bytes * 32, 2048));
+    const std::uint32_t most = static_cast<std::uint32_t>(std::min<std::uint64_t>((kMemorySize - base) / row_bytes * static_cast<std::uint64_t>(page_rows(psm)), 2048));
     const std::uint32_t height = std::min((rows + 63) & ~63u, most);
     if (height < rows) return nullptr;
     if (g_surfaces.size() >= kMaxSurfaces) {
@@ -900,6 +903,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     s->bp = bp;
     s->bw = bw;
     s->depth = depth;
+    s->psm = psm;
     s->width = bw * 64;
     s->height = height;
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -926,7 +930,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
 void load_surface(Surface &s) {
     if (s.stale1 < s.stale0) return;
     NativePass pass{s.depth ? nullptr : &s, s.depth ? &s : nullptr, {}};
-    pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw}), 3, 0, static_cast<std::uint32_t>(s.stale0), s.width,
+    pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw, s.psm}), 3, 0, static_cast<std::uint32_t>(s.stale0), s.width,
                           static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), 0.0f});
     g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
     g_native_passes.push_back(std::move(pass));
@@ -941,9 +945,9 @@ void plan_decodes(std::uint32_t prims);
 bool flush_native(std::uint32_t prims) {
     Batch &b = g_batch;
     const std::uint32_t rows = static_cast<std::uint32_t>(b.maxy) + 1;
-    Surface *color = surface_for(b.fbp, b.fbw, false, rows, nullptr);
+    Surface *color = surface_for(b.fbp, b.fbw, false, PSMCT32, rows, nullptr);
     if (!color) return false;
-    Surface *depth = b.zte ? surface_for(b.zbp, b.fbw, true, rows, color) : nullptr;
+    Surface *depth = b.zte ? surface_for(b.zbp, b.fbw, true, b.zpsm, rows, color) : nullptr;
     if (b.zte && !depth) return false;
     const Range fb = surface_range(*color, b.miny, b.maxy);
     const Range z = depth ? surface_range(*depth, b.miny, b.maxy) : Range{};
@@ -2213,7 +2217,8 @@ void draw(const State &st, const Vertex *v, int count) {
     if (!why && prim < 3) why = 13;
     if (!why && maxx >= static_cast<int>(setup[2] * 64)) why = 14;
     if (!why && (native_skip() & (prim == 6 ? 64u : 32u))) why = 1;
-    if (!why && zte && (prim == 6 ? v[1].z : std::max({v[0].z, v[1].z, v[2].z})) > 0xFFFFFFu) why = 15;
+    // Depths the buffer holds without clamping, and a 32-bit float exactly.
+    if (!why && zte && (prim == 6 ? v[1].z : std::max({v[0].z, v[1].z, v[2].z})) > std::min(setup[23], 0xFFFFFFu)) why = 15;
     // A source alpha above 0x80 is a blend factor above one, which only the compute rasterizer has.
     if (!why && cache.alpha_factor && (prim == 6 ? v[1].a : iip ? std::max({v[0].a, v[1].a, v[2].a}) : v[2].a) > 0x80u) why = 16;
     const bool native = cache.native && !why;

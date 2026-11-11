@@ -211,7 +211,8 @@ fn native_depth_fs(in: NativeVertex) -> NativeDepth {
     return NativeDepth(shaded.color.color, shaded.color.factor, f32(shaded.z) / 16777216.0);
 }
 
-// GS memory into a target's texture, over the scissor rectangle. Parameters: block pointer and buffer width.
+// GS memory into a target's texture, over the scissor rectangle. Parameters: block pointer, buffer width, and a
+// depth buffer's format.
 @vertex
 fn load_vs(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(f32((index << 1u) & 2u) * 2.0 - 1.0, f32(index & 2u) * 2.0 - 1.0, 0.0, 1.0);
@@ -229,6 +230,8 @@ fn load_color_fs(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
 fn load_depth_fs(@builtin(position) position: vec4<f32>) -> @builtin(frag_depth) f32 {
     let sx = u32(position.x);
     let sy = u32(position.y);
-    let v = load_at(addr(fmt_of(PSMZ24, prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE);
-    return f32(v) / 16777216.0;
+    let v = load_at(addr(fmt_of(prm(2u), prm(0u), prm(1u)), sx / SCALE, sy / SCALE), (sy % SCALE) * SCALE + sx % SCALE);
+    // A Z32 buffer can hold more than a float does exactly, and than any native draw's depth: such a pixel is 1.0
+    // here, which no draw's depth reaches, and store_depth leaves GS memory's value alone where it still is.
+    return select(f32(v) / 16777216.0, 1.0, v > 0xFFFFFFu);
 }
