@@ -673,7 +673,7 @@ std::uint32_t g_sync_cause = 0;
 // Why a draw is left to the compute rasterizer, counted for the [native] line.
 const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "",         
                             "mask in channel", "alpha fail writes part", "PABE or no clamp",  "blend by Ad",    "FIX above 0x80",    "blend 1+C",
-                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80", "no native target"};
+                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80", "small, target in memory", "no native target"};
 constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
 std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
 
@@ -1200,12 +1200,30 @@ void flush_batch() {
     // PS2_NATIVE_LIMIT=<n>: only the first n batches that could go to the native renderer do, to find the batch a
     // wrong picture starts with.
     static const std::uint64_t limit = std::getenv("PS2_NATIVE_LIMIT") ? std::strtoull(std::getenv("PS2_NATIVE_LIMIT"), nullptr, 10) : ~0ull;
-    if (b.native && g_native_batches < limit && flush_native(prims)) {
+    // A small batch whose targets GS memory holds as they are goes to the compute rasterizer, which draws there
+    // without anything having to be written back afterwards for whoever reads it next. GT4's colour correction is
+    // 140 such batches a frame, each read by the next: a tile of the picture, then a palette made from it.
+    // PS2_NATIVE_SMALL=<pixels> sets how small (4096 by default, 0 for never).
+    static const long small = std::getenv("PS2_NATIVE_SMALL") ? std::atol(std::getenv("PS2_NATIVE_SMALL")) : 4096;
+    bool native = b.native && g_native_batches < limit;
+    if (native && static_cast<long>(b.maxx - b.minx + 1) * (b.maxy - b.miny + 1) <= small) {
+        bool in_memory = true;
+        for (const auto &s : g_surfaces) {
+            const bool mine = s->depth ? b.zte && s->bp == b.zbp && s->psm == b.zpsm : s->bp == b.fbp;
+            if (mine && s->bw == b.fbw && s->dirty) in_memory = false;
+        }
+        if (in_memory) {
+            native = false;
+            g_why_prims[kWhyCount - 2] += prims;
+            ++g_why_batches[kWhyCount - 2];
+        }
+    }
+    if (native && flush_native(prims)) {
         ++g_native_batches;
         g_native_prims += prims;
         census(prims, false);
     } else {
-        if (b.native) {  // the native renderer had no targets for it: frame and depth in the same memory, or no room
+        if (native) {  // the native renderer had no targets for it: frame and depth in the same memory, or no room
             g_why_prims[kWhyCount - 1] += prims;
             ++g_why_batches[kWhyCount - 1];
         }
