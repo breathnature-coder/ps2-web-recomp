@@ -164,6 +164,7 @@ struct SetupCache {
     std::uint64_t key = 0;
     Range tex;
     bool native = false, alpha_factor = false;
+    std::uint32_t why = 0;
 } g_setup_cache;
 
 struct PreOp {
@@ -624,6 +625,7 @@ struct NativeState {
     float constant = 0.0f;
     bool draws = true;
     bool alpha_factor = false;  // the source alpha is a blend factor, which the blender clamps to one (0x80)
+    std::uint32_t why = 0;      // an index into kWhy when the state is not for the native renderer
 };
 
 constexpr std::size_t kMaxSurfaces = 24;
@@ -652,20 +654,37 @@ std::uint32_t native_skip() {
     return skip;
 }
 
+// What a target was written back to GS memory for, counted for the [native] line.
+const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", ""};
+std::uint64_t g_store_cause[6] = {};
+std::uint32_t g_sync_cause = 0;
+
+// Why a draw is left to the compute rasterizer, counted for the [native] line.
+const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "Z not Z24",
+                            "mask in channel", "alpha fail writes part", "PABE or no clamp",  "blend by Ad",    "FIX above 0x80",    "blend 1+C",
+                            "highlight alpha", "line or point",          "wider than buffer", "Z above 24 bit", "vertex alpha>0x80"};
+constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
+std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
+
 bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     const std::uint32_t flags = w[0], fpsm = w[3], modes = w[7];
     const std::uint32_t skip = native_skip();
-    if (((skip & 2u) && (flags & 8u)) || ((skip & 4u) && (flags & 2u)) || ((skip & 8u) && (flags & 64u)) || ((skip & 16u) && (flags & 512u))) return false;
-    if ((fpsm != PSMCT32 && fpsm != PSMCT24) || w[2] == 0) return false;
-    if (flags & 128u) return false;        // destination alpha test
-    if ((modes >> 28) & 2u) return false;  // every other line masked
+    out.why = 0;
+    const auto why = [&](std::uint32_t reason) {
+        out.why = reason;
+        return false;
+    };
+    if (((skip & 2u) && (flags & 8u)) || ((skip & 4u) && (flags & 2u)) || ((skip & 8u) && (flags & 64u)) || ((skip & 16u) && (flags & 512u))) return why(1);
+    if ((fpsm != PSMCT32 && fpsm != PSMCT24) || w[2] == 0) return why(2);
+    if (flags & 128u) return why(3);       // destination alpha test
+    if ((modes >> 28) & 2u) return why(4); // every other line masked
     const bool zte = flags & 512u;
-    if (zte && w[6] != PSMZ24) return false;
+    if (zte && w[6] != PSMZ24) return why(5);
     std::uint32_t mask = 0;
     for (int ch = 0; ch < (fpsm == PSMCT24 ? 3 : 4); ++ch) {
         const std::uint32_t m = (w[4] >> (ch * 8)) & 0xFFu;
         if (m == 0) mask |= 1u << ch;
-        else if (m != 0xFFu) return false;  // a mask inside a channel
+        else if (m != 0xFFu) return why(6);  // a mask inside a channel
     }
     bool write_z = zte && !(flags & 32u);
     out.flags = flags;
@@ -681,7 +700,7 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
             else write_z = false;
             if (afail == 3) mask &= 7u;
         } else if (afail != 0) {
-            return false;  // a failed test writes some of the pixel: needs the test per pixel and two write masks
+            return why(7);  // a failed test writes some of the pixel: needs the test per pixel and two write masks
         }
     }
     const std::uint32_t ztst = (modes >> 8) & 3u;
@@ -690,7 +709,7 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     out.premultiply = 0;
     out.alpha_factor = false;
     if ((flags & 8u) && (mask & 7u)) {
-        if ((flags & 1024u) || !(flags & 2048u)) return false;  // blending per pixel alpha, or colours that wrap
+        if ((flags & 1024u) || !(flags & 2048u)) return why(8);  // blending per pixel alpha, or colours that wrap
         const std::uint32_t a = (modes >> 12) & 3u, b = (modes >> 14) & 3u, c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
         // (A - B) * C + D as what multiplies the source and the destination colour: so many times C, plus one or not.
         const int source_c = (a == 0) - (b == 0), dest_c = (a == 1) - (b == 1);
@@ -701,7 +720,7 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
             sf = source_1;
             df = dest_1;
         } else if (c == 1) {
-            return false;  // destination alpha: the texture keeps alpha, not alpha as a factor
+            return why(9);  // destination alpha: the texture keeps alpha, not alpha as a factor
         } else if (!dest_c && !source_1) {
             // C only scales the source colour: the shader does it, with the GS's own rounding and for any C.
             out.premultiply = 1u | (c >= 2 ? 2u : 0u) | (source_c < 0 ? 4u : 0u);
@@ -709,7 +728,7 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
             df = dest_1;
             op = source_c < 0 ? 2u : 0u;
         } else {
-            if ((c >= 2 && w[9] > 0x80u) || (skip & 1u)) return false;  // a factor above one
+            if ((c >= 2 && w[9] > 0x80u) || (skip & 1u)) return why(10);  // a factor above one
             bool source_minus = false, dest_minus = false;
             const auto factor = [](int times, int one, bool &minus) {
                 if (!times) return one;
@@ -723,7 +742,7 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
             };
             sf = factor(source_c, source_1, source_minus);
             df = factor(dest_c, dest_1, dest_minus);
-            if (sf < 0 || df < 0 || (source_minus && dest_minus)) return false;
+            if (sf < 0 || df < 0 || (source_minus && dest_minus)) return why(11);
             op = source_minus ? 2u : dest_minus ? 1u : 0u;
             out.alpha_factor = c == 0;
             if (c >= 2) {
@@ -810,6 +829,7 @@ void store_surface(Surface &s) {
     c.target = &s;
     g_commands.push_back(c);
     ++g_stores;
+    ++g_store_cause[g_sync_cause];
 }
 
 // Something other than a native draw to `self` is about to read, or write, this GS memory: textures holding newer
@@ -930,7 +950,9 @@ bool flush_native(std::uint32_t prims) {
     if (depth && fb.overlaps(z.lo, z.hi)) return false;
     // The textures are read from GS memory as it is before the batch: whichever target holds them newer writes them
     // back, the batch's own included (a draw reading the frame it draws to).
+    g_sync_cause = 1;
     for (const Range &t : g_batch_reads) sync_memory(t, false);
+    g_sync_cause = 0;
     sync_memory(fb, true, color);
     if (depth) sync_memory(z, b.zwrite, depth);
     // PS2_NATIVE_SYNC=1 reloads the targets before every batch and writes them back after it: slow, and what the
@@ -1081,9 +1103,12 @@ void raster_batch(std::uint32_t prims) {
     g_compute_prims += prims;
     if (!g_surfaces.empty()) {
         // It reads and writes GS memory itself: native targets under it go back there first.
+        g_sync_cause = 2;
         sync_memory(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy), true);
         if (b.zte) sync_memory(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy), b.zwrite);
+        g_sync_cause = 3;
         for (const Range &r : g_batch_reads) sync_memory(r, false);
+        g_sync_cause = 0;
     }
     g_touched.clear();
     g_spans.clear();
@@ -1193,7 +1218,9 @@ bool batch_conflict(const Range &r, bool clut) {
 
 void emit_pre() {
     if (!g_surfaces.empty())
+        g_sync_cause = 4;
         for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
+        g_sync_cause = 0;
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -1448,6 +1475,32 @@ void submitted() {
                  static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(now[2] - last[2]) / seconds,
                  static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds, static_cast<double>(now[5] - last[5]) / seconds);
     std::copy(now, now + 6, last);
+    // And why the compute rasterizer's share was not the native renderer's: prims and batches a second, most first.
+    static std::uint64_t last_prims[kWhyCount] = {}, last_batches[kWhyCount] = {};
+    std::size_t order[kWhyCount];
+    for (std::size_t i = 0; i < kWhyCount; ++i) order[i] = i;
+    std::sort(order, order + kWhyCount, [&](std::size_t a, std::size_t b) { return g_why_prims[a] - last_prims[a] > g_why_prims[b] - last_prims[b]; });
+    std::string line;
+    for (std::size_t i : order) {
+        if (g_why_prims[i] == last_prims[i]) continue;
+        char text[96];
+        std::snprintf(text, sizeof text, "%s %s %.0f/%.0f", line.empty() ? "" : ",", kWhy[i], static_cast<double>(g_why_prims[i] - last_prims[i]) / seconds,
+                      static_cast<double>(g_why_batches[i] - last_batches[i]) / seconds);
+        line += text;
+    }
+    if (!line.empty()) std::fprintf(stderr, "[native] compute because (prims/batches):%s\n", line.c_str());
+    static std::uint64_t last_cause[6] = {};
+    line.clear();
+    for (std::size_t i = 0; i < 6; ++i) {
+        if (g_store_cause[i] == last_cause[i]) continue;
+        char text[96];
+        std::snprintf(text, sizeof text, "%s %s %.0f", line.empty() ? "" : ",", kStoreCause[i], static_cast<double>(g_store_cause[i] - last_cause[i]) / seconds);
+        line += text;
+    }
+    if (!line.empty()) std::fprintf(stderr, "[native] stores for:%s\n", line.c_str());
+    std::copy(g_store_cause, g_store_cause + 6, last_cause);
+    std::copy(g_why_prims, g_why_prims + kWhyCount, last_prims);
+    std::copy(g_why_batches, g_why_batches + kWhyCount, last_batches);
     since = std::chrono::steady_clock::now();
 }
 
@@ -2048,7 +2101,11 @@ void draw(const State &st, const Vertex *v, int count) {
         // texture's own, and highlight the sum of both, which is left to the compute rasterizer.
         const bool texture_alpha = (cache.flags & (2u | 8192u)) == (2u | 8192u);
         const std::uint32_t tfx = (w[7] >> 20) & 3u;
-        if (state.alpha_factor && texture_alpha && (tfx == 2 || (native_skip() & 128u))) cache.native = false;
+        cache.why = state.why;
+        if (state.alpha_factor && texture_alpha && (tfx == 2 || (native_skip() & 128u))) {
+            cache.native = false;
+            cache.why = tfx == 2 ? 12 : 1;
+        }
         cache.alpha_factor = state.alpha_factor && (!texture_alpha || tfx == 0);
     }
     const std::uint32_t *setup = cache.setup;
@@ -2151,10 +2208,15 @@ void draw(const State &st, const Vertex *v, int count) {
     Batch &b = g_batch;
     const bool zte = flags & 512u;
     // Triangles and sprites inside the buffer's width, with depths a Z24 buffer holds without clamping.
-    bool native = cache.native && prim >= 3 && maxx < static_cast<int>(setup[2] * 64) && !(native_skip() & (prim == 6 ? 64u : 32u));
-    if (native && zte) native = (prim == 6 ? v[1].z : std::max({v[0].z, v[1].z, v[2].z})) <= 0xFFFFFFu;
+    std::uint32_t why = cache.native ? 0 : cache.why;
+    if (!why && prim < 3) why = 13;
+    if (!why && maxx >= static_cast<int>(setup[2] * 64)) why = 14;
+    if (!why && (native_skip() & (prim == 6 ? 64u : 32u))) why = 1;
+    if (!why && zte && (prim == 6 ? v[1].z : std::max({v[0].z, v[1].z, v[2].z})) > 0xFFFFFFu) why = 15;
     // A source alpha above 0x80 is a blend factor above one, which only the compute rasterizer has.
-    if (native && cache.alpha_factor) native = (prim == 6 ? v[1].a : iip ? std::max({v[0].a, v[1].a, v[2].a}) : v[2].a) <= 0x80u;
+    if (!why && cache.alpha_factor && (prim == 6 ? v[1].a : iip ? std::max({v[0].a, v[1].a, v[2].a}) : v[2].a) > 0x80u) why = 16;
+    const bool native = cache.native && !why;
+    if (g_native && !native) ++g_why_prims[why];
     const std::uint64_t key = cache.key | (native ? 1ull << 63 : 0ull);
     if (b.key != ~0ull && b.key != key) emit_all();
     const Range &tex = cache.tex;
@@ -2190,6 +2252,7 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zwrite = false;
         b.rx1 = -2;
         b.native = native;
+        if (g_native && !native) ++g_why_batches[why];
     }
     b.zte = b.zte || zte;
     b.zwrite = b.zwrite || (zte && !(flags & 32u));
