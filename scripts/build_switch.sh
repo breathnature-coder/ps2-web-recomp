@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
   cat <<'EOF'
-usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--record] [--title TEXT]
+usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--census] [--record] [--title TEXT]
                                [--docker [IMAGE]] [--gl-driver nvc0|zink]
 
   <name>        the name given to scripts/port.sh; generated/<name> must exist
@@ -24,6 +24,8 @@ usage: scripts/build_switch.sh <name> [--with-disc] [--log] [--stats] [--record]
    args.txt only to test whether a scene is CPU-bound)
   --log         write the runner's output to log.txt on the SD card
   --stats       also log where the GPU renderer's time goes, once a second
+  --census      also log, every ten seconds, which draw states the game uses
+                and how much of the screen each covers
   --record      record vector unit programs and code the PC runs never reached
                 (into vu1/ and misses.txt on the card); bring them back with
                 scripts/import_switch_run.sh to have them compiled in
@@ -42,7 +44,7 @@ EOF
 
 [ $# -ge 1 ] || { usage; exit 2; }
 name="$1"; shift
-with_disc=0; log=0; stats=0; record=0; title=""; docker_image=""; gl_driver=""; gl="${PS2_SWITCH_GL:-legacy}"; suffix="${PS2_SWITCH_SUFFIX:-}"
+with_disc=0; log=0; stats=0; census=0; record=0; title=""; docker_image=""; gl_driver=""; gl="${PS2_SWITCH_GL:-legacy}"; suffix="${PS2_SWITCH_SUFFIX:-}"
 args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +52,7 @@ while [ $# -gt 0 ]; do
     --boost) echo "--boost is gone: the system boost mode slows the GPU to 76.8 MHz; use sys-clk or similar" >&2 ;;
     --log) log=1 ;;
     --stats) stats=1; log=1 ;;
+    --census) census=1; log=1 ;;
     --record) record=1 ;;
     --title) title="$2"; shift ;;
     --docker) docker_image="ghcr.io/danfromtico/switch-dev"; if [ $# -gt 1 ] && [ "${2#--}" = "$2" ]; then docker_image="$2"; shift; fi ;;
@@ -135,6 +138,7 @@ cp "$elf" "$sd/$(basename "$elf")"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
   [ "$log" = 1 ] && echo "@log"
   [ "$stats" = 1 ] && echo "@env PS2_GL_STATS=1"
+  [ "$census" = 1 ] && echo "@env PS2_GPU_CENSUS=1"
   [ -n "$gl_driver" ] && echo "@env MESA_SWITCH_GL_DRIVER=$gl_driver"
   if [ "$record" = 1 ]; then echo "@env PS2_VU_RECORD=vu1"; echo "--misses misses.txt"; fi
 } > "$sd/args.txt"

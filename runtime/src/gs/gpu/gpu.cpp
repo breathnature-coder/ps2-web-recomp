@@ -8,11 +8,14 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
+#include <map>
 #include <deque>
 #include <memory>
 #include <string>
@@ -578,6 +581,86 @@ void note_raster(std::uint32_t prims, std::uint32_t tiles, std::uint32_t entries
     g_command_info.push_back({g_commands.size(), {prims, tiles, entries, snapshot, b.prims[1], first[3] | (first[14] << 8) | (first[6] << 16), first[0], textured}});
 }
 
+// PS2_GPU_CENSUS=1 (or a number of seconds): every ten seconds, which draw states the game used and how much screen each covered. It is the
+// shopping list for a renderer that draws with the GPU's own rasterizer: the states at the top are the ones worth
+// supporting first.
+struct CensusKey {
+    std::uint32_t kind, flags, fpsm, zpsm, test, tpsm, masked;
+    bool operator<(const CensusKey &o) const {
+        return std::tie(kind, flags, fpsm, zpsm, test, tpsm, masked) < std::tie(o.kind, o.flags, o.fpsm, o.zpsm, o.test, o.tpsm, o.masked);
+    }
+};
+struct CensusCount {
+    std::uint64_t prims = 0, area = 0;
+};
+std::map<CensusKey, CensusCount> g_census;
+std::uint64_t g_census_batches = 0, g_census_feedback = 0, g_census_prims = 0, g_census_area = 0;
+std::chrono::steady_clock::time_point g_census_since = std::chrono::steady_clock::now();
+
+void census(std::uint32_t prims, bool feedback) {
+    static const char *const spec = std::getenv("PS2_GPU_CENSUS");
+    if (!spec) return;
+    static const double interval = std::atof(spec) > 1.0 ? std::atof(spec) : 10.0;  // PS2_GPU_CENSUS=<seconds>, 10 by default
+    const Batch &b = g_batch;
+    ++g_census_batches;
+    g_census_feedback += feedback ? 1 : 0;
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+        const std::uint32_t *w = b.setups.data() + rec[0] * kSetupWords;
+        const bool textured = (w[0] & 2u) != 0;
+        // Without a texture the texture bits of the state say nothing; without blending the blend equation does not either.
+        std::uint32_t test = w[7] & ~(3u << 28);
+        if (!textured) test &= ~((3u << 20) | (0xFu << 24));
+        if (!(w[0] & 8u)) test &= ~(0xFFu << 12);
+        if (!(w[0] & 64u)) test &= ~0x37u;
+        if (!(w[0] & 512u)) test &= ~(3u << 8);
+        std::uint32_t flags = w[0];
+        if (!textured) flags &= ~(16u | 8192u | 16384u | 32768u);
+        const CensusKey key{rec[1], flags, w[3], w[6], test, textured ? w[14] : 0xFFu, w[4] ? 1u : 0u};
+        const std::uint64_t width = (rec[3] & 0xFFFFu) - (rec[2] & 0xFFFFu) + 1, height = (rec[3] >> 16) - (rec[2] >> 16) + 1;
+        CensusCount &c = g_census[key];
+        ++c.prims;
+        c.area += width * height;
+        ++g_census_prims;
+        g_census_area += width * height;
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_census_since).count();
+    if (seconds < interval) return;
+    std::vector<std::pair<CensusKey, CensusCount>> rows(g_census.begin(), g_census.end());
+    std::sort(rows.begin(), rows.end(), [](const auto &x, const auto &y) { return x.second.area > y.second.area; });
+    std::fprintf(stderr, "[census] %.0f s: %llu batches (%llu read their own target), %llu prims, %llu states; box area %.1f Mpx\n", seconds,
+                 (unsigned long long)g_census_batches, (unsigned long long)g_census_feedback, (unsigned long long)g_census_prims,
+                 (unsigned long long)rows.size(), static_cast<double>(g_census_area) / 1e6);
+    static const char *const kAtst[] = {"never", "always", "<", "<=", "==", ">=", ">", "!="};
+    static const char *const kAfail[] = {"keep", "fb", "zb", "rgb"};
+    static const char *const kZtst[] = {"never", "always", ">=", ">"};
+    static const char *const kTfx[] = {"modulate", "decal", "highlight", "highlight2"};
+    for (std::size_t i = 0; i < rows.size() && i < 40; ++i) {
+        const CensusKey &k = rows[i].first;
+        char text[256];
+        int n = std::snprintf(text, sizeof text, "kind %u fb %02X%s z %02X%s", k.kind, k.fpsm, k.masked ? " masked" : "", k.zpsm, (k.flags & 32u) ? " nowrite" : "");
+        if (k.flags & 512u) n += std::snprintf(text + n, sizeof text - n, " ztst %s", kZtst[(k.test >> 8) & 3u]);
+        if (k.flags & 64u) n += std::snprintf(text + n, sizeof text - n, " atst %s fail %s", kAtst[k.test & 7u], kAfail[(k.test >> 4) & 3u]);
+        if (k.flags & 128u) n += std::snprintf(text + n, sizeof text - n, " date%u", (k.flags >> 8) & 1u);
+        if (k.flags & 8u) {
+            const std::uint32_t a = (k.test >> 12) & 0xFFu;
+            n += std::snprintf(text + n, sizeof text - n, " blend (%u-%u)*%u+%u%s", a & 3u, (a >> 2) & 3u, (a >> 4) & 3u, (a >> 6) & 3u, (k.flags & 1024u) ? " pabe" : "");
+        }
+        if (k.flags & 2u)
+            n += std::snprintf(text + n, sizeof text - n, " tex %02X %s%s%s%s clamp %X", k.tpsm, kTfx[(k.test >> 20) & 3u], (k.flags & 8192u) ? " tcc" : "",
+                               (k.flags & 16384u) ? " linear" : "", (k.flags & 16u) ? " fst" : "", (k.test >> 24) & 0xFu);
+        if (k.flags & 4u) n += std::snprintf(text + n, sizeof text - n, " fog");
+        if (k.flags & 1u) n += std::snprintf(text + n, sizeof text - n, " gouraud");
+        if (!(k.flags & 2048u)) n += std::snprintf(text + n, sizeof text - n, " wrapcolor");
+        if (k.flags & 4096u) n += std::snprintf(text + n, sizeof text - n, " fba");
+        std::fprintf(stderr, "[census] %5.1f%% area %7llu prims: %s\n", 100.0 * static_cast<double>(rows[i].second.area) / static_cast<double>(std::max<std::uint64_t>(g_census_area, 1)),
+                     (unsigned long long)rows[i].second.prims, text);
+    }
+    g_census.clear();
+    g_census_batches = g_census_feedback = g_census_prims = g_census_area = 0;
+    g_census_since = std::chrono::steady_clock::now();
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -635,6 +718,7 @@ void flush_batch() {
     const std::uint32_t snapshot = snapshot_batch(prims, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run);
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, snapshot_lo, snapshot_hi, snapshot_stride, snapshot_run});
     note_raster(prims, tiles, total, snapshot);
+    census(prims, snapshot != 0);
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
