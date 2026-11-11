@@ -122,6 +122,7 @@ using Op = std::function<void()>;
 
 struct WGPUCommandEncoderImpl {
     std::vector<Op> ops;
+    bool ops_after_pass = false;  // the open render pass is into textures and ends with an op
 };
 struct WGPUCommandBufferImpl {
     std::vector<Op> ops;
@@ -270,6 +271,10 @@ bool stats_on() {
     static const bool on = std::getenv("PS2_GL_STATS") != nullptr;
     return on;
 }
+
+const char *const kRenderName = "render";
+GLuint g_pass_query = 0;  // the timer query of the render pass being issued
+std::size_t g_pass_entry = 0;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -840,7 +845,20 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
             glEnable(GL_SCISSOR_TEST);
             glDisable(GL_CULL_FACE);
             glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);  // a WebGPU pass starts with this constant, and gpu.cpp counts on it
+            if (stats_on()) {  // the pass's GPU time, as "render" beside the kinds of dispatch
+                const std::size_t entry = stats_entry(kRenderName);
+                ++g_stats.entries[entry].count;
+                if (g_stats.free_queries.empty()) {
+                    g_stats.free_queries.push_back(0);
+                    glGenQueries(1, &g_stats.free_queries.back());
+                }
+                g_pass_query = g_stats.free_queries.back();
+                g_stats.free_queries.pop_back();
+                g_pass_entry = entry;
+                glBeginQuery(GL_TIME_ELAPSED, g_pass_query);
+            }
         });
+        e->ops_after_pass = true;
         return new WGPURenderPassEncoderImpl{e};
     }
     const WGPUColor c = d->colorAttachmentCount ? d->colorAttachments[0].clearValue : WGPUColor{0, 0, 0, 1};
@@ -903,7 +921,16 @@ void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, uint32_t vertices, uint3
     });
 }
 
-void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder) {}
+void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder p) {
+    if (!p->encoder->ops_after_pass) return;
+    p->encoder->ops_after_pass = false;
+    p->encoder->ops.push_back([] {
+        if (!g_pass_query) return;
+        glEndQuery(GL_TIME_ELAPSED);
+        g_stats.queries.emplace_back(g_pass_query, g_pass_entry);
+        g_pass_query = 0;
+    });
+}
 
 void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder p) { delete p; }
 
