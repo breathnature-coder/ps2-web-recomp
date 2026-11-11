@@ -1217,10 +1217,11 @@ bool batch_conflict(const Range &r, bool clut) {
 }
 
 void emit_pre() {
-    if (!g_surfaces.empty())
+    if (!g_surfaces.empty()) {
         g_sync_cause = 4;
         for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
         g_sync_cause = 0;
+    }
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
