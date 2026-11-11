@@ -673,7 +673,7 @@ std::uint32_t g_sync_cause = 0;
 // Why a draw is left to the compute rasterizer, counted for the [native] line.
 const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "",         
                             "mask in channel", "alpha fail writes part", "PABE or no clamp",  "blend by Ad",    "FIX above 0x80",    "blend 1+C",
-                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80"};
+                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80", "no native target"};
 constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
 std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
 
@@ -1205,6 +1205,10 @@ void flush_batch() {
         g_native_prims += prims;
         census(prims, false);
     } else {
+        if (b.native) {  // the native renderer had no targets for it: frame and depth in the same memory, or no room
+            g_why_prims[kWhyCount - 1] += prims;
+            ++g_why_batches[kWhyCount - 1];
+        }
         raster_batch(prims);
     }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
@@ -1760,7 +1764,10 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     if (c.test & 1u) flags |= 64u;
     if ((c.test >> 14) & 1u) flags |= 128u;
     if ((c.test >> 15) & 1u) flags |= 256u;
-    if ((c.test >> 16) & 1u) flags |= 512u;
+    // A depth test that always passes and writes nothing has nothing to do with the depth buffer: GT4 draws its
+    // colour correction that way, over the memory that was the depth buffer.
+    const bool z_unused = ((c.test >> 17) & 3u) == 1 && ((c.zbuf >> 32) & 1u);
+    if (((c.test >> 16) & 1u) && !z_unused) flags |= 512u;
     if (st.pabe & 1u) flags |= 1024u;
     if (st.colclamp & 1u) flags |= 2048u;
     if (c.fba & 1u) flags |= 4096u;
