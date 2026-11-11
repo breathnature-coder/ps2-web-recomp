@@ -382,9 +382,9 @@ GLuint link(std::initializer_list<GLuint> shaders, const char *name) {
     return program;
 }
 
-const char *find_shader(const std::string &entry, std::uint32_t scale) {
+const char *find_shader(const std::string &entry, std::uint32_t scale, std::uint32_t tile = 16) {
     for (std::size_t i = 0; i < kShaderCount; ++i)
-        if (kShaders[i].scale == scale && entry == kShaders[i].entry) return kShaders[i].source;
+        if (kShaders[i].scale == scale && (kShaders[i].tile == 0 || kShaders[i].tile == tile) && entry == kShaders[i].entry) return kShaders[i].source;
     return nullptr;
 }
 
@@ -563,15 +563,17 @@ void wgpuShaderModuleRelease(WGPUShaderModule m) { delete m; }
 WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice, WGPUComputePipelineDescriptor const *d) {
     current();
     const std::string entry = str(d->compute.entryPoint);
-    std::uint32_t scale = 1;
-    for (std::size_t i = 0; i < d->compute.constantCount; ++i)
+    std::uint32_t scale = 1, tile = 16;
+    for (std::size_t i = 0; i < d->compute.constantCount; ++i) {
         if (str(d->compute.constants[i].key) == "SCALE") scale = static_cast<std::uint32_t>(d->compute.constants[i].value);
-    const auto key = std::make_pair(entry, scale);
+        if (str(d->compute.constants[i].key) == "TILE") tile = static_cast<std::uint32_t>(d->compute.constants[i].value);
+    }
+    const auto key = std::make_pair(entry, scale * 100 + tile);
     auto it = g_programs.find(key);
     if (it == g_programs.end()) {
-        const char *source = find_shader(entry, scale);
+        const char *source = find_shader(entry, scale, tile);
         if (!source) {
-            std::fprintf(stderr, "[gl] no GLSL for %s at scale %u; run scripts/gen_glsl.py\n", entry.c_str(), scale);
+            std::fprintf(stderr, "[gl] no GLSL for %s at scale %u, tile %u; run scripts/gen_glsl.py\n", entry.c_str(), scale, tile);
             return nullptr;
         }
         const GLuint shader = compile(GL_COMPUTE_SHADER, source, entry.c_str());

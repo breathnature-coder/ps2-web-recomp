@@ -175,6 +175,9 @@ std::vector<PreOp> g_pre;
 std::vector<Range> g_batch_reads;
 
 int g_tiles_per_row = 128;
+// Side of a raster tile in pixels (PS2_TILE: 16, 8 or 4). Every pixel of a tile walks the tile's whole primitive list, so
+// smaller tiles mean shorter walks at the price of more tiles to bin and dispatch.
+int g_tile = 16;
 std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
 std::vector<std::uint32_t> g_touched;
 
@@ -345,8 +348,8 @@ std::vector<std::uint32_t> g_span_start;
 
 void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi) {
     const int sc = static_cast<int>(g_scale);
-    const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / 16, ty0 = static_cast<int>(lo >> 16) * sc / 16;
-    const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / 16, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / 16;
+    const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / g_tile, ty0 = static_cast<int>(lo >> 16) * sc / g_tile;
+    const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / g_tile, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / g_tile;
     const auto whole = [&] {
         for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1)});
     };
@@ -370,7 +373,7 @@ void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi) {
         m[e] = kind[e] ? -cb / ca : cb;
         q[e] = kind[e] ? -cc / ca : cc;
     }
-    const double span = 16.0 / static_cast<double>(sc);
+    const double span = static_cast<double>(g_tile) / static_cast<double>(sc);
     for (int ty = ty0; ty <= ty1; ++ty) {
         const double y0 = ty * span - 1.0, y1 = (ty + 1) * span + 1.0;
         double left = -1e30, right = 1e30;
@@ -1242,7 +1245,11 @@ bool init(Mode m) {
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
-    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
+    if (const char *tile = std::getenv("PS2_TILE")) {
+        const int t = std::atoi(tile);
+        if (t == 4 || t == 8 || t == 16) g_tile = t;
+    }
+    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + g_tile - 1) / g_tile;
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_field_words = (1u << 19) * g_scale * g_scale;
@@ -1298,11 +1305,13 @@ bool init(Mode m) {
         cd.layout = g_pipeline_layout;
         cd.compute.module = module;
         cd.compute.entryPoint = view(kEntryPoints[i]);
-        WGPUConstantEntry constant = WGPU_CONSTANT_ENTRY_INIT;
-        constant.key = view("SCALE");
-        constant.value = static_cast<double>(g_scale);
-        cd.compute.constantCount = 1;
-        cd.compute.constants = &constant;
+        WGPUConstantEntry constants[2] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
+        constants[0].key = view("SCALE");
+        constants[0].value = static_cast<double>(g_scale);
+        constants[1].key = view("TILE");
+        constants[1].value = static_cast<double>(g_tile);
+        cd.compute.constantCount = 2;
+        cd.compute.constants = constants;
         g_pipelines[i] = wgpuDeviceCreateComputePipeline(g_device, &cd);
         if (!g_pipelines[i]) return false;
     }

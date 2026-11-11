@@ -131,6 +131,7 @@ cp "$elf" "$sd/$(basename "$elf")"
   echo "--memcard $name.ps2"
   echo "# @env PS2_GS=cpu      software renderer, for comparison"
   echo "# @env PS2_SCALE=2     twice the PS2 resolution inside (slower)"
+  echo "# @env PS2_TILE=8      raster tile size: 16 (default), 8 or 4"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi
   [ "$log" = 1 ] && echo "@log"
   [ "$stats" = 1 ] && echo "@env PS2_GL_STATS=1"

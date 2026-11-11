@@ -137,11 +137,13 @@ int main(int argc, char **argv) {
         cd.layout = pl;
         cd.compute.module = mod;
         cd.compute.entryPoint = sv(argv[i]);
-        WGPUConstantEntry c = WGPU_CONSTANT_ENTRY_INIT;
-        c.key = sv("SCALE");
-        c.value = scale;
-        cd.compute.constantCount = 1;
-        cd.compute.constants = &c;
+        WGPUConstantEntry c[2] = {WGPU_CONSTANT_ENTRY_INIT, WGPU_CONSTANT_ENTRY_INIT};
+        c[0].key = sv("SCALE");
+        c[0].value = scale;
+        c[1].key = sv("TILE");
+        c[1].value = getenv("WGSL_TILE") ? atof(getenv("WGSL_TILE")) : 16;
+        cd.compute.constantCount = 2;
+        cd.compute.constants = c;
         fprintf(stdout, "@@ENTRY %s\n", argv[i]);
         WGPUComputePipeline p = wgpuDeviceCreateComputePipeline(dev, &cd);
         fprintf(stderr, "%s: %p\n", argv[i], (void *)p);
