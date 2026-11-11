@@ -34,8 +34,8 @@ namespace ps2::gs::gpu {
 namespace {
 
 // kNative is not a compute pipeline: such a command is a render pass of the native renderer (g_native_passes).
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kStoreColor, kStoreDepth, kPipelines, kNative = kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "store_color", "store_depth"};
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kLutFrame, kLutScratch, kStoreColor, kStoreDepth, kPipelines, kNative = kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "lut_frame", "lut_scratch", "store_color", "store_depth"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -125,6 +125,12 @@ struct Arena {
     std::uint32_t &operator[](std::size_t i) { return words[i]; }
 } g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
+// What each CLUT slot was loaded from: block pointer, and whether as the 256 entries of a 32-bit CSM1 CLUT.
+struct ClutSource {
+    std::uint32_t cbp = 0;
+    bool plain = false;
+};
+ClutSource g_clut_source[kClutSlots];
 
 struct Image {
     bool active = false;
@@ -1197,6 +1203,203 @@ void raster_batch(std::uint32_t prims) {
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
 }
 
+void emit_pre(std::size_t upto = ~static_cast<std::size_t>(0));
+
+// ---- GT4's colour correction ----
+//
+// After a race frame is drawn GT4 puts every pixel's red, green and blue through a 256-entry table. It has the GS do
+// it, a 64x32 tile (one page of the frame) at a time, 70 tiles a frame:
+//   1. 48 sprites read the tile's page as an 8-bit texture, a byte of a pixel at a time, with the table as CLUT,
+//      into a scratch page: 16 sprites for red, then 16 adding blue and 16 adding green.
+//   2. 8 sprites copy the scratch page back over the tile, each through an eighth of it as a CLUT and a texture that
+//      counts (kLutCount), which undoes the order step 1 left the pixels in.
+// That is 140 batches and 630 CLUT loads a frame, each reading what the one before wrote. Here the two steps are
+// recognized, exactly as traced on hardware and nothing looser, and not drawn: the pages they cover are collected
+// and the table is applied to them in one dispatch (lut_frame in gs.wgsl) when something else comes along. The
+// scratch page is left as the game's last step 1 would have left it (lut_scratch). tests/gs_gt4_lut_test.cpp draws
+// the real sequence both ways. PS2_GT4_LUT=0 turns this off.
+const std::uint8_t kLutCount[256] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x0C, 0x0D, 0x0E, 0x0F, 0x08, 0x09, 0x0A, 0x0B, 0x1C, 0x1D, 0x1E, 0x1F, 0x18, 0x19, 0x1A, 0x1B,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x2C, 0x2D, 0x2E, 0x2F, 0x28, 0x29, 0x2A, 0x2B, 0x3C, 0x3D, 0x3E, 0x3F, 0x38, 0x39, 0x3A, 0x3B,
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+    0x4C, 0x4D, 0x4E, 0x4F, 0x48, 0x49, 0x4A, 0x4B, 0x5C, 0x5D, 0x5E, 0x5F, 0x58, 0x59, 0x5A, 0x5B,
+    0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,
+    0x6C, 0x6D, 0x6E, 0x6F, 0x68, 0x69, 0x6A, 0x6B, 0x7C, 0x7D, 0x7E, 0x7F, 0x78, 0x79, 0x7A, 0x7B,
+    0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x8C, 0x8D, 0x8E, 0x8F, 0x88, 0x89, 0x8A, 0x8B, 0x9C, 0x9D, 0x9E, 0x9F, 0x98, 0x99, 0x9A, 0x9B,
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+    0xAC, 0xAD, 0xAE, 0xAF, 0xA8, 0xA9, 0xAA, 0xAB, 0xBC, 0xBD, 0xBE, 0xBF, 0xB8, 0xB9, 0xBA, 0xBB,
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7,
+    0xCC, 0xCD, 0xCE, 0xCF, 0xC8, 0xC9, 0xCA, 0xCB, 0xDC, 0xDD, 0xDE, 0xDF, 0xD8, 0xD9, 0xDA, 0xDB,
+    0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7,
+    0xEC, 0xED, 0xEE, 0xEF, 0xE8, 0xE9, 0xEA, 0xEB, 0xFC, 0xFD, 0xFE, 0xFF, 0xF8, 0xF9, 0xFA, 0xFB,
+};
+// Step 2's eight CLUTs, in blocks from the scratch page's start.
+const std::uint32_t kLutClut[8] = {0x00, 0x04, 0x10, 0x14, 0x08, 0x0C, 0x18, 0x1C};
+
+struct Lut {
+    bool count_ok = false;  // the counting texture is in GS memory, at count_bp
+    std::uint32_t count_bp = 0;
+    Range count_range;
+    bool half = false;  // a step 1 was taken and its step 2 has not come
+    std::uint32_t page = 0, scratch = 0, scratch_bw = 0, slot = 0, table = 0;  // of the latest step 1
+    std::size_t pre = 0;                                                       // uploads and CLUT loads queued before it
+    bool any = false;  // pages are waiting for the table
+    std::uint32_t fbp = 0, fbw = 0, mask[8] = {};
+    int minx = 0, miny = 0, maxx = 0, maxy = 0;
+} g_lut;
+std::uint64_t g_lut_tiles = 0, g_lut_passes = 0;
+
+void clear_batch() {
+    Batch &b = g_batch;
+    b.prims.clear();
+    b.setups.clear();
+    b.boxes.clear();
+    g_batch_reads.clear();
+    b.key = ~0ull;
+    b.minx = b.miny = 1 << 30;
+    b.maxx = b.maxy = -1;
+}
+
+// Is the pending batch step 1, and of which page?
+bool lut_step1(std::uint32_t &page, std::uint32_t &scratch, std::uint32_t &scratch_bw, std::uint32_t &slot) {
+    const Batch &b = g_batch;
+    if (b.prims.size() != 48 * kPrimWords) return false;
+    static const struct { std::uint32_t color; float u, v; bool blend, region; } kChannel[3] = {{0x00000080u, 0, 0, false, false}, {0x00800000u, 128, 0, true, false}, {0x00008000u, 64, 32, true, true}};
+    for (std::uint32_t n = 0; n < 48; ++n) {
+        const std::uint32_t *rec = b.prims.data() + n * kPrimWords;
+        const std::uint32_t *w = b.setups.data() + rec[0] * kSetupWords;
+        const auto &c = kChannel[n / 16];
+        const std::uint32_t i = n % 16;
+        // The state: a 32-bit scratch page with its alpha masked, the page as a 128x64 8-bit texture, modulated,
+        // point sampled, nothing tested; red plain, blue and green added.
+        const std::uint32_t flags = w[0], want = 2u | 16u | 2048u | 8192u | (c.blend ? 8u : 0u);
+        if ((flags & (2u | 4u | 8u | 16u | 64u | 128u | 512u | 1024u | 2048u | 4096u | 8192u | 16384u)) != want) return false;
+        if (w[3] != PSMCT32 || w[4] != 0xFF000000u || w[1] % 32u || w[12] % 32u || w[13] != 2 || w[14] != PSMT8 || w[15] != 0x0607u) return false;
+        if (((w[7] >> 20) & 3u) != 0 || ((w[7] >> 28) & 3u) != 0) return false;
+        if (c.blend && (((w[7] >> 12) & 0xFFu) != 0x68u || w[9] != 0x80u)) return false;
+        if (((w[7] >> 24) & 0xFu) != (c.region ? 3u : 0u) || (c.region && w[18] != 0x3F7u)) return false;
+        if ((w[10] & 0xFFFFu) != 0 || (w[10] >> 16) < 63 || (w[11] & 0xFFFFu) != 0 || (w[11] >> 16) < 31) return false;
+        if (n == 0) {
+            page = w[12];
+            scratch = w[1];
+            scratch_bw = w[2];
+            slot = w[22];
+        } else if (w[12] != page || w[1] != scratch || w[2] != scratch_bw || w[22] != slot) {
+            return false;
+        }
+        // The sprite: 8x16 pixels of the scratch page from 8 texels by 64, which is every fourth row of bytes.
+        const float u = c.u + static_cast<float>(i / 2) * 256.0f, v = c.v + static_cast<float>(i % 2) * 16.0f;
+        const float expect[4] = {static_cast<float>((i % 8) * 8), static_cast<float>((i / 8) * 16), 8.0f, 16.0f};
+        if (rec[1] != 1 || std::memcmp(rec + 4, expect, sizeof expect) != 0 || rec[13] != c.color) return false;
+        if (u2f(rec[15]) != u || u2f(rec[16]) != v || u2f(rec[18]) != u + 128.0f || u2f(rec[19]) != v + 1024.0f) return false;
+    }
+    return g_clut_source[slot].plain;
+}
+
+// Is the pending batch step 2 of the step 1 taken, and over which page of the frame?
+bool lut_step2(std::uint32_t &tile) {
+    const Batch &b = g_batch;
+    if (b.prims.size() != 8 * kPrimWords || !g_lut.count_ok) return false;
+    const std::uint32_t *first = b.setups.data() + b.prims[0] * kSetupWords;
+    const std::uint32_t fbp = first[1], fbw = first[2];
+    if (b.minx % 64 || b.miny % 32 || b.maxx != b.minx + 63 || b.maxy != b.miny + 31 || !fbw) return false;
+    tile = static_cast<std::uint32_t>(b.minx / 64) + static_cast<std::uint32_t>(b.miny / 32) * fbw;
+    if (tile >= 256 || fbp + tile * 32u != g_lut.page) return false;
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        const std::uint32_t *rec = b.prims.data() + k * kPrimWords;
+        const std::uint32_t *w = b.setups.data() + rec[0] * kSetupWords;
+        // The state: the 24-bit frame, the counting texture, decal, point sampled, nothing tested or blended.
+        if ((w[0] & (2u | 4u | 8u | 16u | 64u | 128u | 512u | 1024u | 2048u | 4096u | 8192u | 16384u)) != (2u | 16u | 2048u | 8192u)) return false;
+        if (w[3] != PSMCT24 || w[4] != 0xFF000000u || w[1] != fbp || w[2] != fbw) return false;
+        if (w[12] != g_lut.count_bp || w[13] != 1 || w[14] != PSMT8 || w[15] != 0x0503u) return false;
+        if (((w[7] >> 20) & 3u) != 1 || ((w[7] >> 24) & 0xFu) != 0 || ((w[7] >> 28) & 3u) != 0) return false;
+        if (static_cast<int>(w[10] & 0xFFFFu) > b.minx || static_cast<int>(w[10] >> 16) < b.maxx || static_cast<int>(w[11] & 0xFFFFu) > b.miny || static_cast<int>(w[11] >> 16) < b.maxy) return false;
+        const ClutSource &clut = g_clut_source[w[22]];
+        if (!clut.plain || clut.cbp != g_lut.scratch + kLutClut[k]) return false;
+        // The sprite: strip k of the tile, 8x32 pixels from the texture's 8x32.
+        const float expect[4] = {static_cast<float>(b.minx + static_cast<int>(k) * 8), static_cast<float>(b.miny), 8.0f, 32.0f};
+        if (rec[1] != 1 || std::memcmp(rec + 4, expect, sizeof expect) != 0) return false;
+        if (u2f(rec[15]) != 0.0f || u2f(rec[16]) != 0.0f || u2f(rec[18]) != 128.0f || u2f(rec[19]) != 512.0f) return false;
+    }
+    return true;
+}
+
+void lut_flush();
+
+// Takes the pending batch if it is the next step of the colour correction; true when it did.
+bool lut_try() {
+    static const bool on = !std::getenv("PS2_GT4_LUT") || std::atoi(std::getenv("PS2_GT4_LUT")) != 0;
+    if (!on || g_scale != 1 || g_batch.prims.empty()) return false;
+    std::uint32_t page = 0, scratch = 0, scratch_bw = 0, slot = 0, tile = 0;
+    if (!g_lut.half && lut_step1(page, scratch, scratch_bw, slot)) {
+        // Every step 1 of a run has to use the same table: the same CLUT, which nothing can have changed since the
+        // run began (an upload ends it).
+        if (g_lut.any && (g_clut_source[slot].cbp != g_lut.table || scratch != g_lut.scratch)) return false;
+        // A page whose lookup is still to be done, read again: the lookup first.
+        if (g_lut.any && page >= g_lut.fbp && (page - g_lut.fbp) / 32u < 256u && ((g_lut.mask[(page - g_lut.fbp) / 32u / 32u] >> ((page - g_lut.fbp) / 32u % 32u)) & 1u)) lut_flush();
+        g_lut.half = true;
+        g_lut.page = page;
+        g_lut.scratch = scratch;
+        g_lut.scratch_bw = scratch_bw;
+        g_lut.slot = slot;
+        g_lut.table = g_clut_source[slot].cbp;
+        g_lut.pre = g_pre.size();
+        clear_batch();
+        return true;
+    }
+    if (g_lut.half && lut_step2(tile)) {
+        const std::uint32_t *w = g_batch.setups.data() + g_batch.prims[0] * kSetupWords;
+        if (g_lut.any && (w[1] != g_lut.fbp || w[2] != g_lut.fbw)) return false;
+        g_lut.minx = g_lut.any ? std::min(g_lut.minx, g_batch.minx) : g_batch.minx;
+        g_lut.miny = g_lut.any ? std::min(g_lut.miny, g_batch.miny) : g_batch.miny;
+        g_lut.maxx = g_lut.any ? std::max(g_lut.maxx, g_batch.maxx) : g_batch.maxx;
+        g_lut.maxy = g_lut.any ? std::max(g_lut.maxy, g_batch.maxy) : g_batch.maxy;
+        g_lut.any = true;
+        g_lut.half = false;
+        g_lut.fbp = w[1];
+        g_lut.fbw = w[2];
+        g_lut.mask[tile / 32] |= 1u << (tile % 32);
+        ++g_lut_tiles;
+        clear_batch();
+        return true;
+    }
+    return false;
+}
+
+// Does what the steps taken so far come to, before anything else touches GS memory.
+void lut_flush() {
+    if (!g_lut.any && !g_lut.half) return;
+    // The table's CLUT load is among what was queued before the latest step 1; what was queued after it (the eight
+    // loads from the scratch page) has to see what that step wrote.
+    emit_pre(g_lut.half ? g_lut.pre : ~static_cast<std::size_t>(0));
+    const auto scratch = [&] {
+        sync_memory(pages(g_lut.page, 1, PSMCT32, 0, 0, 63, 31), false);
+        sync_memory(pages(g_lut.scratch, g_lut.scratch_bw, PSMCT32, 0, 0, 63, 31), true);
+        std::uint32_t where[256];
+        for (std::uint32_t i = 0; i < 256; ++i) where[kLutCount[i]] = (i % 8) | ((i / 8) << 8);
+        const std::uint32_t offset = arena_append(where, sizeof where);
+        g_commands.push_back({kLutScratch, 8, 4, push_params({g_lut.scratch, g_lut.scratch_bw, g_lut.page, g_lut.slot, offset})});
+    };
+    // The scratch page holds the latest step 1's pixels: those of a page before its lookup, if that page's step 2
+    // came, so this goes first.
+    if (g_lut.any && !g_lut.half) scratch();
+    if (g_lut.any) {
+        sync_memory(pages(g_lut.fbp, g_lut.fbw, PSMCT32, g_lut.minx, g_lut.miny, g_lut.maxx, g_lut.maxy), true);
+        const std::uint32_t w = static_cast<std::uint32_t>(g_lut.maxx - g_lut.minx + 1), h = static_cast<std::uint32_t>(g_lut.maxy - g_lut.miny + 1);
+        g_commands.push_back({kLutFrame, (w + 7) / 8, (h + 7) / 8,
+                              push_params({g_lut.fbp, g_lut.fbw, static_cast<std::uint32_t>(g_lut.minx), static_cast<std::uint32_t>(g_lut.miny), w, h, g_lut.slot, 0, g_lut.mask[0], g_lut.mask[1],
+                                           g_lut.mask[2], g_lut.mask[3], g_lut.mask[4], g_lut.mask[5], g_lut.mask[6], g_lut.mask[7]})});
+        ++g_lut_passes;
+        TRACE("colour correction over %d,%d-%d,%d of %X/%u\n", g_lut.minx, g_lut.miny, g_lut.maxx, g_lut.maxy, g_lut.fbp, g_lut.fbw);
+    }
+    if (g_lut.half) scratch();
+    g_lut.any = g_lut.half = false;
+    std::memset(g_lut.mask, 0, sizeof g_lut.mask);
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -1238,13 +1441,9 @@ void flush_batch() {
     }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
-    b.prims.clear();
-    b.setups.clear();
-    b.boxes.clear();
-    g_batch_reads.clear();
-    b.key = ~0ull;
-    b.minx = b.miny = 1 << 30;
-    b.maxx = b.maxy = -1;
+    // Whatever was drawn over the counting texture of GT4's colour correction, it no longer counts.
+    if (g_lut.count_ok && pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy).overlaps(g_lut.count_range.lo, g_lut.count_range.hi)) g_lut.count_ok = false;
+    clear_batch();
 }
 
 
@@ -1271,7 +1470,13 @@ bool batch_conflict(const Range &r, bool clut) {
     return false;
 }
 
-void emit_pre() {
+// Emits the first `upto` of the queued uploads and CLUT loads (all of them by default).
+void emit_pre(std::size_t upto) {
+    std::vector<PreOp> later;
+    if (upto < g_pre.size()) {
+        later.assign(g_pre.begin() + static_cast<std::ptrdiff_t>(upto), g_pre.end());
+        g_pre.resize(upto);
+    }
     if (!g_surfaces.empty()) {
         g_sync_cause = 4;
         for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
@@ -1308,16 +1513,29 @@ void emit_pre() {
         else dispatch_linear(kUpload, total, push_params({offset, count, total}));
         i = j;
     }
-    g_pre.clear();
+    g_pre = std::move(later);
 }
 
 void emit_all() {
+    if (lut_try()) return;
+    lut_flush();
     emit_pre();
     flush_batch();
 }
 
+// emit_all, and nothing kept back: a taken step of the colour correction leaves its lookup and the queued uploads
+// and CLUT loads waiting for the next step, and they cannot wait past a submit (which empties what they point into)
+// or anything else that reads or writes GS memory.
+void emit_everything() {
+    emit_all();
+    lut_flush();
+    emit_pre();
+}
+
 void queue_pre(const PreOp &op) {
     if (batch_conflict(op.range, op.clut)) emit_all();
+    // An upload could change the colour correction's table or what it reads: what is collected is done first.
+    if (!op.clut) lut_flush();
     g_pre.push_back(op);
 }
 
@@ -1342,7 +1560,7 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
             // is read again before the next insert, so without a submit here the cache would take nothing new
             // once it wraps, and every upload from then on goes through the per-submit buffer.
             if (!cached && !g_cache_ring.empty() && g_cache_ring.front().used == g_serial) {
-                emit_all();
+                emit_everything();
                 submit(nullptr);
                 cached = cache_insert(key, bytes, n, offset);
             }
@@ -1356,6 +1574,14 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
     op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
                       static_cast<int>(im.dsay + last));
+    // GT4's counting texture for its colour correction, as a whole or written over.
+    if (im.dpsm == PSMT8 && im.dbw == 1 && im.rrw == 8 && !im.dsax && !im.dsay && !im.done && pixels == 256 && !lead_bits && std::memcmp(bytes, kLutCount, 256) == 0) {
+        g_lut.count_ok = true;
+        g_lut.count_bp = im.dbp;
+        g_lut.count_range = op.range;
+    } else if (g_lut.count_ok && op.range.overlaps(g_lut.count_range.lo, g_lut.count_range.hi)) {
+        g_lut.count_ok = false;
+    }
     op.x0 = im.dsax;
     op.x1 = im.dsax + im.rrw - 1;
     op.y0 = im.dsay + first;
@@ -1393,7 +1619,7 @@ void flush_image() {
 
 void flush_all() {
     flush_image();
-    emit_all();
+    emit_everything();
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -1562,6 +1788,11 @@ void submitted() {
         line += text;
     }
     if (!line.empty()) std::fprintf(stderr, "[native] compute because (prims/batches):%s\n", line.c_str());
+    static std::uint64_t last_tiles = 0, last_passes = 0;
+    if (g_lut_tiles != last_tiles)
+        std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
+    last_tiles = g_lut_tiles;
+    last_passes = g_lut_passes;
     static std::uint64_t last_cause[6] = {};
     line.clear();
     for (std::size_t i = 0; i < 6; ++i) {
@@ -2392,6 +2623,7 @@ void image_data(const std::uint8_t *data, std::size_t bytes) {
 
 void local_copy(const State &s) {
     flush_all();
+    g_lut.count_ok = false;  // rather than work out whether it was copied over
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     const std::uint32_t w = static_cast<std::uint32_t>(reg) & 0xFFFu, h = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
     if (!w || !h) return;
@@ -2417,7 +2649,7 @@ void local_copy(const State &s) {
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     flush_image();
     if (g_clut_loads + 2 >= kClutSlots) {
-        emit_all();
+        emit_everything();
         submit();
     }
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
@@ -2433,6 +2665,7 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    g_clut_source[next] = {cbp, cpsm == PSMCT32 && !csm && rec[6] != 0};
     g_clut_slot = next;
     ++g_clut_loads;
 }
@@ -2570,6 +2803,8 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     wait_idle();
 }
 
+std::uint64_t corrected_tiles() { return g_lut_tiles; }
+
 void stats() {
     if (g_mode == Mode::off) return;
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
@@ -2580,6 +2815,7 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_lut_tiles) std::fprintf(stderr, "[gpu] colour correction: %llu tiles as table lookups in %llu passes\n", static_cast<unsigned long long>(g_lut_tiles), static_cast<unsigned long long>(g_lut_passes));
 }
 
 void configure_surface() {

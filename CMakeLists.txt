@@ -164,6 +164,12 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         # bytes per scene), so this only checks that it runs; compare two GPU
         # renderers with each other through scripts/compare_gpu_backends.sh.
         add_test(NAME gs_gpu_compare COMMAND gs_gpu_compare_test 40)
+        # GT4's colour correction as it draws it, against the table lookup it is.
+        add_executable(gs_gt4_lut_test tests/gs_gt4_lut_test.cpp)
+        target_include_directories(gs_gt4_lut_test PRIVATE runtime/src)
+        target_link_libraries(gs_gt4_lut_test PRIVATE ps2runtime)
+        add_test(NAME gs_gt4_lut COMMAND gs_gt4_lut_test)
+        set_tests_properties(gs_gt4_lut PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(gs_gpu_compare PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_COMPARE_MIN_PERCENT=0")
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)

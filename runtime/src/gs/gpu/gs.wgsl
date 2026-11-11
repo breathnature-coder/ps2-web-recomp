@@ -1148,6 +1148,48 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
+// GT4's colour correction, which the game draws a 64x32 tile at a time through textures and CLUTs (see lut_try in
+// gpu.cpp), comes to this: red, green and blue each looked up in the 256-entry table a CLUT slot holds.
+fn lut_word(slot: u32, v: u32) -> u32 {
+    let base = slot * CLUT_ENTRIES;
+    return (v & 0xFF000000u) | (clut[base + (v & 255u)] & 0xFFu) | (clut[base + ((v >> 8u) & 255u)] & 0xFF00u) | (clut[base + ((v >> 16u) & 255u)] & 0xFF0000u);
+}
+
+// The lookup over the frame's pages that are set in a mask. Parameters: block pointer, buffer width, the rectangle
+// in pixels, the table's CLUT slot, and from 8 on the mask, a bit a page. Only at an internal resolution of one.
+@compute @workgroup_size(8, 8)
+fn lut_frame(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= prm(4u) || gid.y >= prm(5u)) {
+        return;
+    }
+    let x = prm(2u) + gid.x;
+    let y = prm(3u) + gid.y;
+    let page = x / 64u + (y / 32u) * prm(1u);
+    if (page >= 256u || ((prm(8u + page / 32u) >> (page % 32u)) & 1u) == 0u) {
+        return;
+    }
+    let l = addr(fmt_of(PSMCT32, prm(0u), prm(1u)), x, y);
+    store(l, 0u, lut_word(prm(6u), load_at(l, 0u)));
+}
+
+// What the game's first step leaves in its scratch page: the looked-up pixels of one page, in the order of the
+// eight CLUTs its second step reads them back through. Parameters: the scratch page's block pointer and buffer
+// width, the page's block pointer, the table's CLUT slot, and where in data[] the 256 words are that say which
+// pixel of an 8x32 strip (x, and y from bit 8) a CLUT index holds.
+@compute @workgroup_size(8, 8)
+fn lut_scratch(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= 64u || gid.y >= 32u) {
+        return;
+    }
+    let strip = gid.x / 16u + (gid.y / 16u) * 4u;
+    let at = (gid.y % 16u) * 16u + gid.x % 16u;
+    let index = (at & 0xE7u) | ((at & 8u) << 1u) | ((at & 16u) >> 1u);
+    let where_ = data[prm(4u) + index];
+    let source = load_at(addr(fmt_of(PSMCT32, prm(2u), 1u), strip * 8u + (where_ & 255u), where_ >> 8u), 0u);
+    let l = addr(fmt_of(PSMCT32, prm(0u), prm(1u)), gid.x, gid.y);
+    store(l, 0u, (load_at(l, 0u) & 0xFF000000u) | (lut_word(prm(3u), source) & 0xFFFFFFu));
+}
+
 // Native render targets back into GS memory. Parameters: block pointer, buffer width, then the rectangle in pixels.
 // A colour target holds whole 32-bit words (a CT24 draw leaves its alpha alone); a depth target holds Z24.
 @compute @workgroup_size(8, 8)

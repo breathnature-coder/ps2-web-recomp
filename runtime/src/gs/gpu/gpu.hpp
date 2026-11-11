@@ -46,5 +46,7 @@ bool has_surface();
 bool present(const DisplaySource &src);
 double busy_ms();
 void stats();
+// Tiles of GT4's colour correction done as a table lookup instead of drawn (see lut_try in gpu.cpp).
+std::uint64_t corrected_tiles();
 
 }
