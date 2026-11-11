@@ -1125,6 +1125,13 @@ void raster_batch(std::uint32_t prims) {
         const std::uint32_t *w = b.setups.data() + b.prims[0] * kSetupWords;
         TRACE("compute %u prims kind %u flags %05X modes %08X fb %X/%u/%02X msk %08X z %X/%02X tex %X/%u/%02X box %d,%d-%d,%d reads %zu\n", prims, b.prims[1], w[0], w[7], b.fbp, b.fbw, b.fpsm, w[4],
               b.zbp, b.zpsm, w[12], w[13], w[14], b.minx, b.miny, b.maxx, b.maxy, g_batch_reads.size());
+        // The first few batches of GT4's colour correction (alpha masked) in full, to work out what it computes.
+        static int dumps = 0;
+        if (w[4] == 0xFF000000u && prims <= 64 && dumps < 8) {
+            ++dumps;
+            for (std::size_t i = 0; i < b.setups.size(); ++i) std::fprintf(stderr, "%s%08X%s", i % kSetupWords ? " " : "[trace] setup ", b.setups[i], (i + 1) % kSetupWords ? "" : "\n");
+            for (std::size_t i = 0; i < b.prims.size(); ++i) std::fprintf(stderr, "%s%08X%s", i % kPrimWords ? " " : "[trace] prim ", b.prims[i], (i + 1) % kPrimWords ? "" : "\n");
+        }
     }
     g_compute_prims += prims;
     if (!g_surfaces.empty()) {
@@ -1272,8 +1279,9 @@ void emit_pre() {
     }
     if (g_trace > 0)
         for (const PreOp &op : g_pre)
-            TRACE("%s %llX-%llX rec %X %X %X %X rect %u,%u-%u,%u\n", op.clut ? "clut" : "upload", static_cast<unsigned long long>(op.range.lo), static_cast<unsigned long long>(op.range.hi), op.rec[0],
-                  op.rec[1], op.rec[2], op.rec[3], op.x0, op.y0, op.x1, op.y1);
+            TRACE("%s %llX-%llX rec %X %X %X %X %X %X %X %X %X %X %X rect %u,%u-%u,%u\n", op.clut ? "clut" : "upload", static_cast<unsigned long long>(op.range.lo),
+                  static_cast<unsigned long long>(op.range.hi), op.rec[0], op.rec[1], op.rec[2], op.rec[3], op.rec[4], op.rec[5], op.rec[6], op.rec[7], op.rec[8], op.rec[9], op.rec[10], op.x0, op.y0,
+                  op.x1, op.y1);
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
