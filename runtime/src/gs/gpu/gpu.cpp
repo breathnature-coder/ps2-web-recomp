@@ -655,6 +655,16 @@ std::uint32_t native_skip() {
     return skip;
 }
 
+// PS2_NATIVE_TRACE, or the [native] report once a race has run for a while: everything the renderer does over a
+// few frames, a line each, to see what a frame is made of on hardware.
+int g_trace = 0;
+#define TRACE(...) do { if (g_trace > 0) std::fprintf(stderr, "[trace] " __VA_ARGS__); } while (0)
+const Range *g_sync_range = nullptr;
+bool native_debug() {
+    static const bool on = std::getenv("PS2_NATIVE_DEBUG") != nullptr;
+    return on;
+}
+
 // What a target was written back to GS memory for, counted for the [native] line.
 const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", ""};
 std::uint64_t g_store_cause[6] = {};
@@ -833,11 +843,15 @@ void store_surface(Surface &s) {
     g_commands.push_back(c);
     ++g_stores;
     ++g_store_cause[g_sync_cause];
+    TRACE("store %s %X/%u/%02X rect %d,%d-%d,%d for %s", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1, kStoreCause[g_sync_cause]);
+    if (g_trace > 0 && g_sync_range) std::fprintf(stderr, " %llX-%llX", static_cast<unsigned long long>(g_sync_range->lo), static_cast<unsigned long long>(g_sync_range->hi));
+    if (g_trace > 0) std::fprintf(stderr, "\n");
 }
 
 // Something other than a native draw to `self` is about to read, or write, this GS memory: textures holding newer
 // pixels there are written back first, and after a write they are stale where it landed.
 void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
+    g_sync_range = &r;
     for (const auto &p : g_surfaces) {
         Surface &s = *p;
         if (&s == self) continue;
@@ -934,6 +948,7 @@ void load_surface(Surface &s) {
                           static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), 0.0f});
     g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
     g_native_passes.push_back(std::move(pass));
+    TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.stale0, s.stale1);
     s.stale0 = 0;
     s.stale1 = -1;
     ++g_loads;
@@ -974,7 +989,7 @@ bool flush_native(std::uint32_t prims) {
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     NativePass pass{color, depth, {}};
-    if (std::getenv("PS2_NATIVE_DEBUG")) std::fprintf(stderr, "[batch] %llu: %u prims, fbp %X zbp %X\n", static_cast<unsigned long long>(g_native_batches), prims, b.fbp, b.zbp);
+    if (native_debug()) std::fprintf(stderr, "[batch] %llu: %u prims, fbp %X zbp %X\n", static_cast<unsigned long long>(g_native_batches), prims, b.fbp, b.zbp);
     for (std::uint32_t i = 0; i < prims;) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
         std::uint32_t j = i + 1;
@@ -984,8 +999,8 @@ bool flush_native(std::uint32_t prims) {
         native_state(w, depth != nullptr, state);
         const std::uint32_t x0 = std::min(w[10] & 0xFFFFu, color->width), x1 = std::min((w[10] >> 16) + 1, color->width);
         const std::uint32_t y0 = std::min(w[11] & 0xFFFFu, color->height), y1 = std::min((w[11] >> 16) + 1, color->height);
-        if (std::getenv("PS2_NATIVE_DEBUG")) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
-        if (std::getenv("PS2_NATIVE_DEBUG")) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
+        if (native_debug()) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
+        if (native_debug()) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
         if (state.draws && x0 < x1 && y0 < y1) {
             std::array<std::uint32_t, kParamStride / 4> record{};
             std::memcpy(record.data(), w, kSetupWords * 4);
@@ -1002,6 +1017,8 @@ bool flush_native(std::uint32_t prims) {
         i = j;
     }
     g_native_draws += pass.draws.size();
+    TRACE("native %u prims %zu draws %zu decodes fb %X/%u/%02X z %X/%02X%s box %d,%d-%d,%d reads %zu\n", prims, pass.draws.size(), g_decodes.size(), b.fbp, b.fbw, b.fpsm, b.zbp, b.zpsm,
+          b.zte ? (b.zwrite ? " zw" : " zt") : " -", b.minx, b.miny, b.maxx, b.maxy, g_batch_reads.size());
     if (!pass.draws.empty()) {
         g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
         g_native_passes.push_back(std::move(pass));
@@ -1104,6 +1121,11 @@ void census(std::uint32_t prims, bool feedback) {
 void raster_batch(std::uint32_t prims) {
     Batch &b = g_batch;
     ++g_compute_batches;
+    if (g_trace > 0) {
+        const std::uint32_t *w = b.setups.data() + b.prims[0] * kSetupWords;
+        TRACE("compute %u prims kind %u flags %05X modes %08X fb %X/%u/%02X msk %08X z %X/%02X tex %X/%u/%02X box %d,%d-%d,%d reads %zu\n", prims, b.prims[1], w[0], w[7], b.fbp, b.fbw, b.fpsm, w[4],
+              b.zbp, b.zpsm, w[12], w[13], w[14], b.minx, b.miny, b.maxx, b.maxy, g_batch_reads.size());
+    }
     g_compute_prims += prims;
     if (!g_surfaces.empty()) {
         // It reads and writes GS memory itself: native targets under it go back there first.
@@ -1226,6 +1248,10 @@ void emit_pre() {
         for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
         g_sync_cause = 0;
     }
+    if (g_trace > 0)
+        for (const PreOp &op : g_pre)
+            TRACE("%s %llX-%llX rec %X %X %X %X rect %u,%u-%u,%u\n", op.clut ? "clut" : "upload", static_cast<unsigned long long>(op.range.lo), static_cast<unsigned long long>(op.range.hi), op.rec[0],
+                  op.rec[1], op.rec[2], op.rec[3], op.x0, op.y0, op.x1, op.y1);
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -1467,6 +1493,7 @@ void submitted() {
     g_clut_loads = 0;
     g_native_passes.clear();
     release_retired();
+    if (g_trace > 0) std::fprintf(stderr, "[trace] ---- submitted, %d to go\n", --g_trace);
     // PS2_GL_STATS (the Switch build's --stats) or PS2_NATIVE_STATS: once a second, how much each rasterizer drew
     // and how often a target went to GS memory and back. What stays with the compute rasterizer is what costs.
     static const bool report = g_native && (std::getenv("PS2_GL_STATS") || std::getenv("PS2_NATIVE_STATS"));
@@ -1475,10 +1502,21 @@ void submitted() {
     static std::uint64_t last[6] = {};
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
     if (seconds < 1.0) return;
+    static std::uint64_t last_draws = 0;
     const std::uint64_t now[6] = {g_native_batches, g_native_prims, g_compute_batches, g_compute_prims, g_stores, g_loads};
-    std::fprintf(stderr, "[native] per second: %.0f batches (%.0f prims) native, %.0f batches (%.0f prims) compute, %.0f stores, %.0f loads\n",
-                 static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(now[2] - last[2]) / seconds,
-                 static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds, static_cast<double>(now[5] - last[5]) / seconds);
+    std::fprintf(stderr, "[native] per second: %.0f batches (%.0f prims, %.0f draws) native, %.0f batches (%.0f prims) compute, %.0f stores, %.0f loads\n",
+                 static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(g_native_draws - last_draws) / seconds,
+                 static_cast<double>(now[2] - last[2]) / seconds, static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds,
+                 static_cast<double>(now[5] - last[5]) / seconds);
+    // Twenty busy seconds in a row are a race: trace a few frames of it, twice, half a minute apart.
+    static int busy = 0, traces = 0;
+    busy = static_cast<double>(now[1] - last[1]) / seconds > 50000.0 ? busy + 1 : 0;
+    if (traces < 2 && busy == 20 + 30 * traces) {
+        ++traces;
+        g_trace = 3;
+        std::fprintf(stderr, "[trace] ---- the next %d submits\n", g_trace);
+    }
+    last_draws = g_native_draws;
     std::copy(now, now + 6, last);
     // And why the compute rasterizer's share was not the native renderer's: prims and batches a second, most first.
     static std::uint64_t last_prims[kWhyCount] = {}, last_batches[kWhyCount] = {};
