@@ -76,6 +76,7 @@ struct WGPUBufferImpl {
     WGPUBufferUsage usage = 0;
     std::vector<std::uint8_t> shadow;  // what a mapped (MapRead) buffer exposes
     bool mapped = false;
+    bool discard = false;  // a write from its start replaces everything in it (ps2GlDiscardOnWrite)
 };
 
 struct WGPUBindGroupLayoutImpl {
@@ -583,6 +584,8 @@ void const *wgpuBufferGetConstMappedRange(WGPUBuffer b, size_t offset, size_t) {
 
 void wgpuBufferUnmap(WGPUBuffer b) { b->mapped = false; }
 
+void ps2GlDiscardOnWrite(WGPUBuffer b) { b->discard = true; }
+
 WGPUFuture wgpuQueueOnSubmittedWorkDone(WGPUQueue, WGPUQueueWorkDoneCallbackInfo cb) {
     fence([cb] { cb.callback(WGPUQueueWorkDoneStatus_Success, text(""), cb.userdata1, cb.userdata2); });
     return future();
@@ -593,6 +596,10 @@ void wgpuQueueWriteBuffer(WGPUQueue, WGPUBuffer b, uint64_t offset, void const *
     current();
     const auto start = Clock::now();
     glBindBuffer(GL_COPY_WRITE_BUFFER, b->id);
+    // The GPU may still be reading what the last submit put here, and the driver would wait for it before writing
+    // over it. Where the write replaces the whole buffer, new storage is asked for instead (PS2_GL_ORPHAN=0: not).
+    static const bool orphan = !std::getenv("PS2_GL_ORPHAN") || std::atoi(std::getenv("PS2_GL_ORPHAN")) != 0;
+    if (orphan && b->discard && offset == 0) glBufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(b->size), nullptr, GL_DYNAMIC_DRAW);
     glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), data);
     g_stats.write_ms += ms_since(start);
     ++g_stats.writes;

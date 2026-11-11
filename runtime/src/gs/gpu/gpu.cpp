@@ -25,6 +25,12 @@ extern const char kGsShader[];
 extern const char kBlitShader[];
 extern const char kNativeShader[];
 
+#ifdef PS2_GPU_GL
+// The OpenGL layer's (gl/webgpu_gl.cpp): a write to this buffer from its start replaces all of it, so the driver
+// may hand out new storage instead of waiting for the GPU to be done with the old.
+extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
+#endif
+
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
 }
@@ -661,6 +667,38 @@ std::uint32_t native_skip() {
     return skip;
 }
 
+// Where the GS thread's own time goes inside the renderer, for the [native] report: each part's time without what
+// it calls that is itself timed.
+enum CpuPart { kCpuDraw, kCpuClut, kCpuImage, kCpuPre, kCpuNative, kCpuCompute, kCpuSubmit, kCpuParts };
+const char *const kCpuNames[kCpuParts] = {"draw", "clut", "image", "uploads", "native flush", "compute flush", "submit"};
+struct Cpu {
+    double ms[kCpuParts] = {};
+    int current = -1;
+    std::chrono::steady_clock::time_point since;
+} g_cpu;
+bool cpu_on() {
+    static const bool on = std::getenv("PS2_GL_STATS") || std::getenv("PS2_NATIVE_STATS");
+    return on;
+}
+struct Timed {
+    int before = -1;
+    explicit Timed(int part) {
+        if (!cpu_on()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (g_cpu.current >= 0) g_cpu.ms[g_cpu.current] += std::chrono::duration<double, std::milli>(now - g_cpu.since).count();
+        before = g_cpu.current;
+        g_cpu.current = part;
+        g_cpu.since = now;
+    }
+    ~Timed() {
+        if (!cpu_on()) return;
+        const auto now = std::chrono::steady_clock::now();
+        g_cpu.ms[g_cpu.current] += std::chrono::duration<double, std::milli>(now - g_cpu.since).count();
+        g_cpu.current = before;
+        g_cpu.since = now;
+    }
+};
+
 // PS2_NATIVE_TRACE, or the [native] report once a race has run for a while: everything the renderer does over a
 // few frames, a line each, to see what a frame is made of on hardware.
 int g_trace = 0;
@@ -964,6 +1002,7 @@ void plan_decodes(std::uint32_t prims);
 
 // Draws the pending batch with the GPU's rasterizer; false leaves it to the compute rasterizer.
 bool flush_native(std::uint32_t prims) {
+    const Timed timed(kCpuNative);
     Batch &b = g_batch;
     const std::uint32_t rows = static_cast<std::uint32_t>(b.maxy) + 1;
     Surface *color = surface_for(b.fbp, b.fbw, false, PSMCT32, rows, nullptr);
@@ -1125,6 +1164,7 @@ void census(std::uint32_t prims, bool feedback) {
 
 // The pending batch through the compute rasterizer.
 void raster_batch(std::uint32_t prims) {
+    const Timed timed(kCpuCompute);
     Batch &b = g_batch;
     ++g_compute_batches;
     if (g_trace > 0) {
@@ -1472,6 +1512,7 @@ bool batch_conflict(const Range &r, bool clut) {
 
 // Emits the first `upto` of the queued uploads and CLUT loads (all of them by default).
 void emit_pre(std::size_t upto) {
+    const Timed timed(kCpuPre);
     std::vector<PreOp> later;
     if (upto < g_pre.size()) {
         later.assign(g_pre.begin() + static_cast<std::ptrdiff_t>(upto), g_pre.end());
@@ -1487,6 +1528,19 @@ void emit_pre(std::size_t upto) {
             TRACE("%s %llX-%llX rec %X %X %X %X %X %X %X %X %X %X %X rect %u,%u-%u,%u\n", op.clut ? "clut" : "upload", static_cast<unsigned long long>(op.range.lo),
                   static_cast<unsigned long long>(op.range.hi), op.rec[0], op.rec[1], op.rec[2], op.rec[3], op.rec[4], op.rec[5], op.rec[6], op.rec[7], op.rec[8], op.rec[9], op.rec[10], op.x0, op.y0,
                   op.x1, op.y1);
+    // Uploads go ahead of the CLUT loads queued before them, as far as no such load reads what the upload writes:
+    // a game alternates the two, and every change from one kind to the other is a dispatch.
+    {
+        std::vector<PreOp> ordered;
+        ordered.reserve(g_pre.size());
+        for (const PreOp &op : g_pre) {
+            std::size_t at = ordered.size();
+            if (!op.clut)
+                while (at > 0 && ordered[at - 1].clut && !ordered[at - 1].range.overlaps(op.range.lo, op.range.hi)) --at;
+            ordered.insert(ordered.begin() + static_cast<std::ptrdiff_t>(at), op);
+        }
+        g_pre = std::move(ordered);
+    }
     std::size_t i = 0;
     while (i < g_pre.size()) {
         const bool clut = g_pre[i].clut;
@@ -1678,6 +1732,9 @@ void ensure_capacity() {
         if (g_data) wgpuBufferRelease(g_data);
         g_data_size = std::max<std::uint64_t>(g_data_size * 2, (data_bytes + (4u << 20) - 1) & ~((4ull << 20) - 1));
         g_data = make_buffer(g_data_size, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+#ifdef PS2_GPU_GL
+        ps2GlDiscardOnWrite(g_data);
+#endif
         changed = true;
     }
     const std::uint64_t param_bytes = std::max<std::uint64_t>(g_param_records.size(), 1) * kParamStride;
@@ -1685,6 +1742,9 @@ void ensure_capacity() {
         if (g_params) wgpuBufferRelease(g_params);
         g_params_size = std::max<std::uint64_t>(g_params_size * 2, std::max<std::uint64_t>(param_bytes, 64 * 1024));
         g_params = make_buffer(g_params_size, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+#ifdef PS2_GPU_GL
+        ps2GlDiscardOnWrite(g_params);
+#endif
         changed = true;
     }
     if (changed || !g_group) rebuild_group();
@@ -1788,6 +1848,13 @@ void submitted() {
         line += text;
     }
     if (!line.empty()) std::fprintf(stderr, "[native] compute because (prims/batches):%s\n", line.c_str());
+    {
+        char text[256];
+        int n = 0;
+        for (int i = 0; i < kCpuParts; ++i) n += std::snprintf(text + n, sizeof text - static_cast<std::size_t>(n), "%s %s %.0f", i ? "," : "", kCpuNames[i], g_cpu.ms[i] / seconds);
+        std::fprintf(stderr, "[native] GS thread ms a second in the renderer:%s\n", text);
+        std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
+    }
     static std::uint64_t last_tiles = 0, last_passes = 0;
     if (g_lut_tiles != last_tiles)
         std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
@@ -1878,6 +1945,7 @@ void profile_submit() {
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
 void submit(WGPUTextureView present_view = nullptr) {
+    const Timed timed(kCpuSubmit);
     if (g_commands.empty() && !present_view) return;
     if (g_profile_out && !present_view && g_timestamps && frame_count() >= g_profile_from && frame_count() < g_profile_to) {
         profile_submit();
@@ -2381,6 +2449,7 @@ bool init(Mode m) {
 }
 
 void draw(const State &st, const Vertex *v, int count) {
+    const Timed timed(kCpuDraw);
     if (g_image.active && !g_image.pending.empty()) flush_image();
     std::uint64_t attr = st.prim;
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
@@ -2591,6 +2660,7 @@ void draw(const State &st, const Vertex *v, int count) {
 }
 
 void image_begin(const State &s) {
+    const Timed timed(kCpuImage);
     flush_image();
     Image &im = g_image;
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
@@ -2608,6 +2678,7 @@ void image_begin(const State &s) {
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
+    const Timed timed(kCpuImage);
     Image &im = g_image;
     if (!im.active) return;
     if (im.pending.empty() && !im.lead_bits) {
@@ -2647,6 +2718,7 @@ void local_copy(const State &s) {
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
+    const Timed timed(kCpuClut);
     flush_image();
     if (g_clut_loads + 2 >= kClutSlots) {
         emit_everything();
@@ -2941,6 +3013,7 @@ void resize_surface(std::uint32_t width, std::uint32_t height) {
 bool has_surface() { return g_surface != nullptr; }
 
 bool present(const DisplaySource &src) {
+    const Timed timed(kCpuSubmit);
     if (!g_surface) return false;
     flush_all();
     sync_display(src);
