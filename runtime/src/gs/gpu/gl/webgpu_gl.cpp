@@ -606,8 +606,23 @@ void wgpuQueueWriteBuffer(WGPUQueue, WGPUBuffer b, uint64_t offset, void const *
     g_stats.write_bytes += size;
 }
 
+// A frame's eglSwapBuffers returns when the GPU is done with the frame, and nothing can be issued meanwhile. So a
+// present only flushes, which starts the GPU on the frame, and the swap is made when the next commands are about to
+// be issued: the time in between, in which the renderer puts the next frame together, the GPU spends on this one
+// instead of idle. PS2_GL_LATE_SWAP=0 swaps at once.
+WGPUSurface g_swap_pending = nullptr;
+
+void swap_pending() {
+    if (!g_swap_pending) return;
+    const auto start = Clock::now();
+    if (g_swap_pending->surface) eglSwapBuffers(g.display, g_swap_pending->surface);
+    g_stats.swap_ms += ms_since(start);
+    g_swap_pending = nullptr;
+}
+
 void wgpuQueueSubmit(WGPUQueue, size_t count, WGPUCommandBuffer const *commands) {
     current();
+    swap_pending();
     const auto start = Clock::now();
     for (std::size_t i = 0; i < count; ++i)
         for (const Op &op : commands[i]->ops) op();
@@ -989,15 +1004,23 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *out) {
 
 WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
     current();
+    static const bool late = !std::getenv("PS2_GL_LATE_SWAP") || std::atoi(std::getenv("PS2_GL_LATE_SWAP")) != 0;
+    ++g_stats.presents;
+    if (late && s->surface) {
+        swap_pending();
+        glFlush();
+        g_swap_pending = s;
+        return WGPUStatus_Success;
+    }
     const auto start = Clock::now();
     const bool ok = s->surface && eglSwapBuffers(g.display, s->surface);
     g_stats.swap_ms += ms_since(start);
-    ++g_stats.presents;
     return ok ? WGPUStatus_Success : WGPUStatus_Error;
 }
 
 void wgpuSurfaceRelease(WGPUSurface s) {
     if (!s) return;
+    if (g_swap_pending == s) g_swap_pending = nullptr;
     if (s->surface) {
         if (g.draw == s->surface) {
             g.draw = nullptr;
