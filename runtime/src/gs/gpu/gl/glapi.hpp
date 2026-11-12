@@ -126,6 +126,7 @@ inline constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
     X(void, DeleteTextures, (GLsizei n, const GLuint *textures))                                                                             \
     X(void, BindTexture, (GLenum target, GLuint texture))                                                                                    \
     X(void, TexStorage2D, (GLenum target, GLsizei levels, GLenum format, GLsizei width, GLsizei height))                                     \
+    X(void, CopyImageSubData, (GLuint src, GLenum src_target, GLint src_level, GLint src_x, GLint src_y, GLint src_z, GLuint dst, GLenum dst_target, GLint dst_level, GLint dst_x, GLint dst_y, GLint dst_z, GLsizei width, GLsizei height, GLsizei depth)) \
     X(void, TexParameteri, (GLenum target, GLenum pname, GLint param))                                                                       \
     X(void, ActiveTexture, (GLenum texture))                                                                                                 \
     X(void, GenFramebuffers, (GLsizei n, GLuint * framebuffers))                                                                             \

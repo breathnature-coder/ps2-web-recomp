@@ -185,9 +185,25 @@ int main(int argc, char **argv) {
         npd.bindGroupLayoutCount = 1;
         npd.bindGroupLayouts = &nl;
         WGPUPipelineLayout np = wgpuDeviceCreatePipelineLayout(dev, &npd);
-        // vertex entry, fragment entry, a colour target, a depth target
-        const struct { const char *vs, *fs; bool color, depth; } pipelines[4] = {{"native_vs", "native_fs", true, false}, {"native_vs", "native_depth_fs", true, true},
-                                                                                {"load_vs", "load_color_fs", true, false}, {"load_vs", "load_depth_fs", false, true}};
+        // The pipelines that read the pixel already there take the target's backdrop as a second group.
+        WGPUBindGroupLayoutEntry be = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        be.binding = 0;
+        be.visibility = WGPUShaderStage_Fragment;
+        be.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+        be.texture.viewDimension = WGPUTextureViewDimension_2D;
+        WGPUBindGroupLayoutDescriptor bld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        bld.entryCount = 1;
+        bld.entries = &be;
+        const WGPUBindGroupLayout with_backdrop[2] = {nl, wgpuDeviceCreateBindGroupLayout(dev, &bld)};
+        WGPUPipelineLayoutDescriptor fpd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        fpd.bindGroupLayoutCount = 2;
+        fpd.bindGroupLayouts = with_backdrop;
+        WGPUPipelineLayout fp = wgpuDeviceCreatePipelineLayout(dev, &fpd);
+        // vertex entry, fragment entry, a colour target, a depth target, the backdrop
+        const struct { const char *vs, *fs; bool color, depth, backdrop; } pipelines[6] = {
+            {"native_vs", "native_fs", true, false, false},          {"native_vs", "native_depth_fs", true, true, false},
+            {"native_vs", "native_feedback_fs", true, false, true},  {"native_vs", "native_feedback_depth_fs", true, true, true},
+            {"load_vs", "load_color_fs", true, false, false},        {"load_vs", "load_depth_fs", false, true, false}};
         for (const auto &d : pipelines) {
             WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
             color.format = WGPUTextureFormat_RGBA8Unorm;
@@ -203,7 +219,7 @@ int main(int argc, char **argv) {
             depth.depthWriteEnabled = WGPUOptionalBool_True;
             depth.depthCompare = WGPUCompareFunction_Always;
             WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-            rd.layout = np;
+            rd.layout = d.backdrop ? fp : np;
             rd.vertex.module = mod;
             rd.vertex.entryPoint = sv(d.vs);
             rd.vertex.constantCount = 1;

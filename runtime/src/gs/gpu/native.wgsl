@@ -211,6 +211,150 @@ fn native_depth_fs(in: NativeVertex) -> NativeDepth {
     return NativeDepth(shaded.color.color, shaded.color.factor, f32(shaded.z) / 16777216.0);
 }
 
+// ---- draws that need the pixel already there ----
+//
+// A destination alpha test, blending by the destination alpha, a mask inside a channel, a failed alpha test that
+// writes part of the pixel: the fixed functions have none of these. Such a draw gets the target as it was before it
+// in a second texture and makes the whole pixel here, as the compute rasterizer's plot does, the blender off and
+// every channel written. That holds as long as no two primitives of the draw cover the same pixel, which gpu.cpp
+// sees to (feedback groups in flush_native).
+@group(1) @binding(0) var backdrop: texture_2d<f32>;
+
+struct FeedbackShaded {
+    color: vec4<f32>,
+    z: u32,
+}
+
+fn native_feedback(in: NativeVertex) -> FeedbackShaded {
+    let s = param_setup();
+    let sx = u32(in.position.x);
+    let sy = u32(in.position.y);
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
+    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
+    var hit: Covered;
+    if (prm(33u) == 0u) {
+        hit = triangle_at(in.pa, in.pb, in.zi.y, in.c0, in.c1, in.c2, in.t0, in.t1, in.t2, in.zi.x, in.dz, px, py);
+    } else {
+        hit = sprite_at(s, in.pa, in.t0, in.t1, in.c0, in.zi.x, x, y, px, py);
+    }
+    if (!hit.inside) {
+        discard;  // the two rasterizers disagree about an edge: the compute one's word counts
+    }
+    let c = shade_color(s, hit.at, (sy % SCALE) * SCALE + sx % SCALE);
+    let there = textureLoad(backdrop, vec2<i32>(i32(sx), i32(sy)), 0);
+    let raw = u32(there.x * 255.0 + 0.5) | (u32(there.y * 255.0 + 0.5) << 8u) | (u32(there.z * 255.0 + 0.5) << 16u) | (u32(there.w * 255.0 + 0.5) << 24u);
+    // A 24-bit frame reads as alpha 0x80, and its fourth byte is never written.
+    var dst = raw;
+    var mask = s.fbmsk;
+    if (s.fpsm == 1u) {
+        dst = (raw & 0xFFFFFFu) | 0x80000000u;
+        mask = mask | 0xFF000000u;
+    }
+    if (has(s, F_DATE) && ((dst & 0x80000000u) != 0u) != has(s, F_DATM)) {
+        discard;
+    }
+    var r = c.x;
+    var g = c.y;
+    var b = c.z;
+    let a = c.w;
+    var write_fb = true;
+    if (has(s, F_ATE) && !alpha_test(s, a)) {
+        // Which of the pixel a failed test still writes. The depth is the pipeline's, so gpu.cpp sends here only
+        // what leaves it alone or writes it either way.
+        switch mode(s, 4u, 2u) {
+            case 0u {
+                discard;
+            }
+            case 1u {
+            }
+            case 2u {
+                write_fb = false;
+            }
+            default {
+                mask = mask | 0xFF000000u;
+            }
+        }
+    }
+    var word = raw;
+    if (write_fb) {
+        let colclamp = has(s, F_COLCLAMP);
+        if (has(s, F_ABE) && (!has(s, F_PABE) || (a & 0x80) != 0)) {
+            let cd = vec3<i32>(i32(dst & 0xFFu), i32((dst >> 8u) & 0xFFu), i32((dst >> 16u) & 0xFFu));
+            let cs = vec3<i32>(r, g, b);
+            let ad = i32(dst >> 24u);
+            let ba = mode(s, 12u, 2u);
+            let bb = mode(s, 14u, 2u);
+            let bc = mode(s, 16u, 2u);
+            let bd = mode(s, 18u, 2u);
+            var cc = i32(s.fix);
+            if (bc == 0u) {
+                cc = a;
+            } else if (bc == 1u) {
+                cc = ad;
+            }
+            var av = vec3<i32>(0);
+            var bv = vec3<i32>(0);
+            var dv = vec3<i32>(0);
+            if (ba == 0u) {
+                av = cs;
+            } else if (ba == 1u) {
+                av = cd;
+            }
+            if (bb == 0u) {
+                bv = cs;
+            } else if (bb == 1u) {
+                bv = cd;
+            }
+            if (bd == 0u) {
+                dv = cs;
+            } else if (bd == 1u) {
+                dv = cd;
+            }
+            var o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
+            if (colclamp) {
+                o = clamp(o, vec3<i32>(0), vec3<i32>(255));
+            } else {
+                o = o & vec3<i32>(0xFF);
+            }
+            r = o.x;
+            g = o.y;
+            b = o.z;
+        } else if (!colclamp) {
+            r = r & 0xFF;
+            g = g & 0xFF;
+            b = b & 0xFF;
+        }
+        var out_a = u32(a & 0xFF);
+        if (has(s, F_FBA)) {
+            out_a = out_a | 0x80u;
+        }
+        let made = u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u);
+        word = (made & ~mask) | (raw & mask);
+    }
+    var out: FeedbackShaded;
+    out.color = vec4<f32>(f32(word & 0xFFu), f32((word >> 8u) & 0xFFu), f32((word >> 16u) & 0xFFu), f32(word >> 24u)) / 255.0;
+    out.z = min(hit.at.z, s.zmax);
+    return out;
+}
+
+@fragment
+fn native_feedback_fs(in: NativeVertex) -> @location(0) vec4<f32> {
+    return native_feedback(in).color;
+}
+
+struct FeedbackDepth {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+
+@fragment
+fn native_feedback_depth_fs(in: NativeVertex) -> FeedbackDepth {
+    let shaded = native_feedback(in);
+    return FeedbackDepth(shaded.color, f32(shaded.z) / 16777216.0);
+}
+
 // GS memory into a target's texture, over the scissor rectangle. Parameters: block pointer, buffer width, and a
 // depth buffer's format.
 @vertex

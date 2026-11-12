@@ -786,6 +786,17 @@ WGPUCommandBuffer wgpuCommandEncoderFinish(WGPUCommandEncoder e, WGPUCommandBuff
 
 void wgpuCommandBufferRelease(WGPUCommandBuffer c) { delete c; }
 
+// Between two textures of the renderer's, which both have their first row at the bottom: nothing to flip.
+void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e, WGPUTexelCopyTextureInfo const *src, WGPUTexelCopyTextureInfo const *dst, WGPUExtent3D const *size) {
+    const GLuint s = src->texture->id, d = dst->texture->id;
+    const GLint sx = static_cast<GLint>(src->origin.x), sy = static_cast<GLint>(src->origin.y), dx = static_cast<GLint>(dst->origin.x), dy = static_cast<GLint>(dst->origin.y);
+    const GLsizei w = static_cast<GLsizei>(size->width), h = static_cast<GLsizei>(size->height);
+    e->ops.push_back([=] {
+        ++g_stats.copies;
+        glCopyImageSubData(s, GL_TEXTURE_2D, 0, sx, sy, 0, d, GL_TEXTURE_2D, 0, dx, dy, 0, w, h, 1);
+    });
+}
+
 void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffer src, uint64_t src_offset, WGPUBuffer dst, uint64_t dst_offset, uint64_t size) {
     const GLuint s = src->id, d = dst->id;
     e->ops.push_back([s, d, src_offset, dst_offset, size] {

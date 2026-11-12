@@ -612,6 +612,10 @@ struct Surface {
     std::uint32_t bp = 0, bw = 0, width = 0, height = 0;  // block pointer, buffer width in 64s, size in pixels
     bool depth = false;
     std::uint32_t psm = PSMCT32;  // a depth buffer's format; colour is kept as CT32 words
+    // A colour target's copy for draws that read the pixel already there, made when the first such draw comes.
+    WGPUTexture backdrop = nullptr;
+    WGPUTextureView backdrop_view = nullptr;
+    WGPUBindGroup backdrop_group = nullptr;
     WGPUTexture texture = nullptr;
     WGPUTextureView view = nullptr;
     WGPUBindGroup group = nullptr;
@@ -621,10 +625,13 @@ struct Surface {
     std::uint64_t used = 0;
 };
 
+// A draw of a native pass, or with no pipeline a copy of the colour target's rectangle to its backdrop, which the
+// feedback draws after it read (see native_feedback in native.wgsl).
 struct NativeDraw {
     WGPURenderPipeline pipeline;
     std::uint32_t param, vertices, x, y, w, h;
     float constant;
+    bool feedback = false;
 };
 
 struct NativePass {
@@ -639,6 +646,7 @@ struct NativeState {
     bool draws = true;
     bool alpha_factor = false;  // the source alpha is a blend factor, which the blender clamps to one (0x80)
     std::uint32_t why = 0;      // an index into kWhy when the state is not for the native renderer
+    bool feedback = false;      // the shader makes the whole pixel from the one already there
 };
 
 constexpr std::size_t kMaxSurfaces = 24;
@@ -649,7 +657,10 @@ std::vector<NativePass> g_native_passes;
 std::uint64_t g_surface_clock = 0;
 std::uint64_t g_native_batches = 0, g_native_prims = 0, g_compute_batches = 0, g_compute_prims = 0, g_stores = 0, g_loads = 0, g_native_draws = 0;
 WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
-WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr;
+WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
+WGPUBindGroupLayout g_backdrop_layout = nullptr;
+std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
+bool g_refusal_counted = false;  // flush_native said why it gave a batch up
 WGPUBindGroup g_native_group = nullptr;
 WGPUShaderModule g_native_module = nullptr;
 WGPURenderPipeline g_load_pipelines[2] = {};
@@ -661,7 +672,8 @@ std::unordered_map<std::uint32_t, WGPURenderPipeline> g_native_pipelines;
 // destination factors (0, 1, C, 1 - C), 15 C is FIX and not the source alpha, 16 the shader writes the depth.
 // PS2_NATIVE_SKIP=<sum>: leave a kind of draw to the compute rasterizer, to find which one a wrong picture comes from.
 // 1 blending by a factor, 2 any blending, 4 textures, 8 alpha tests, 16 depth tests, 32 triangles, 64 sprites,
-// 128 blending by a factor that has a texture's alpha in it (see draw).
+// 128 blending by a factor that has a texture's alpha in it (see draw), 256 what needs the pixel already there;
+// and 512 does not leave anything out (see native_state).
 std::uint32_t native_skip() {
     static const std::uint32_t skip = std::getenv("PS2_NATIVE_SKIP") ? static_cast<std::uint32_t>(std::atoi(std::getenv("PS2_NATIVE_SKIP"))) : 0u;
     return skip;
@@ -717,11 +729,11 @@ std::uint32_t g_sync_cause = 0;
 // Why a draw is left to the compute rasterizer, counted for the [native] line.
 const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit target",     "DATE",           "scan mask",         "",         
                             "mask in channel", "alpha fail writes part", "PABE or no clamp",  "blend by Ad",    "FIX above 0x80",    "blend 1+C",
-                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80", "small, target in memory", "no native target"};
+                            "highlight alpha", "line or point",          "wider than buffer", "Z above range" , "vertex alpha>0x80", "overlapping, reads target", "small, target in memory", "no native target"};
 constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
 std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
 
-bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
+bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     const std::uint32_t flags = w[0], fpsm = w[3], modes = w[7];
     const std::uint32_t skip = native_skip();
     out.why = 0;
@@ -816,6 +828,43 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     return true;
 }
 
+// What the native renderer does with a draw state. What the fixed functions cannot express (native_fixed says why)
+// a draw that reads the pixel already there can, the shader making the whole pixel: a destination alpha test, a
+// blend the blender has no factors for, a mask inside a channel, a failed alpha test that still writes the colour.
+// PS2_NATIVE_FEEDBACK=0, or 256 in PS2_NATIVE_SKIP, leaves those to the compute rasterizer.
+bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
+    out.feedback = false;
+    const std::uint32_t flags = w[0], modes = w[7];
+    // 512 in PS2_NATIVE_SKIP has every blend made this way, which is the compute rasterizer's to the bit where the
+    // blender's is a step off: for telling the two apart.
+    const bool fixed = native_fixed(w, has_depth, out), exact_blend = (native_skip() & 512u) && (flags & 8u);
+    if (fixed && !exact_blend) return true;
+    static const bool on = !std::getenv("PS2_NATIVE_FEEDBACK") || std::atoi(std::getenv("PS2_NATIVE_FEEDBACK")) != 0;
+    const std::uint32_t reason = out.why;
+    if (!fixed && (!on || (native_skip() & 256u) || !(reason == 3 || (reason >= 6 && reason <= 11)))) return false;
+    if ((modes >> 28) & 2u) {
+        out.why = 4;
+        return false;
+    }
+    const bool zte = flags & 512u, write_z = zte && !(flags & 32u);
+    const std::uint32_t atst = modes & 7u, afail = (modes >> 4) & 3u, ztst = (modes >> 8) & 3u;
+    // A failed alpha test that writes the colour and not the depth: the depth write is the pipeline's, all or nothing.
+    if ((flags & 64u) && atst != 1 && (afail == 1 || afail == 3) && write_z) {
+        out.why = 7;
+        return false;
+    }
+    static const bool exact = !std::getenv("PS2_NATIVE_Z") || std::strcmp(std::getenv("PS2_NATIVE_Z"), "fast") != 0;
+    out.why = 0;
+    out.flags = flags;
+    out.constant = 0.0f;
+    out.premultiply = 0;
+    out.alpha_factor = false;
+    out.feedback = true;
+    out.draws = !(zte && ztst == 0);
+    out.key = (has_depth ? 1u : 0u) | ((zte ? ztst : 1u) << 1) | (write_z ? 8u : 0u) | (0xFu << 4) | (has_depth && zte && exact ? 1u << 16 : 0u) | (1u << 17);
+    return true;
+}
+
 WGPURenderPipeline native_pipeline(std::uint32_t key) {
     const auto found = g_native_pipelines.find(key);
     if (found != g_native_pipelines.end()) return found->second;
@@ -836,10 +885,11 @@ WGPURenderPipeline native_pipeline(std::uint32_t key) {
     WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
     target.format = WGPUTextureFormat_RGBA8Unorm;
     target.writeMask = (key >> 4) & 0xFu;
-    if ((key >> 8) & 1u) target.blend = &blend;
+    const bool feedback = (key >> 17) & 1u;
+    if (((key >> 8) & 1u) && !feedback) target.blend = &blend;
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = g_native_module;
-    fragment.entryPoint = view((key >> 16) & 1u ? "native_depth_fs" : "native_fs");
+    fragment.entryPoint = view(feedback ? ((key >> 16) & 1u ? "native_feedback_depth_fs" : "native_feedback_fs") : (key >> 16) & 1u ? "native_depth_fs" : "native_fs");
     fragment.constantCount = 1;
     fragment.constants = &constant;
     fragment.targetCount = 1;
@@ -850,7 +900,7 @@ WGPURenderPipeline native_pipeline(std::uint32_t key) {
     depth.depthWriteEnabled = (key & 8u) ? WGPUOptionalBool_True : WGPUOptionalBool_False;
     depth.depthCompare = compares[(key >> 1) & 3u];
     WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-    rd.layout = g_native_pipeline_layout;
+    rd.layout = feedback ? g_feedback_pipeline_layout : g_native_pipeline_layout;
     rd.vertex.module = g_native_module;
     rd.vertex.entryPoint = view("native_vs");
     rd.vertex.constantCount = 1;
@@ -927,6 +977,11 @@ void retire_surface(std::size_t index) {
 
 void release_retired() {
     for (const auto &s : g_retired) {
+        if (s->backdrop) {
+            wgpuBindGroupRelease(s->backdrop_group);
+            wgpuTextureViewRelease(s->backdrop_view);
+            wgpuTextureRelease(s->backdrop);
+        }
         wgpuBindGroupRelease(s->group);
         wgpuTextureViewRelease(s->view);
         wgpuTextureRelease(s->texture);
@@ -965,7 +1020,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     s->width = bw * 64;
     s->height = height;
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
-    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
     td.size = WGPUExtent3D{s->width * g_scale, s->height * g_scale, 1};
     td.format = depth ? WGPUTextureFormat_Depth32Float : WGPUTextureFormat_RGBA8Unorm;
     s->texture = wgpuDeviceCreateTexture(g_device, &td);
@@ -1001,14 +1056,108 @@ void load_surface(Surface &s) {
 void plan_decodes(std::uint32_t prims);
 
 // Draws the pending batch with the GPU's rasterizer; false leaves it to the compute rasterizer.
+// A primitive's outline, for telling whether two of a feedback draw can cover the same pixel.
+struct Outline {
+    float x[4], y[4];
+    int corners;
+};
+
+Outline outline(const std::uint32_t *rec) {
+    Outline o;
+    if (rec[1]) {  // a sprite: x, y, width, height
+        const float x0 = u2f(rec[4]), y0 = u2f(rec[5]), x1 = x0 + u2f(rec[6]), y1 = y0 + u2f(rec[7]);
+        const float xs[4] = {x0, x1, x1, x0}, ys[4] = {y0, y0, y1, y1};
+        std::copy(xs, xs + 4, o.x);
+        std::copy(ys, ys + 4, o.y);
+        o.corners = 4;
+    } else {
+        for (int i = 0; i < 3; ++i) {
+            o.x[i] = u2f(rec[4 + i * 2]);
+            o.y[i] = u2f(rec[5 + i * 2]);
+        }
+        o.corners = 3;
+    }
+    return o;
+}
+
+// Whether the insides of two convex outlines meet (touching along an edge is not meeting: the fill rule gives a
+// pixel on a shared edge to one of them). A separating axis is along some edge of one of the two.
+bool outlines_meet(const Outline &a, const Outline &b) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const Outline &p = pass ? b : a;
+        for (int i = 0; i < p.corners; ++i) {
+            const int j = (i + 1) % p.corners;
+            const float nx = p.y[j] - p.y[i], ny = p.x[i] - p.x[j];
+            if (nx == 0.0f && ny == 0.0f) continue;
+            float amin = 1e30f, amax = -1e30f, bmin = 1e30f, bmax = -1e30f;
+            for (int k = 0; k < a.corners; ++k) {
+                const float d = a.x[k] * nx + a.y[k] * ny;
+                amin = std::min(amin, d);
+                amax = std::max(amax, d);
+            }
+            for (int k = 0; k < b.corners; ++k) {
+                const float d = b.x[k] * nx + b.y[k] * ny;
+                bmin = std::min(bmin, d);
+                bmax = std::max(bmax, d);
+            }
+            if (amax <= bmin || bmax <= amin) return false;
+        }
+    }
+    return true;
+}
+
+// Where the group of a feedback draw's primitives that starts at `from` ends: before the first one, short of `to`,
+// that can cover a pixel one of the group covers.
+std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
+    static std::vector<Outline> group;
+    group.clear();
+    for (std::uint32_t q = from; q < to; ++q) {
+        const Outline o = outline(g_batch.prims.data() + q * kPrimWords);
+        for (const Outline &other : group)
+            if (outlines_meet(o, other)) return q;
+        group.push_back(o);
+    }
+    return to;
+}
+
 bool flush_native(std::uint32_t prims) {
     const Timed timed(kCpuNative);
     Batch &b = g_batch;
+    // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
+    // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
+    // batch to the compute rasterizer costs.
+    {
+        std::uint32_t groups = 0, among = 0;
+        for (std::uint32_t i = 0; i < prims;) {
+            const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
+            std::uint32_t j = i + 1;
+            while (j < prims && b.prims[j * kPrimWords] == rec[0] && b.prims[j * kPrimWords + 1] == rec[1]) ++j;
+            NativeState state;
+            if (native_state(b.setups.data() + rec[0] * kSetupWords, b.zte, state) && state.feedback && state.draws) {
+                among += j - i;
+                for (std::uint32_t from = i; from < j; from = feedback_group(from, j)) ++groups;
+            }
+            i = j;
+        }
+        if (groups > 16 + among / 4) {
+            g_why_prims[kWhyCount - 3] += prims;
+            ++g_why_batches[kWhyCount - 3];
+            g_refusal_counted = true;
+            return false;
+        }
+    }
     const std::uint32_t rows = static_cast<std::uint32_t>(b.maxy) + 1;
     Surface *color = surface_for(b.fbp, b.fbw, false, PSMCT32, rows, nullptr);
     if (!color) return false;
     Surface *depth = b.zte ? surface_for(b.zbp, b.fbw, true, b.zpsm, rows, color) : nullptr;
     if (b.zte && !depth) return false;
+    if (depth && depth->height != color->height) {
+        // A pass's attachments are of one size: the shorter is made again as tall as the other.
+        const std::uint32_t tall = std::max(color->height, depth->height);
+        color = surface_for(b.fbp, b.fbw, false, PSMCT32, tall, depth);
+        depth = color ? surface_for(b.zbp, b.fbw, true, b.zpsm, tall, color) : nullptr;
+        if (!color || !depth || depth->height != color->height) return false;
+    }
     const Range fb = surface_range(*color, b.miny, b.maxy);
     const Range z = depth ? surface_range(*depth, b.miny, b.maxy) : Range{};
     if (depth && fb.overlaps(z.lo, z.hi)) return false;
@@ -1055,9 +1204,55 @@ bool flush_native(std::uint32_t prims) {
             record[34] = color->width;
             record[35] = color->height;
             record[36] = state.premultiply;
-            g_param_records.push_back(record);
-            pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
-                                  y1 - y0, state.constant});
+            if (!state.feedback) {
+                g_param_records.push_back(record);
+                pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
+                                      y1 - y0, state.constant});
+            } else {
+                // The draw's primitives go in groups of which no two can cover the same pixel: each group reads the
+                // target as the groups before it left it, copied to the backdrop over the group's box.
+                if (!color->backdrop) {
+                    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+                    td.size = WGPUExtent3D{color->width * g_scale, color->height * g_scale, 1};
+                    td.format = WGPUTextureFormat_RGBA8Unorm;
+                    color->backdrop = wgpuDeviceCreateTexture(g_device, &td);
+                    color->backdrop_view = wgpuTextureCreateView(color->backdrop, nullptr);
+                    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+                    entry.binding = 0;
+                    entry.textureView = color->backdrop_view;
+                    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+                    bd.layout = g_backdrop_layout;
+                    bd.entryCount = 1;
+                    bd.entries = &entry;
+                    color->backdrop_group = wgpuDeviceCreateBindGroup(g_device, &bd);
+                }
+                std::uint32_t from = i;
+                while (from < j) {
+                    int gx0 = 1 << 30, gy0 = 1 << 30, gx1 = -1, gy1 = -1;
+                    const std::uint32_t to = feedback_group(from, j);
+                    for (std::uint32_t q = from; q < to; ++q) {
+                        const std::uint32_t *prim = b.prims.data() + q * kPrimWords;
+                        gx0 = std::min(gx0, static_cast<int>(prim[2] & 0xFFFFu));
+                        gy0 = std::min(gy0, static_cast<int>(prim[2] >> 16));
+                        gx1 = std::max(gx1, static_cast<int>(prim[3] & 0xFFFFu));
+                        gy1 = std::max(gy1, static_cast<int>(prim[3] >> 16));
+                    }
+                    // The copy over the group's box inside the scissor rectangle; nothing is drawn outside it.
+                    const std::uint32_t cx0 = std::max(static_cast<std::uint32_t>(std::max(gx0, 0)), x0), cy0 = std::max(static_cast<std::uint32_t>(std::max(gy0, 0)), y0);
+                    const std::uint32_t cx1 = std::min(static_cast<std::uint32_t>(gx1 + 1), x1), cy1 = std::min(static_cast<std::uint32_t>(gy1 + 1), y1);
+                    if (gx1 >= 0 && cx0 < cx1 && cy0 < cy1) {
+                        record[32] = prim_offset + from * kPrimWords;
+                        g_param_records.push_back(record);
+                        pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
+                        pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
+                                              y1 - y0, 0.0f, true});
+                        ++g_feedback_copies;
+                        g_feedback_draws += to - from;
+                    }
+                    from = to;
+                }
+            }
         }
         i = j;
     }
@@ -1473,10 +1668,11 @@ void flush_batch() {
         g_native_prims += prims;
         census(prims, false);
     } else {
-        if (native) {  // the native renderer had no targets for it: frame and depth in the same memory, or no room
+        if (native && !g_refusal_counted) {  // no targets for it: frame and depth in the same memory, or no room
             g_why_prims[kWhyCount - 1] += prims;
             ++g_why_batches[kWhyCount - 1];
         }
+        g_refusal_counted = false;
         raster_batch(prims);
     }
     mark_rendered(pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy));
@@ -1775,6 +1971,23 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     float constant = 0.0f;
     for (;;) {
         for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
+            if (!d.pipeline) {
+                // The colour target as it is now, for the feedback draw that follows: a copy cannot be made inside
+                // a pass, so this one ends and another begins.
+                wgpuRenderPassEncoderEnd(rp);
+                wgpuRenderPassEncoderRelease(rp);
+                WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+                from.texture = first.color->texture;
+                to.texture = first.color->backdrop;
+                from.origin = to.origin = WGPUOrigin3D{d.x * g_scale, d.y * g_scale, 0};
+                const WGPUExtent3D size{d.w * g_scale, d.h * g_scale, 1};
+                wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
+                rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+                current = nullptr;
+                constant = 0.0f;
+                continue;
+            }
+            if (d.feedback) wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
             if (d.pipeline != current) {
                 wgpuRenderPassEncoderSetPipeline(rp, d.pipeline);
                 current = d.pipeline;
@@ -1855,6 +2068,12 @@ void submitted() {
         std::fprintf(stderr, "[native] GS thread ms a second in the renderer:%s\n", text);
         std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
     }
+    static std::uint64_t last_feedback = 0, last_copies = 0;
+    if (g_feedback_draws != last_feedback)
+        std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
+                     static_cast<double>(g_feedback_copies - last_copies) / seconds);
+    last_feedback = g_feedback_draws;
+    last_copies = g_feedback_copies;
     static std::uint64_t last_tiles = 0, last_passes = 0;
     if (g_lut_tiles != last_tiles)
         std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
@@ -2382,6 +2601,18 @@ bool init(Mode m) {
         npd.bindGroupLayoutCount = 1;
         npd.bindGroupLayouts = &g_native_layout;
         g_native_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &npd);
+        // And those that read the pixel already there take the target's backdrop as a second group.
+        WGPUBindGroupLayoutEntry be = te;
+        be.visibility = WGPUShaderStage_Fragment;
+        WGPUBindGroupLayoutDescriptor bld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+        bld.entryCount = 1;
+        bld.entries = &be;
+        g_backdrop_layout = wgpuDeviceCreateBindGroupLayout(g_device, &bld);
+        const WGPUBindGroupLayout with_backdrop[2] = {g_native_layout, g_backdrop_layout};
+        WGPUPipelineLayoutDescriptor fpd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+        fpd.bindGroupLayoutCount = 2;
+        fpd.bindGroupLayouts = with_backdrop;
+        g_feedback_pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &fpd);
         const std::string text = std::string("enable dual_source_blending;\n") + kGsShader + kNativeShader;
         WGPUShaderSourceWGSL native_source = WGPU_SHADER_SOURCE_WGSL_INIT;
         native_source.code = view(text.c_str());

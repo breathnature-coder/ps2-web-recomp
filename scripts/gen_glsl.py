@@ -31,7 +31,7 @@ entries = ['upload', 'copy_read', 'copy_write', 'load_clut', 'display', 'raster'
 scales = [1, 2, 3]
 tiles = [16, 8, 4]  # raster tile sizes (PS2_TILE); only the raster entry depends on it
 stores = ['store_color', 'store_depth']  # compute entries that read a native target's texture
-natives = ['native_fs', 'native_depth_fs', 'load_color_fs', 'load_depth_fs']  # render pipelines, by fragment entry
+natives = ['native_fs', 'native_depth_fs', 'native_feedback_fs', 'native_feedback_depth_fs', 'load_color_fs', 'load_depth_fs']  # render pipelines, by fragment entry
 
 
 def build_tool(work: Path) -> Path:
