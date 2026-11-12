@@ -136,6 +136,7 @@ cp "$elf" "$sd/$(basename "$elf")"
   echo "# @env PS2_SCALE=2     twice the PS2 resolution inside (slower)"
   echo "# @env PS2_TILE=8      raster tile size: 16 (default), 8 or 4"
   echo "# @env PS2_GPU_NATIVE=0  everything through the compute rasterizer, as before the native renderer"
+  echo "# @env PS2_NATIVE_TRACE=1  with --stats: log a few race frames in full (stops the game for seconds while it writes)"
   echo "# @env PS2_NATIVE_Z=fast  let the GPU reject hidden pixels early (faster; may flicker where surfaces touch)"
   echo "# @env PS2_NATIVE_SKIP=2  leave blending to the compute rasterizer (1 by a factor, 4 textures, 8 alpha tests, 16 depth tests, 32 triangles, 64 sprites; add them up)"
   if [ -f "$game/patches.txt" ]; then cp "$game/patches.txt" "$sd/patches.txt"; echo "--patches patches.txt"; fi

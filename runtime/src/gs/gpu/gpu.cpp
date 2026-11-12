@@ -711,8 +711,9 @@ struct Timed {
     }
 };
 
-// PS2_NATIVE_TRACE, or the [native] report once a race has run for a while: everything the renderer does over a
-// few frames, a line each, to see what a frame is made of on hardware.
+// PS2_NATIVE_TRACE=1 with the [native] report (--stats): once a race has run for a while, everything the renderer
+// does over a few frames, a line each, to see what a frame is made of on hardware. Writing those thousands of lines
+// to the SD card stops the game for seconds, so it is off unless asked for.
 int g_trace = 0;
 #define TRACE(...) do { if (g_trace > 0) std::fprintf(stderr, "[trace] " __VA_ARGS__); } while (0)
 const Range *g_sync_range = nullptr;
@@ -2038,9 +2039,10 @@ void submitted() {
                  static_cast<double>(now[2] - last[2]) / seconds, static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds,
                  static_cast<double>(now[5] - last[5]) / seconds);
     // Twenty busy seconds in a row are a race: trace a few frames of it, twice, half a minute apart.
+    static const bool tracing = std::getenv("PS2_NATIVE_TRACE") && std::atoi(std::getenv("PS2_NATIVE_TRACE")) != 0;
     static int busy = 0, traces = 0;
     busy = static_cast<double>(now[1] - last[1]) / seconds > 50000.0 ? busy + 1 : 0;
-    if (traces < 2 && busy == 20 + 30 * traces) {
+    if (tracing && traces < 2 && busy == 20 + 30 * traces) {
         ++traces;
         g_trace = 3;
         std::fprintf(stderr, "[trace] ---- the next %d submits\n", g_trace);
