@@ -596,9 +596,10 @@ void wgpuQueueWriteBuffer(WGPUQueue, WGPUBuffer b, uint64_t offset, void const *
     current();
     const auto start = Clock::now();
     glBindBuffer(GL_COPY_WRITE_BUFFER, b->id);
-    // The GPU may still be reading what the last submit put here, and the driver would wait for it before writing
-    // over it. Where the write replaces the whole buffer, new storage is asked for instead (PS2_GL_ORPHAN=0: not).
-    static const bool orphan = !std::getenv("PS2_GL_ORPHAN") || std::atoi(std::getenv("PS2_GL_ORPHAN")) != 0;
+    // An experiment, off unless PS2_GL_ORPHAN=1: the GPU may still be reading what the last submit put here, and
+    // the driver waits for it before writing over it, so where the write replaces the whole buffer new storage is
+    // asked for first. On the Switch the writes took as long as before.
+    static const bool orphan = std::getenv("PS2_GL_ORPHAN") && std::atoi(std::getenv("PS2_GL_ORPHAN")) != 0;
     if (orphan && b->discard && offset == 0) glBufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(b->size), nullptr, GL_DYNAMIC_DRAW);
     glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size), data);
     g_stats.write_ms += ms_since(start);
@@ -606,10 +607,10 @@ void wgpuQueueWriteBuffer(WGPUQueue, WGPUBuffer b, uint64_t offset, void const *
     g_stats.write_bytes += size;
 }
 
-// A frame's eglSwapBuffers returns when the GPU is done with the frame, and nothing can be issued meanwhile. So a
-// present only flushes, which starts the GPU on the frame, and the swap is made when the next commands are about to
-// be issued: the time in between, in which the renderer puts the next frame together, the GPU spends on this one
-// instead of idle. PS2_GL_LATE_SWAP=0 swaps at once.
+// An experiment, off unless PS2_GL_LATE_SWAP=1: a frame's eglSwapBuffers returns when the GPU is done with the
+// frame, so a present only flushes and the swap is made when the next commands are about to be issued, for the GPU
+// to work on the frame while the renderer puts the next together. On the Switch it made things worse: the wait
+// moved into the buffer writes before the next submit, and a race went from 14 frames a second to 5.
 WGPUSurface g_swap_pending = nullptr;
 
 void swap_pending() {
@@ -1004,7 +1005,7 @@ void wgpuSurfaceGetCurrentTexture(WGPUSurface s, WGPUSurfaceTexture *out) {
 
 WGPUStatus wgpuSurfacePresent(WGPUSurface s) {
     current();
-    static const bool late = !std::getenv("PS2_GL_LATE_SWAP") || std::atoi(std::getenv("PS2_GL_LATE_SWAP")) != 0;
+    static const bool late = std::getenv("PS2_GL_LATE_SWAP") && std::atoi(std::getenv("PS2_GL_LATE_SWAP")) != 0;
     ++g_stats.presents;
     if (late && s->surface) {
         swap_pending();
