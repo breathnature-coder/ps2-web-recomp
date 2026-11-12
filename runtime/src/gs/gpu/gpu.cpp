@@ -475,8 +475,28 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
     return r;
 }
 
+// When each page of GS memory was last written, by a clock that counts the writes as they are queued (which is the
+// order the GPU makes them in): a texture decoded after the last write to its pages still holds (see plan_decodes).
+std::uint64_t g_write_clock = 0, g_page_written[512] = {};
+
+void wrote(const Range &r) {
+    ++g_write_clock;
+    if (r.hi - r.lo >= kMemorySize) {
+        std::fill(std::begin(g_page_written), std::end(g_page_written), g_write_clock);
+        return;
+    }
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) g_page_written[(at >> 13) & 511u] = g_write_clock;
+}
+
+std::uint64_t last_written(const Range &r) {
+    std::uint64_t last = 0;
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) last = std::max(last, g_page_written[(at >> 13) & 511u]);
+    return last;
+}
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
+    wrote(r);
 }
 
 bool rendered(const Range &r) {
@@ -490,37 +510,101 @@ struct Decode {
 };
 std::vector<Decode> g_decodes;
 
+// What a CLUT slot holds, as a number that is the same only for the same entries: each load mixes into the number of
+// the slot it copies the one of what it reads, and when that was last written (load_clut).
+std::uint64_t g_clut_content[kClutSlots] = {};
+
+std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xFF51AFD7ED558CCDull;
+    return h ^ (h >> 33);
+}
+
+// Textures decoded to 32-bit texels (decode in gs.wgsl), kept across batches and frames for as long as GS memory under
+// them is not written and, for a palette texture, while the CLUT is the same: a race frame reads the same textures
+// in many batches, and each decode was a dispatch and as many texels as the texture has. When the buffer is full
+// it starts over. PS2_DECODE_CACHE=0 decodes each batch's textures for that batch alone, as before.
+struct DecodeKey {
+    std::uint32_t tbp, tbw, tpsm, size, cpsm, csa, ta, aem;
+    std::uint64_t clut;
+    bool operator==(const DecodeKey &o) const {
+        return tbp == o.tbp && tbw == o.tbw && tpsm == o.tpsm && size == o.size && cpsm == o.cpsm && csa == o.csa && ta == o.ta && aem == o.aem && clut == o.clut;
+    }
+};
+struct DecodeKeyHash {
+    std::size_t operator()(const DecodeKey &k) const {
+        std::uint64_t h = mix(mix(mix(mix(k.tbp, k.tbw), k.tpsm), k.size), k.cpsm);
+        return static_cast<std::size_t>(mix(mix(mix(mix(h, k.csa), k.ta), k.aem), k.clut));
+    }
+};
+struct Decoded {
+    std::uint32_t offset;
+    std::uint64_t when;  // the write clock when it was queued
+};
+std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
+std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_decode_restarts = 0;
+
+bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
+
+bool decode_cache_on() {
+    static const bool on = !std::getenv("PS2_DECODE_CACHE") || std::atoi(std::getenv("PS2_DECODE_CACHE")) != 0;
+    return on;
+}
+
 void plan_decodes(std::uint32_t prims) {
     Batch &b = g_batch;
     g_decodes.clear();
-    if (!g_decode || prims <= kDecodePrims) return;
+    if (!g_decode) return;
+    const bool cache = decode_cache_on();
+    if (!cache) {
+        g_decoded_cache.clear();
+        if (prims <= kDecodePrims) return;
+    }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    static const int kKey[] = {12, 13, 14, 15, 16, 17, 20, 22};
+    bool restarted = false;
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
         if (!(w[0] & 2u)) continue;
-        bool shared = false;
-        for (const Decode &d : g_decodes) {
-            const std::uint32_t *o = b.setups.data() + d.setup * kSetupWords;
-            bool same = (o[0] & 32768u) == (w[0] & 32768u);
-            for (int k : kKey) same = same && o[k] == w[k];
-            if (same) {
-                w[24] = d.offset;
-                shared = true;
-                break;
-            }
-        }
-        if (shared) continue;
         const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
         const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
+        const Range texels = pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
+        if (g_scale > 1 && rendered(texels)) continue;
+        const bool palette = palette_psm(w[14]);
+        const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
+        const auto found = g_decoded_cache.find(key);
+        if (found != g_decoded_cache.end()) {
+            if (last_written(texels) < found->second.when) {
+                w[24] = found->second.offset;
+                ++g_decode_hits;
+                continue;
+            }
+            g_decoded_cache.erase(found);
+        }
+        // Decoding costs a dispatch and every texel: for a few primitives reading GS memory directly is cheaper.
+        if (prims <= kDecodePrims) continue;
         const std::uint32_t words = 1u << (tw + th);
-        if (g_decoded_used + words > kDecodedWords) continue;
-        if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
+        if (words > kDecodedWords / 4) continue;
+        if (g_decoded_used + words > kDecodedWords) {
+            // Full: start over, and over this batch too, whose textures found so far may be where new ones go.
+            g_decoded_cache.clear();
+            g_decoded_used = 0;
+            ++g_decode_restarts;
+            if (!restarted && i > 0) {
+                restarted = true;
+                g_decodes.clear();
+                for (std::uint32_t k = 0; k < setups; ++k) b.setups[k * kSetupWords + 24] = 0xFFFFFFFFu;
+                i = ~0u;  // the loop's ++ makes it 0
+                continue;
+            }
+        }
         w[24] = g_decoded_used;
         g_decodes.push_back({i, g_decoded_used, words});
+        g_decoded_cache[key] = {g_decoded_used, g_write_clock + 1};
         g_decoded_used += words;
+        ++g_decode_misses;
+        g_decode_words += words;
     }
 }
 
@@ -936,6 +1020,7 @@ void store_surface(Surface &s) {
               push_params({s.bp, s.bw, static_cast<std::uint32_t>(s.dx0), static_cast<std::uint32_t>(s.dy0), w, h, s.psm})};
     c.target = &s;
     g_commands.push_back(c);
+    wrote(pages(s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1));
     ++g_stores;
     ++g_store_cause[g_sync_cause];
     TRACE("store %s %X/%u/%02X rect %d,%d-%d,%d for %s", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1, kStoreCause[g_sync_cause]);
@@ -1583,6 +1668,7 @@ bool lut_try() {
         g_lut.slot = slot;
         g_lut.table = g_clut_source[slot].cbp;
         g_lut.pre = g_pre.size();
+        wrote(pages(scratch, scratch_bw, PSMCT32, 0, 0, 63, 31));  // as the step would have
         clear_batch();
         return true;
     }
@@ -1598,6 +1684,7 @@ bool lut_try() {
         g_lut.fbp = w[1];
         g_lut.fbw = w[2];
         g_lut.mask[tile / 32] |= 1u << (tile % 32);
+        wrote(pages(g_lut.page, 1, PSMCT32, 0, 0, 63, 31));
         ++g_lut_tiles;
         clear_batch();
         return true;
@@ -1786,7 +1873,10 @@ void emit_everything() {
 void queue_pre(const PreOp &op) {
     if (batch_conflict(op.range, op.clut)) emit_all();
     // An upload could change the colour correction's table or what it reads: what is collected is done first.
-    if (!op.clut) lut_flush();
+    if (!op.clut) {
+        lut_flush();
+        wrote(op.range);
+    }
     g_pre.push_back(op);
 }
 
@@ -2019,7 +2109,7 @@ void submitted() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
-    g_decoded_used = 0;
+    if (!decode_cache_on()) g_decoded_used = 0;  // kept across submits when cached
     g_clut_loads = 0;
     g_native_passes.clear();
     release_retired();
@@ -2070,6 +2160,15 @@ void submitted() {
         std::fprintf(stderr, "[native] GS thread ms a second in the renderer:%s\n", text);
         std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
     }
+    static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0;
+    if (g_decode_hits + g_decode_misses != last_hits + last_misses)
+        std::fprintf(stderr, "[native] decoded textures a second: %.0f found, %.0f decoded (%.0f texels), %.0f times the buffer full\n",
+                     static_cast<double>(g_decode_hits - last_hits) / seconds, static_cast<double>(g_decode_misses - last_misses) / seconds,
+                     static_cast<double>(g_decode_words - last_words) / seconds, static_cast<double>(g_decode_restarts - last_restarts) / seconds);
+    last_hits = g_decode_hits;
+    last_misses = g_decode_misses;
+    last_words = g_decode_words;
+    last_restarts = g_decode_restarts;
     static std::uint64_t last_feedback = 0, last_copies = 0;
     if (g_feedback_draws != last_feedback)
         std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
@@ -2537,6 +2636,8 @@ bool init(Mode m) {
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
+    g_decoded_cache.clear();
+    g_decoded_used = 0;
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
@@ -2970,6 +3071,9 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
+    std::uint64_t content = g_clut_content[g_clut_slot];
+    for (int k = 2; k < 10; ++k) content = mix(content, rec[k]);
+    g_clut_content[next] = mix(content, last_written(op.range));
     g_clut_source[next] = {cbp, cpsm == PSMCT32 && !csm && rec[6] != 0};
     g_clut_slot = next;
     ++g_clut_loads;
@@ -3096,6 +3200,10 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     const std::size_t words = kMemorySize / 4;
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
+    wrote(Range{0, kMemorySize});
+    g_decoded_cache.clear();
+    g_decoded_used = 0;
+    g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {
