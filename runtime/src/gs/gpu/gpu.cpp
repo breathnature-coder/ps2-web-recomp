@@ -543,6 +543,7 @@ struct Decoded {
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_decode_restarts = 0;
+std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded again
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
@@ -578,6 +579,7 @@ void plan_decodes(std::uint32_t prims) {
             if (last_written(texels) < found->second.when) {
                 w[24] = found->second.offset;
                 ++g_decode_hits;
+                g_decode_saved_words += 1ull << (tw + th);
                 continue;
             }
             g_decoded_cache.erase(found);
@@ -2160,15 +2162,23 @@ void submitted() {
         std::fprintf(stderr, "[native] GS thread ms a second in the renderer:%s\n", text);
         std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
     }
-    static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0;
-    if (g_decode_hits + g_decode_misses != last_hits + last_misses)
+    static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0, last_saved_words = 0;
+    const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
+    if (hits + misses) {
+        const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
         std::fprintf(stderr, "[native] decoded textures a second: %.0f found, %.0f decoded (%.0f texels), %.0f times the buffer full\n",
-                     static_cast<double>(g_decode_hits - last_hits) / seconds, static_cast<double>(g_decode_misses - last_misses) / seconds,
+                     static_cast<double>(hits) / seconds, static_cast<double>(misses) / seconds,
                      static_cast<double>(g_decode_words - last_words) / seconds, static_cast<double>(g_decode_restarts - last_restarts) / seconds);
+        std::fprintf(stderr, "[native] decode cache: %.1f%% hits, %.0f texels/s reused, %zu entries, %.1f/%.1f MiB used\n",
+                     hit_rate, static_cast<double>(g_decode_saved_words - last_saved_words) / seconds,
+                     g_decoded_cache.size(), static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
+                     static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+    }
     last_hits = g_decode_hits;
     last_misses = g_decode_misses;
     last_words = g_decode_words;
     last_restarts = g_decode_restarts;
+    last_saved_words = g_decode_saved_words;
     static std::uint64_t last_feedback = 0, last_copies = 0;
     if (g_feedback_draws != last_feedback)
         std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
