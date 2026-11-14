@@ -494,6 +494,15 @@ std::uint64_t last_written(const Range &r) {
     return last;
 }
 
+// A decoded texture is stale as soon as any of its GS pages was written
+// after the decode was queued. Unlike last_written(), this can stop at
+// the first invalidating page instead of scanning the entire texture.
+bool written_since(const Range &r, std::uint64_t when) {
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192)
+        if (g_page_written[(at >> 13) & 511u] >= when) return true;
+    return false;
+}
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
     wrote(r);
@@ -577,7 +586,7 @@ void plan_decodes(std::uint32_t prims) {
         const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
         const auto found = g_decoded_cache.find(key);
         if (found != g_decoded_cache.end()) {
-            if (last_written(texels) < found->second.when) {
+            if (!written_since(texels, found->second.when)) {
                 w[24] = found->second.offset;
                 ++g_decode_hits;
                 g_decode_saved_words += 1ull << (tw + th);
