@@ -755,8 +755,16 @@ void plan_decodes(std::uint32_t prims) {
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
         const Range texels = pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
         if (g_scale > 1 && rendered(texels)) continue;
-        const bool palette = palette_psm(w[14]);
-        const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
+        // Avoid building a persistent cache identity for transient decoding.
+        // In particular, the uncached path does not need to inspect CLUT
+        // history, which can change on every palette upload.
+        DecodeKey key{};
+        if (cache) {
+            const bool palette = palette_psm(w[14]);
+            key = {w[12], w[13], w[14], w[15], palette ? w[16] : 0u,
+                   palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u,
+                   palette ? g_clut_content[w[22] % kClutSlots] : 0u};
+        }
         // The transient (uncached) path cannot hit a persistent entry.
         // Avoid hashing the key and probing an empty map on every setup.
         const auto found = cache ? g_decoded_cache.find(key) : g_decoded_cache.end();
