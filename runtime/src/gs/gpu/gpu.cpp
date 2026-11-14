@@ -2511,8 +2511,12 @@ void profile_submit() {
         g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // Native-only / present-only submissions can have no compute payload.
+    // Avoid queue writes and backend validation for empty upload ranges.
+    if (!g_arena.empty())
+        wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (!g_param_records.empty())
+        wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     std::vector<std::uint32_t> measured_commands;
     measured_commands.reserve(std::min<std::size_t>(g_commands.size(), kMax));
@@ -2586,8 +2590,12 @@ void submit(WGPUTextureView present_view = nullptr) {
         return;
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // Native-only / present-only submissions can have no compute payload.
+    // Avoid queue writes and backend validation for empty upload ranges.
+    if (!g_arena.empty())
+        wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (!g_param_records.empty())
+        wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
