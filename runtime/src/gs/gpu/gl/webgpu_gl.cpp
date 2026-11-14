@@ -343,6 +343,7 @@ struct Bound {
 };
 Bound g_bound_storage[16], g_bound_uniform[16];
 GLuint g_bound_program = 0;
+GLuint g_bound_vao = 0;
 
 void forget_buffer(GLuint id) {
     for (Bound &b : g_bound_storage)
@@ -384,24 +385,31 @@ GLuint framebuffer(GLuint color, GLuint depth) {
     return id;
 }
 
+RenderState g_applied_state;
+bool g_render_state_valid = false;
+
 void apply(const RenderState &s) {
-    if (!s.native) return;
-    glColorMask(s.mask & 1u, (s.mask >> 1) & 1u, (s.mask >> 2) & 1u, (s.mask >> 3) & 1u);
+    const auto &previous = g_applied_state;
+    const bool first = !g_render_state_valid;
+    if (first || s.mask != previous.mask)
+        glColorMask(s.mask & 1u, (s.mask >> 1) & 1u, (s.mask >> 2) & 1u, (s.mask >> 3) & 1u);
+    if (first || s.blend != previous.blend)
+        (s.blend ? glEnable : glDisable)(GL_BLEND);
     if (s.blend) {
-        glEnable(GL_BLEND);
-        glBlendEquationSeparate(s.equation, GL_FUNC_ADD);
-        glBlendFuncSeparate(s.source, s.dest, GL_ONE, GL_ZERO);
-    } else {
-        glDisable(GL_BLEND);
+        if (first || !previous.blend || s.equation != previous.equation)
+            glBlendEquationSeparate(s.equation, GL_FUNC_ADD);
+        if (first || !previous.blend || s.source != previous.source || s.dest != previous.dest)
+            glBlendFuncSeparate(s.source, s.dest, GL_ONE, GL_ZERO);
     }
     // OpenGL writes depth only with the test on.
+    if (first || s.depth != previous.depth)
+        (s.depth ? glEnable : glDisable)(GL_DEPTH_TEST);
     if (s.depth) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(s.depth_func);
-        glDepthMask(s.depth_write);
-    } else {
-        glDisable(GL_DEPTH_TEST);
+        if (first || !previous.depth || s.depth_func != previous.depth_func) glDepthFunc(s.depth_func);
+        if (first || !previous.depth || s.depth_write != previous.depth_write) glDepthMask(s.depth_write);
     }
+    g_applied_state = s;
+    g_render_state_valid = true;
 }
 
 // Callbacks waiting for the GPU, oldest first.
@@ -931,10 +939,8 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
     e->ops.push_back([c] {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
         glDisable(GL_CULL_FACE);
-        glColorMask(1, 1, 1, 1);
+        apply(RenderState{});
         glClearColor(static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b), static_cast<float>(c.a));
         glClear(GL_COLOR_BUFFER_BIT);
     });
@@ -960,8 +966,11 @@ void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipelin
     const GLuint program = pipeline->program, vao = pipeline->vao;
     p->encoder->ops.push_back([program, vao, state = pipeline->state] {
         use_program(program);
-        glBindVertexArray(vao);
-        apply(state);
+        if (vao != g_bound_vao) {
+            glBindVertexArray(vao);
+            g_bound_vao = vao;
+        }
+        if (state.native) apply(state);
     });
 }
 
