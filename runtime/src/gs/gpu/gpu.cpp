@@ -2486,6 +2486,19 @@ void submitted() {
     since = std::chrono::steady_clock::now();
 }
 
+void track_decode_completion(std::uint64_t serial) {
+    auto *completed_serial = new std::uint64_t(serial);
+    WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
+    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *userdata, void *) {
+        std::unique_ptr<std::uint64_t> completed(static_cast<std::uint64_t *>(userdata));
+        if (status == WGPUQueueWorkDoneStatus_Success)
+            g_decode_completed_serial = std::max(g_decode_completed_serial, *completed);
+    };
+    decode_done.userdata1 = completed_serial;
+    wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
+}
+
 void profile_submit() {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
@@ -2528,6 +2541,7 @@ void profile_submit() {
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
+    track_decode_completion(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (n) {
@@ -2655,16 +2669,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     // The queue completion callback gates reuse of decoded texture slots.
     // The serial belongs to the commands just submitted, before submitted()
     // advances g_serial. A failed callback never authorizes reclamation.
-    auto *completed_serial = new std::uint64_t(g_serial);
-    WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
-    decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
-    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *userdata, void *) {
-        std::unique_ptr<std::uint64_t> serial(static_cast<std::uint64_t *>(userdata));
-        if (status == WGPUQueueWorkDoneStatus_Success)
-            g_decode_completed_serial = std::max(g_decode_completed_serial, *serial);
-    };
-    decode_done.userdata1 = completed_serial;
-    wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
+    track_decode_completion(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (measure && !first_compute_pass) {
