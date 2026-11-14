@@ -42,5 +42,23 @@ int main() {
             }
         }
     }
+    // Exercise the upper 32-bit boundary, where adding cursor and
+    // request in uint32_t would wrap. Use uint64_t as an independent oracle.
+    constexpr std::uint32_t limits[] = {max - 2, max - 1, max};
+    constexpr std::uint32_t requests[] = {0, 1, 2, 3, 64, 1024, max - 1, max};
+    for (std::uint32_t cap : limits) {
+        const std::uint32_t cursors[] = {0, 1, cap - 2, cap - 1, cap, max};
+        for (std::uint32_t cursor : cursors) {
+            for (std::uint32_t request : requests) {
+                const bool expected = request != 0 &&
+                    static_cast<std::uint64_t>(cursor) + request <= cap;
+                if (decoded_arena_can_append(cursor, request, cap) != expected) {
+                    std::fprintf(stderr, "decoded arena high-bound mismatch: used=%u words=%u capacity=%u\n",
+                                 cursor, request, cap);
+                    return 1;
+                }
+            }
+        }
+    }
     return 0;
 }
