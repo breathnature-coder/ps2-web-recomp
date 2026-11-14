@@ -594,7 +594,7 @@ struct DecodeKeyHash {
 };
 struct Decoded {
     std::uint32_t offset;
-    std::uint64_t when;  // the write clock when it was queued
+    std::uint64_t when;  // first write serial after decode or successful validation
     std::uint32_t words;
     std::uint64_t last_use_serial;
 };
@@ -805,11 +805,16 @@ void plan_decodes(std::uint32_t prims) {
         // Avoid hashing the key and probing an empty map on every setup.
         const auto found = cache ? g_decoded_cache.find(key) : g_decoded_cache.end();
         if (found != g_decoded_cache.end()) {
-            if (!texture_written_since(w[12], w[13], w[14], tw, th, texels, found->second.when)) {
-                w[24] = found->second.offset;
-                found->second.last_use_serial = g_serial;
+            auto &decoded = found->second;
+            // Multiple setups can read the same texture before another GS
+            // write. Reuse the successful validation until the clock moves.
+            if (decoded.when > g_write_clock ||
+                !texture_written_since(w[12], w[13], w[14], tw, th, texels, decoded.when)) {
+                w[24] = decoded.offset;
+                decoded.when = g_write_clock + 1;
+                decoded.last_use_serial = g_serial;
                 ++g_decode_hits;
-                g_decode_saved_words += 1ull << (tw + th);
+                g_decode_saved_words += decoded.words;
                 continue;
             }
             ++g_decode_invalidated;
