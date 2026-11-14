@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "decoded_arena.h"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
@@ -653,7 +654,7 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         return true;
     };
     if (take_free()) return true;
-    if (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used) {
+    if (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)) {
         offset = g_decoded_used;
         g_decoded_used += words;
         return true;
@@ -682,7 +683,7 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         // Collecting a retired tail block can move the append cursor
         // backwards instead of leaving a reusable free-list block. Check
         // that space again before evicting another live cache entry.
-        if (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used) {
+        if (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)) {
             offset = g_decoded_used;
             g_decoded_used += words;
             return true;
@@ -777,7 +778,7 @@ void plan_decodes(std::uint32_t prims) {
         }
         std::uint32_t decoded_offset = 0;
         if (!(cache ? decode_allocate(words, decoded_offset)
-                    : (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used
+                    : (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)
                         ? (decoded_offset = g_decoded_used, g_decoded_used += words, true)
                         : false))) {
             // Never overwrite a decoded slot while queued native passes (or
