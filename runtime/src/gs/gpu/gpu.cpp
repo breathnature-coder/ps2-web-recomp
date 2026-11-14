@@ -1360,13 +1360,31 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
     static std::vector<Outline> group;
     group.clear();
+    float group_min_x = 0, group_max_x = 0, group_min_y = 0, group_max_y = 0;
     ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
         ++g_feedback_group_prims;
         const Outline o = outline(g_batch.prims.data() + q * kPrimWords);
-        for (const Outline &other : group) {
-            ++g_feedback_outline_tests;
-            if (outlines_meet(o, other)) return q;
+        // Skip every SAT test when this primitive misses the bounding box
+        // of the entire group. This is especially useful for spread-out GT4
+        // geometry; the exact overlap predicate remains unchanged.
+        const bool may_overlap = !group.empty() &&
+            o.max_x > group_min_x && o.min_x < group_max_x &&
+            o.max_y > group_min_y && o.min_y < group_max_y;
+        if (may_overlap) {
+            for (const Outline &other : group) {
+                ++g_feedback_outline_tests;
+                if (outlines_meet(o, other)) return q;
+            }
+        }
+        if (group.empty()) {
+            group_min_x = o.min_x; group_max_x = o.max_x;
+            group_min_y = o.min_y; group_max_y = o.max_y;
+        } else {
+            group_min_x = std::min(group_min_x, o.min_x);
+            group_max_x = std::max(group_max_x, o.max_x);
+            group_min_y = std::min(group_min_y, o.min_y);
+            group_max_y = std::max(group_max_y, o.max_y);
         }
         group.push_back(o);
     }
