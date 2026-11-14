@@ -31,6 +31,7 @@
 #include "shaders.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -367,6 +368,29 @@ void bind_texture(std::uint32_t unit, GLuint id) {
     g_bound_texture[unit & 3u] = id;
 }
 
+GLuint g_bound_framebuffer = 0;
+std::array<GLint, 4> g_viewport{0, 0, -1, -1}, g_scissor{0, 0, -1, -1};
+bool g_scissor_enabled = false;
+
+void bind_framebuffer(GLuint id) {
+    if (g_bound_framebuffer == id) return;
+    glBindFramebuffer(GL_FRAMEBUFFER, id);
+    g_bound_framebuffer = id;
+}
+
+void set_viewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+    const std::array<GLint, 4> rect{x, y, w, h};
+    if (g_viewport == rect) return;
+    glViewport(x, y, w, h);
+    g_viewport = rect;
+}
+
+void set_scissor_enabled(bool enabled) {
+    if (g_scissor_enabled == enabled) return;
+    (enabled ? glEnable : glDisable)(GL_SCISSOR_TEST);
+    g_scissor_enabled = enabled;
+}
+
 // A framebuffer object per pair of attachments a render pass used.
 std::map<std::pair<GLuint, GLuint>, GLuint> g_framebuffers;
 
@@ -375,7 +399,7 @@ GLuint framebuffer(GLuint color, GLuint depth) {
     if (found != g_framebuffers.end()) return found->second;
     GLuint id = 0;
     glGenFramebuffers(1, &id);
-    glBindFramebuffer(GL_FRAMEBUFFER, id);
+    bind_framebuffer(id);
     if (color) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
     if (depth) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
     const GLenum buffer = color ? GL_COLOR_ATTACHMENT0 : GL_NONE;
@@ -914,9 +938,9 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
             // Neither attachment may stay bound for reading from the last time it was written back.
             for (std::uint32_t unit = 0; unit < 4; ++unit)
                 if (g_bound_texture[unit] && (g_bound_texture[unit] == color_id || g_bound_texture[unit] == depth_id)) bind_texture(unit, 0);
-            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer(color_id, depth_id));
-            glViewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
-            glEnable(GL_SCISSOR_TEST);
+            bind_framebuffer(framebuffer(color_id, depth_id));
+            set_viewport(0, 0, static_cast<GLsizei>(width), static_cast<GLsizei>(height));
+            set_scissor_enabled(true);
             glDisable(GL_CULL_FACE);
             glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);  // a WebGPU pass starts with this constant, and gpu.cpp counts on it
             if (stats_on()) {  // the pass's GPU time, as "render" beside the kinds of dispatch
@@ -937,8 +961,8 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder e, WG
     }
     const WGPUColor c = d->colorAttachmentCount ? d->colorAttachments[0].clearValue : WGPUColor{0, 0, 0, 1};
     e->ops.push_back([c] {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDisable(GL_SCISSOR_TEST);
+        bind_framebuffer(0);
+        set_scissor_enabled(false);
         glDisable(GL_CULL_FACE);
         apply(RenderState{});
         glClearColor(static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b), static_cast<float>(c.a));
@@ -958,7 +982,7 @@ extern "C" {
 void wgpuRenderPassEncoderSetViewport(WGPURenderPassEncoder p, float x, float y, float w, float h, float, float) {
     // WebGPU puts the origin at the top left, OpenGL at the bottom left.
     p->encoder->ops.push_back([x, y, w, h] {
-        glViewport(static_cast<GLint>(x), static_cast<GLint>(static_cast<float>(g_surface_height) - y - h), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        set_viewport(static_cast<GLint>(x), static_cast<GLint>(static_cast<float>(g_surface_height) - y - h), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
     });
 }
 
@@ -976,7 +1000,12 @@ void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder p, WGPURenderPipelin
 
 // Only passes into textures set these, and a texture's first row is OpenGL's row 0: nothing to flip.
 void wgpuRenderPassEncoderSetScissorRect(WGPURenderPassEncoder p, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
-    p->encoder->ops.push_back([x, y, w, h] { glScissor(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h)); });
+    p->encoder->ops.push_back([rect = std::array<GLint, 4>{static_cast<GLint>(x), static_cast<GLint>(y),
+                                                           static_cast<GLsizei>(w), static_cast<GLsizei>(h)}] {
+        if (g_scissor == rect) return;
+        glScissor(rect[0], rect[1], rect[2], rect[3]);
+        g_scissor = rect;
+    });
 }
 
 void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor const *color) {
@@ -1104,6 +1133,7 @@ void wgpuTextureRelease(WGPUTexture t) {
     current();
     for (auto it = g_framebuffers.begin(); it != g_framebuffers.end();) {
         if (it->first.first == t->id || it->first.second == t->id) {
+            if (g_bound_framebuffer == it->second) g_bound_framebuffer = 0;
             glDeleteFramebuffers(1, &it->second);
             it = g_framebuffers.erase(it);
         } else {
