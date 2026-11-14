@@ -743,8 +743,12 @@ bool decode_cache_on() {
 #else
     constexpr bool default_on = true;
 #endif
-    const char *env = std::getenv("PS2_DECODE_CACHE");
-    static const bool on = env ? std::atoi(env) != 0 : default_on;
+    // Read args.txt environment overrides on first use, then avoid getenv
+    // on every palette load, batch and submit.
+    static const bool on = [] {
+        const char *env = std::getenv("PS2_DECODE_CACHE");
+        return env ? std::atoi(env) != 0 : default_on;
+    }();
     return on;
 }
 
