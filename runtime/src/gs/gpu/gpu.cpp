@@ -2215,7 +2215,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
         depth.depthStoreOp = WGPUStoreOp_Store;
         rd.depthStencilAttachment = &depth;
     }
-    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+    WGPURenderPassEncoder rp = nullptr;
     WGPURenderPipeline current = nullptr;
     float constant = 0.0f;
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
@@ -2225,20 +2225,29 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
             if (!d.pipeline) {
                 // The colour target as it is now, for the feedback draw that follows: a copy cannot be made inside
                 // a pass, so this one ends and another begins.
-                wgpuRenderPassEncoderEnd(rp);
-                wgpuRenderPassEncoderRelease(rp);
+                if (rp) {
+                    wgpuRenderPassEncoderEnd(rp);
+                    wgpuRenderPassEncoderRelease(rp);
+                    rp = nullptr;
+                }
                 WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
                 from.texture = first.color->texture;
                 to.texture = first.color->backdrop;
                 from.origin = to.origin = WGPUOrigin3D{d.x * g_scale, d.y * g_scale, 0};
                 const WGPUExtent3D size{d.w * g_scale, d.h * g_scale, 1};
                 wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
-                rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
                 current = nullptr;
                 constant = 0.0f;
                 backdrop_bound = false;
                 last_x = last_y = last_w = last_h = ~0u;
                 continue;
+            }
+            if (!rp) {
+                rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+                current = nullptr;
+                constant = 0.0f;
+                backdrop_bound = false;
+                last_x = last_y = last_w = last_h = ~0u;
             }
             if (d.feedback && !backdrop_bound) {
                 wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
@@ -2266,8 +2275,10 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
         if (next.color != first.color || next.depth != first.depth) break;
         ++i;
     }
-    wgpuRenderPassEncoderEnd(rp);
-    wgpuRenderPassEncoderRelease(rp);
+    if (rp) {
+        wgpuRenderPassEncoderEnd(rp);
+        wgpuRenderPassEncoderRelease(rp);
+    }
     return i;
 }
 
