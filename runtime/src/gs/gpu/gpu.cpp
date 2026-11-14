@@ -1412,6 +1412,10 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline
         if (may_overlap) {
             for (std::uint32_t prev = from; prev < q; ++prev) {
                 const Outline &other = precomputed ? precomputed[prev - from] : fallback_group[prev - from];
+                // Reject disjoint individual bounds before invoking SAT.
+                // The aggregate group bounds are only a coarse filter.
+                if (o.max_x <= other.min_x || other.max_x <= o.min_x ||
+                    o.max_y <= other.min_y || other.max_y <= o.min_y) continue;
                 ++g_feedback_outline_tests;
                 if (outlines_meet(o, other)) return q;
             }
