@@ -686,10 +686,16 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
         if (it->second.last_use_serial <= g_decode_completed_serial)
             candidates.push_back(it);
-    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
-        return a->second.last_use_serial < b->second.last_use_serial;
-    });
-    for (const auto victim : candidates) {
+    // Heap construction is linear. Extract only as many oldest entries as
+    // allocation needs instead of sorting every eligible texture.
+    const auto newer = [](const auto &a, const auto &b) {
+        return a->second.last_use_serial > b->second.last_use_serial;
+    };
+    std::make_heap(candidates.begin(), candidates.end(), newer);
+    while (!candidates.empty()) {
+        std::pop_heap(candidates.begin(), candidates.end(), newer);
+        const auto victim = candidates.back();
+        candidates.pop_back();  // discard its iterator before erasing the entry
         decode_retire(victim->second);
         g_decoded_cache.erase(victim);
         ++g_decode_evictions;
