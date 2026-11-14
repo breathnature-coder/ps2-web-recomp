@@ -583,6 +583,12 @@ std::uint64_t g_decode_admission_skips = 0, g_decode_admission_texels = 0;
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
+bool decode_admission_on() {
+    static const bool on = !std::getenv("PS2_DECODE_ADMISSION") ||
+                           std::atoi(std::getenv("PS2_DECODE_ADMISSION")) != 0;
+    return on;
+}
+
 bool decode_cache_on() {
     static const bool on = !std::getenv("PS2_DECODE_CACHE") || std::atoi(std::getenv("PS2_DECODE_CACHE")) != 0;
     return on;
@@ -634,7 +640,7 @@ void plan_decodes(std::uint32_t prims) {
         // expensive full-cache resets. Leave their sampling on the direct
         // GS-memory path until a second encounter establishes reuse.
         // Small textures stay eager: their decode and footprint are cheap.
-        if (cache && words >= 4096u) {
+        if (cache && decode_admission_on() && words >= 4096u) {
             if (g_decode_seen.size() >= 8192u) g_decode_seen.clear();
             auto [seen, inserted] = g_decode_seen.try_emplace(key, 0u);
             if (seen->second < 2u) ++seen->second;
