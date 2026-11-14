@@ -590,23 +590,32 @@ void decode_retire(const Decoded &d) {
     g_decode_retired.emplace(d.last_use_serial, DecodeBlock{d.offset, d.words, d.last_use_serial});
 }
 void decode_collect() {
+    // Keep free blocks sorted and coalesced as each completed retirement
+    // arrives, instead of re-sorting the entire list for every LRU victim.
     while (!g_decode_retired.empty() &&
            g_decode_retired.begin()->first <= g_decode_completed_serial) {
-        g_decode_free.push_back(g_decode_retired.begin()->second);
-        g_decode_free_dirty = true;
+        const DecodeBlock block = g_decode_retired.begin()->second;
         g_decode_retired.erase(g_decode_retired.begin());
+        auto it = std::lower_bound(g_decode_free.begin(), g_decode_free.end(), block.offset,
+                                   [](const DecodeBlock &free, std::uint32_t offset) {
+                                       return free.offset < offset;
+                                   });
+        const auto index = static_cast<std::size_t>(it - g_decode_free.begin());
+        if (index && g_decode_free[index - 1].offset + g_decode_free[index - 1].words == block.offset) {
+            g_decode_free[index - 1].words += block.words;
+            if (index < g_decode_free.size() &&
+                g_decode_free[index - 1].offset + g_decode_free[index - 1].words == g_decode_free[index].offset) {
+                g_decode_free[index - 1].words += g_decode_free[index].words;
+                g_decode_free.erase(g_decode_free.begin() + index);
+            }
+        } else if (index < g_decode_free.size() &&
+                   block.offset + block.words == g_decode_free[index].offset) {
+            g_decode_free[index].offset = block.offset;
+            g_decode_free[index].words += block.words;
+        } else {
+            g_decode_free.insert(it, block);
+        }
     }
-    if (g_decode_free.empty() || !g_decode_free_dirty) return;
-    g_decode_free_dirty = false;
-    std::sort(g_decode_free.begin(), g_decode_free.end(),
-              [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
-    std::size_t out = 0;
-    for (const DecodeBlock &block : g_decode_free) {
-        if (out && g_decode_free[out - 1].offset + g_decode_free[out - 1].words == block.offset)
-            g_decode_free[out - 1].words += block.words;
-        else g_decode_free[out++] = block;
-    }
-    g_decode_free.resize(out);
 }
 bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     decode_collect();
