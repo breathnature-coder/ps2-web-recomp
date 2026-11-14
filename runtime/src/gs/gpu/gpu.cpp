@@ -674,6 +674,14 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         ++g_decode_evictions;
         decode_collect();
         if (take_free()) return true;
+        // Collecting a retired tail block can move the append cursor
+        // backwards instead of leaving a reusable free-list block. Check
+        // that space again before evicting another live cache entry.
+        if (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used) {
+            offset = g_decoded_used;
+            g_decoded_used += words;
+            return true;
+        }
     }
     return false;
 }
