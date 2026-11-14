@@ -1357,14 +1357,14 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 
 // Where the group of a feedback draw's primitives that starts at `from` ends: before the first one, short of `to`,
 // that can cover a pixel one of the group covers.
-std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
+std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline *precomputed = nullptr) {
     static std::vector<Outline> group;
     group.clear();
     float group_min_x = 0, group_max_x = 0, group_min_y = 0, group_max_y = 0;
     ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
         ++g_feedback_group_prims;
-        const Outline o = outline(g_batch.prims.data() + q * kPrimWords);
+        const Outline o = precomputed ? precomputed[q - from] : outline(g_batch.prims.data() + q * kPrimWords);
         // Skip every SAT test when this primitive misses the bounding box
         // of the entire group. This is especially useful for spread-out GT4
         // geometry; the exact overlap predicate remains unchanged.
@@ -1409,8 +1409,14 @@ bool flush_native(std::uint32_t prims) {
             NativeState state;
             if (native_state(b.setups.data() + rec[0] * kSetupWords, b.zte, state) && state.feedback && state.draws) {
                 among += j - i;
+                // Build outlines once for the entire state run. The previous
+                // partitioner rebuilt outlines for each new feedback group.
+                std::vector<Outline> run_outlines;
+                run_outlines.reserve(j - i);
+                for (std::uint32_t q = i; q < j; ++q)
+                    run_outlines.push_back(outline(b.prims.data() + q * kPrimWords));
                 for (std::uint32_t from = i; from < j;) {
-                    const std::uint32_t end = feedback_group(from, j);
+                    const std::uint32_t end = feedback_group(from, j, run_outlines.data() + (from - i));
                     feedback_ends[from] = end;
                     from = end;
                     ++groups;
