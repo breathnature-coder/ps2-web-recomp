@@ -1148,6 +1148,7 @@ void plan_decodes(std::uint32_t prims);
 // A primitive's outline, for telling whether two of a feedback draw can cover the same pixel.
 struct Outline {
     float x[4], y[4];
+    float minx, miny, maxx, maxy;
     int corners;
 };
 
@@ -1166,12 +1167,23 @@ Outline outline(const std::uint32_t *rec) {
         }
         o.corners = 3;
     }
+    o.minx = o.maxx = o.x[0];
+    o.miny = o.maxy = o.y[0];
+    for (int i = 1; i < o.corners; ++i) {
+        o.minx = std::min(o.minx, o.x[i]);
+        o.miny = std::min(o.miny, o.y[i]);
+        o.maxx = std::max(o.maxx, o.x[i]);
+        o.maxy = std::max(o.maxy, o.y[i]);
+    }
     return o;
 }
 
 // Whether the insides of two convex outlines meet (touching along an edge is not meeting: the fill rule gives a
 // pixel on a shared edge to one of them). A separating axis is along some edge of one of the two.
 bool outlines_meet(const Outline &a, const Outline &b) {
+    // Most GT4 feedback primitives are far apart. Reject disjoint boxes before the
+    // more expensive separating-axis test; touching edges are non-overlapping.
+    if (a.maxx <= b.minx || b.maxx <= a.minx || a.maxy <= b.miny || b.maxy <= a.miny) return false;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
         for (int i = 0; i < p.corners; ++i) {
