@@ -746,7 +746,10 @@ WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
 WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
 WGPUBindGroupLayout g_backdrop_layout = nullptr;
 std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
-std::uint64_t g_feedback_copy_pixels = 0;  // unscaled source pixels copied for feedback
+std::uint64_t g_feedback_copy_pixels = 0;
+std::uint64_t g_feedback_group_calls = 0;
+std::uint64_t g_feedback_outline_tests = 0;
+std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
 bool g_refusal_counted = false;  // flush_native said why it gave a batch up
 WGPUBindGroup g_native_group = nullptr;
 WGPUShaderModule g_native_module = nullptr;
@@ -1148,7 +1151,6 @@ void plan_decodes(std::uint32_t prims);
 // A primitive's outline, for telling whether two of a feedback draw can cover the same pixel.
 struct Outline {
     float x[4], y[4];
-    float minx, miny, maxx, maxy;
     int corners;
 };
 
@@ -1167,23 +1169,12 @@ Outline outline(const std::uint32_t *rec) {
         }
         o.corners = 3;
     }
-    o.minx = o.maxx = o.x[0];
-    o.miny = o.maxy = o.y[0];
-    for (int i = 1; i < o.corners; ++i) {
-        o.minx = std::min(o.minx, o.x[i]);
-        o.miny = std::min(o.miny, o.y[i]);
-        o.maxx = std::max(o.maxx, o.x[i]);
-        o.maxy = std::max(o.maxy, o.y[i]);
-    }
     return o;
 }
 
 // Whether the insides of two convex outlines meet (touching along an edge is not meeting: the fill rule gives a
 // pixel on a shared edge to one of them). A separating axis is along some edge of one of the two.
 bool outlines_meet(const Outline &a, const Outline &b) {
-    // Most GT4 feedback primitives are far apart. Reject disjoint boxes before the
-    // more expensive separating-axis test; touching edges are non-overlapping.
-    if (a.maxx <= b.minx || b.maxx <= a.minx || a.maxy <= b.miny || b.maxy <= a.miny) return false;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
         for (int i = 0; i < p.corners; ++i) {
@@ -1212,10 +1203,14 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
     static std::vector<Outline> group;
     group.clear();
+    ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
+        ++g_feedback_group_prims;
         const Outline o = outline(g_batch.prims.data() + q * kPrimWords);
-        for (const Outline &other : group)
+        for (const Outline &other : group) {
+            ++g_feedback_outline_tests;
             if (outlines_meet(o, other)) return q;
+        }
         group.push_back(o);
     }
     return to;
@@ -2208,6 +2203,23 @@ void submitted() {
     last_feedback = g_feedback_draws;
     last_copies = g_feedback_copies;
     last_copy_pixels = g_feedback_copy_pixels;
+    static std::uint64_t last_group_calls = 0;
+    static std::uint64_t last_outline_tests = 0;
+    static std::uint64_t last_group_prims = 0;
+    const auto group_calls = g_feedback_group_calls - last_group_calls;
+    const auto outline_tests = g_feedback_outline_tests - last_outline_tests;
+    const auto group_prims = g_feedback_group_prims - last_group_prims;
+    if (group_calls)
+        std::fprintf(stderr,
+            "[native] feedback grouping: %.0f calls/s, %.0f prim visits/s, "
+            "%.0f overlap tests/s, %.1f tests/call\n",
+            static_cast<double>(group_calls) / seconds,
+            static_cast<double>(group_prims) / seconds,
+            static_cast<double>(outline_tests) / seconds,
+            static_cast<double>(outline_tests) / static_cast<double>(group_calls));
+    last_group_calls = g_feedback_group_calls;
+    last_outline_tests = g_feedback_outline_tests;
+    last_group_prims = g_feedback_group_prims;
     static std::uint64_t last_tiles = 0, last_passes = 0;
     if (g_lut_tiles != last_tiles)
         std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
