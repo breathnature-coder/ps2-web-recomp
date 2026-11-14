@@ -2141,6 +2141,8 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
     WGPURenderPipeline current = nullptr;
     float constant = 0.0f;
+    std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
+    bool backdrop_bound = false;
     for (;;) {
         for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
             if (!d.pipeline) {
@@ -2157,16 +2159,24 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
                 current = nullptr;
                 constant = 0.0f;
+                backdrop_bound = false;
+                last_x = last_y = last_w = last_h = ~0u;
                 continue;
             }
-            if (d.feedback) wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
+            if (d.feedback && !backdrop_bound) {
+                wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
+                backdrop_bound = true;
+            }
             if (d.pipeline != current) {
                 wgpuRenderPassEncoderSetPipeline(rp, d.pipeline);
                 current = d.pipeline;
             }
             const std::uint32_t offset = d.param * kParamStride;
             wgpuRenderPassEncoderSetBindGroup(rp, 0, g_native_group, 1, &offset);
-            wgpuRenderPassEncoderSetScissorRect(rp, d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale);
+            if (d.x != last_x || d.y != last_y || d.w != last_w || d.h != last_h) {
+                wgpuRenderPassEncoderSetScissorRect(rp, d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale);
+                last_x = d.x; last_y = d.y; last_w = d.w; last_h = d.h;
+            }
             if (d.constant != constant) {
                 constant = d.constant;
                 const WGPUColor c{constant, constant, constant, constant};
