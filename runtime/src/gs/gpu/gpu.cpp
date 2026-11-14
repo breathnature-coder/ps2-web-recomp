@@ -554,31 +554,40 @@ struct Decode {
 };
 std::vector<Decode> g_decodes;
 
-// What a CLUT slot holds, as a number that is the same only for the same entries: each load mixes into the number of
-// the slot it copies the one of what it reads, and when that was last written (load_clut).
-std::uint64_t g_clut_content[kClutSlots] = {};
-
 std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
     h *= 0xFF51AFD7ED558CCDull;
     return h ^ (h >> 33);
 }
 
+// Indexed sampling reads either one 16-entry bank or all of the first
+// 256 entries. Track those banks independently of the GPU's rotating slots.
+struct ClutIdentity {
+    std::array<std::uint64_t, 16> banks{};
+    std::uint64_t eight = 0;
+
+    void refresh_eight() {
+        eight = 0;
+        for (const auto bank : banks) eight = mix(eight, bank);
+    }
+};
+ClutIdentity g_clut_identity[kClutSlots];
+
 // Textures decoded to 32-bit texels (decode in gs.wgsl), kept across batches and frames for as long as GS memory under
 // them is not written and, for a palette texture, while the CLUT is the same: a race frame reads the same textures
 // in many batches, and each decode was a dispatch and as many texels as the texture has. When the buffer is full
 // it starts over. PS2_DECODE_CACHE=0 decodes each batch's textures for that batch alone, as before.
 struct DecodeKey {
-    std::uint32_t tbp, tbw, tpsm, size, cpsm, csa, ta, aem;
+    std::uint32_t tbp, tbw, tpsm, size, cpsm, ta, aem;
     std::uint64_t clut;
     bool operator==(const DecodeKey &o) const {
-        return tbp == o.tbp && tbw == o.tbw && tpsm == o.tpsm && size == o.size && cpsm == o.cpsm && csa == o.csa && ta == o.ta && aem == o.aem && clut == o.clut;
+        return tbp == o.tbp && tbw == o.tbw && tpsm == o.tpsm && size == o.size && cpsm == o.cpsm && ta == o.ta && aem == o.aem && clut == o.clut;
     }
 };
 struct DecodeKeyHash {
     std::size_t operator()(const DecodeKey &k) const {
         std::uint64_t h = mix(mix(mix(mix(k.tbp, k.tbw), k.tpsm), k.size), k.cpsm);
-        return static_cast<std::size_t>(mix(mix(mix(mix(h, k.csa), k.ta), k.aem), k.clut));
+        return static_cast<std::size_t>(mix(mix(mix(h, k.ta), k.aem), k.clut));
     }
 };
 struct Decoded {
@@ -772,9 +781,23 @@ void plan_decodes(std::uint32_t prims) {
         DecodeKey key{};
         if (cache) {
             const bool palette = palette_psm(w[14]);
-            key = {w[12], w[13], w[14], w[15], palette ? w[16] : 0u,
-                   palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u,
-                   palette ? g_clut_content[w[22] % kClutSlots] : 0u};
+            std::uint64_t clut = 0;
+            if (palette) {
+                const auto &identity = g_clut_identity[w[22]];
+                clut = (w[14] == PSMT8 || w[14] == PSMT8H) ? identity.eight
+                                                            : identity.banks[w[17] & 15u];
+            }
+            // The bank index selects the identity, but does not affect
+            // conversion once the palette entries are known.
+            const std::uint32_t color_psm = palette ? w[16] : w[14];
+            const bool expand16 = color_psm == PSMCT16 || color_psm == PSMCT16S ||
+                                  (!palette && (color_psm == PSMZ16 || color_psm == PSMZ16S));
+            // Indexed formats expand any CLUT format other than 32/24-bit.
+            const bool alpha16 = palette ? color_psm != PSMCT32 && color_psm != PSMCT24 : expand16;
+            const bool alpha24 = !palette && (color_psm == PSMCT24 || color_psm == PSMZ24);
+            const auto ta = alpha16 ? w[20] : alpha24 ? w[20] & 0xFFu : 0u;
+            const auto aem = (alpha16 || alpha24) && (w[0] & 32768u) ? 1u : 0u;
+            key = {w[12], w[13], w[14], w[15], palette ? w[16] : 0u, ta, aem, clut};
         }
         // The transient (uncached) path cannot hit a persistent entry.
         // Avoid hashing the key and probing an empty map on every setup.
@@ -2567,7 +2590,7 @@ void submitted() {
     last_invalidated = g_decode_invalidated;
     last_cold = g_decode_cold;
     last_small = g_decode_small;
-    std::fprintf(stderr, "[native] decode admission: %.0f cold large textures/s bypassed, %.0f texels/s not predecoded\\n",
+    std::fprintf(stderr, "[native] decode admission: %.0f cold large textures/s bypassed, %.0f texels/s not predecoded\n",
                  static_cast<double>(g_decode_admission_skips - last_admission_skips) / seconds,
                  static_cast<double>(g_decode_admission_texels - last_admission_texels) / seconds);
     std::fprintf(stderr, "[native] decode capacity: %.0f bypasses/s, %.0f texels/s direct, %.1f/%.1f MiB occupied\n",
@@ -3145,6 +3168,7 @@ bool init(Mode m) {
     g_decode_free.clear();
     g_decode_retired.clear();
     g_decoded_used = 0;
+    std::fill(std::begin(g_clut_identity), std::end(g_clut_identity), ClutIdentity{});
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
@@ -3578,15 +3602,26 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
-    // An eight-bit CSM1=0 load overwrites all 256 palette entries that
-    // PSMT8/PSMT8H can sample. The previous CLUT slot is irrelevant to
-    // those entries. Hashing it made identical reloads produce different
-    // keys forever, defeating decoded texture reuse.
-    // Partial loads still depend on the previous slot contents.
-    const bool full_palette = !csm && rec[6] != 0;
-    std::uint64_t content = full_palette ? 0u : g_clut_content[g_clut_slot];
-    for (int k = 2; k < 10; ++k) content = mix(content, rec[k]);
-    g_clut_content[next] = mix(content, last_written(op.range));
+    if (decode_cache_on()) {
+        auto &identity = g_clut_identity[next];
+        identity = g_clut_identity[g_clut_slot];
+        const std::uint32_t banks = rec[6] ? 16u : 1u;
+        const std::uint32_t first = csm ? rec[5] : (rec[6] ? 0u : rec[5] & 15u);
+        const std::uint64_t source = mix(mix(cbp, cpsm), csm);
+        const std::uint64_t csm1_written = csm ? 0u : last_written(op.range);
+        for (std::uint32_t k = 0; k < banks; ++k) {
+            const std::uint32_t dst = (first + k) & 31u;
+            if (dst >= identity.banks.size()) continue;  // the sampler cannot select these entries
+            // CSM2 reads a linear span. CSM1 four-bit loads always read
+            // the same 8x2 rectangle, regardless of the destination bank.
+            const int x = static_cast<int>((cou + k) * 16);
+            const int y = static_cast<int>(cov);
+            const auto written = csm ? last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y)) : csm1_written;
+            const auto layout = csm ? mix(mix(cbw, cou + k), cov) : (rec[6] ? k + 1u : 0u);
+            identity.banks[dst] = mix(mix(source, layout), written);
+        }
+        identity.refresh_eight();
+    }
     g_clut_source[next] = {cbp, cpsm == PSMCT32 && !csm && rec[6] != 0};
     g_clut_slot = next;
     ++g_clut_loads;
@@ -3718,7 +3753,9 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     g_decode_free.clear();
     g_decode_retired.clear();
     g_decoded_used = 0;
-    g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
+    auto &identity = g_clut_identity[g_clut_slot];
+    identity.banks.fill(g_write_clock);
+    identity.refresh_eight();
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {
