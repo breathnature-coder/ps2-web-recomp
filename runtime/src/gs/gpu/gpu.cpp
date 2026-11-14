@@ -2622,6 +2622,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     WGPUComputePassEncoder pass = nullptr;
     bool first_compute_pass = true;
     Pipeline current = kPipelines;
+    Surface *bound_target = nullptr;
     ++g_submits;
     ++g_total_passes;
     for (std::size_t i = 0; i < g_commands.size(); ++i) {
@@ -2642,6 +2643,7 @@ void submit(WGPUTextureView present_view = nullptr) {
                 first_compute_pass = false;
             }
             current = kPipelines;
+            bound_target = nullptr;
         }
         ++g_dispatches[c.pipeline];
         if (c.pipeline != current) {
@@ -2650,7 +2652,10 @@ void submit(WGPUTextureView present_view = nullptr) {
         }
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
-        if (c.target) wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
+        if (c.target && c.target != bound_target) {
+            wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
+            bound_target = c.target;
+        }
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
     if (pass) {
