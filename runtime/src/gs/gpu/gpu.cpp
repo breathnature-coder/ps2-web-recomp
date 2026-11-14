@@ -581,7 +581,6 @@ std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
 std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
-bool g_decode_free_dirty = false;
 std::uint64_t g_decode_completed_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0;
 void decode_retire(const Decoded &d) {
@@ -693,8 +692,7 @@ void plan_decodes(std::uint32_t prims) {
         g_decoded_cache.clear();
         g_decode_free.clear();
         g_decode_retired.clear();
-        g_decode_free_dirty = false;
-        if (prims <= kDecodePrims) return;
+            if (prims <= kDecodePrims) return;
     }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     for (std::uint32_t i = 0; i < setups; ++i) {
@@ -2988,7 +2986,6 @@ bool init(Mode m) {
     g_decoded_cache.clear();
     g_decode_free.clear();
     g_decode_retired.clear();
-    g_decode_free_dirty = false;
     g_decoded_used = 0;
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
@@ -3556,7 +3553,6 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     g_decoded_cache.clear();
     g_decode_free.clear();
     g_decode_retired.clear();
-    g_decode_free_dirty = false;
     g_decoded_used = 0;
     g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
     if (from == to && vram.size() == words * to) {
