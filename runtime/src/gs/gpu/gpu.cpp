@@ -1366,6 +1366,10 @@ bool outlines_meet(const Outline &a, const Outline &b) {
     if (a.corners == 4 && b.corners == 4) return true;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
+        // Sprite edges are axis-aligned; the AABB test above has already
+        // checked their separating axes. Only triangle edge normals need
+        // explicit projections.
+        if (p.corners == 4) continue;
         for (int i = 0; i < p.corners; ++i) {
             const int j = (i + 1) % p.corners;
             const float nx = p.y[j] - p.y[i], ny = p.x[i] - p.x[j];
