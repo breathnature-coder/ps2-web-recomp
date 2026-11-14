@@ -647,7 +647,11 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     // Select reclaim candidates once, oldest first. Repeatedly scanning the
     // entire hash table for each victim was O(entries * evictions) per miss.
     // Never evict textures referenced by queued or unfinished GPU work.
-    std::vector<decltype(g_decoded_cache.begin())> candidates;
+    // Keep scratch capacity across allocation misses to avoid repeated heap
+    // allocation when the decoded cache is under pressure.
+    using DecodeCacheIterator = decltype(g_decoded_cache.begin());
+    static std::vector<DecodeCacheIterator> candidates;
+    candidates.clear();
     candidates.reserve(g_decoded_cache.size());
     for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
         if (it->second.last_use_serial <= g_decode_completed_serial)
