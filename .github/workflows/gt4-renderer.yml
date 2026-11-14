@@ -22,6 +22,21 @@ jobs:
       - name: Compile renderer and runtime
         run: cmake --build build-gpu --target ps2runtime -j 2
 
+
+  gl-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and EGL headers
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang curl unzip libegl1-mesa-dev libgl-dev
+      - name: Fetch WebGPU headers
+        run: sh scripts/fetch_wgpu.sh
+      - name: Configure OpenGL renderer
+        run: cmake -S . -B build-gl -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=gl
+      - name: Compile OpenGL renderer and runtime
+        run: cmake --build build-gl --target ps2runtime -j 2
+
   runtime-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
