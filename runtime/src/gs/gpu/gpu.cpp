@@ -513,29 +513,24 @@ bool written_since(const Range &r, std::uint64_t when) {
 // For unusual widths, retain the conservative contiguous-range check.
 bool texture_written_since(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm,
                            std::uint32_t tw, std::uint32_t th,
-                           const Range &bounds, std::uint64_t when) {
+                           std::uint64_t when) {
     std::uint32_t pw, ph;
     page_size(psm, pw, ph);
-    const std::uint64_t row_pages = std::max<std::uint32_t>(1, bw * 64 / pw);
-    const std::uint64_t width_pages = ((1ull << tw) + pw - 1) / pw;
-    const std::uint64_t height_pages = ((1ull << th) + ph - 1) / ph;
-    // A texture row occupies only width_pages of its GS stride. Checking
-    // the bounding interval also checks unrelated pages between rows and
-    // invalidates perfectly reusable textures. A non-page-aligned TBP
-    // straddles two physical tracking pages per logical GS page: check both
-    // instead of falling back to the overly broad bounding interval.
-    if (width_pages >= row_pages) return written_since(bounds, when);
-    const std::uint64_t base_bytes = static_cast<std::uint64_t>(bp) * 256;
-    const std::uint64_t base_page = base_bytes >> 13;
-    const bool straddles = (base_bytes & 8191ull) != 0;
-    for (std::uint64_t y = 0; y < height_pages; ++y) {
-        const std::uint64_t row = base_page + y * row_pages;
-        for (std::uint64_t x = 0; x < width_pages; ++x) {
-            const std::uint64_t page = row + x;
-            if (g_page_written[page & 511u] >= when ||
-                (straddles && g_page_written[(page + 1) & 511u] >= when))
-                return true;
-        }
+    const std::uint32_t stride = std::max(1u, bw * 64 / pw);
+    const std::uint32_t width = ((1u << tw) + pw - 1) / pw;
+    const std::uint32_t height = ((1u << th) + ph - 1) / ph;
+    const std::uint32_t base = bp / 32;
+    // A non-aligned logical page overlaps the following tracking page.
+    // Include that page once per row instead of checking it for every texel page.
+    const std::uint32_t span = width + (bp % 32 != 0);
+    if (span >= stride) {
+        const std::uint64_t end = base + (height - 1) * stride + span;
+        return written_since(Range{base * 8192ull, end * 8192ull}, when);
+    }
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const std::uint32_t row = base + y * stride;
+        for (std::uint32_t x = 0; x < span; ++x)
+            if (g_page_written[(row + x) & 511u] >= when) return true;
     }
     return false;
 }
@@ -775,8 +770,7 @@ void plan_decodes(std::uint32_t prims) {
         const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
-        const Range texels = pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
-        if (g_scale > 1 && rendered(texels)) continue;
+        if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
         // Avoid building a persistent cache identity for transient decoding.
         // In particular, the uncached path does not need to inspect CLUT
         // history, which can change on every palette upload.
@@ -809,7 +803,7 @@ void plan_decodes(std::uint32_t prims) {
             // Multiple setups can read the same texture before another GS
             // write. Reuse the successful validation until the clock moves.
             if (decoded.when > g_write_clock ||
-                !texture_written_since(w[12], w[13], w[14], tw, th, texels, decoded.when)) {
+                !texture_written_since(w[12], w[13], w[14], tw, th, decoded.when)) {
                 w[24] = decoded.offset;
                 decoded.when = g_write_clock + 1;
                 decoded.last_use_serial = g_serial;
