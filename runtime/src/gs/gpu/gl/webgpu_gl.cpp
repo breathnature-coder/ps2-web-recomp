@@ -38,6 +38,8 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -95,7 +97,8 @@ struct WGPUBindGroupImpl {
         bool uniform, dynamic;
         GLuint texture = 0;  // not a buffer: this texture, on the unit of its binding number
     };
-    std::vector<Entry> entries;  // in binding order, which is the order of dynamic offsets
+    // Commands retain the immutable entries until submit.
+    std::shared_ptr<const std::vector<Entry>> entries;
 };
 
 struct WGPUShaderModuleImpl {
@@ -478,9 +481,9 @@ const char *find_shader(const std::string &entry, std::uint32_t scale, std::uint
 
 std::map<std::pair<std::string, std::uint32_t>, GLuint> g_programs;
 
-void bind(const WGPUBindGroupImpl &group, const std::vector<std::uint32_t> &dynamic) {
+void bind(const std::vector<WGPUBindGroupImpl::Entry> &entries, std::span<const std::uint32_t> dynamic) {
     std::size_t next = 0;
-    for (const auto &e : group.entries) {
+    for (const auto &e : entries) {
         std::uint64_t offset = e.offset;
         if (e.texture) {
             bind_texture(e.binding, e.texture);
@@ -496,6 +499,20 @@ void bind(const WGPUBindGroupImpl &group, const std::vector<std::uint32_t> &dyna
         ++g_stats.binds;
         glBindBufferRange(e.uniform ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER, e.binding, e.buffer, static_cast<GLintptr>(offset),
                           static_cast<GLsizeiptr>(e.size));
+    }
+}
+
+void record_bind(WGPUCommandEncoder encoder, WGPUBindGroup group, std::span<const std::uint32_t> offsets) {
+    if (offsets.empty()) {
+        encoder->ops.emplace_back([entries = group->entries] { bind(*entries, {}); });
+    } else if (offsets.size() == 1) {
+        encoder->ops.emplace_back([entries = group->entries, offset = offsets.front()] {
+            bind(*entries, {&offset, 1});
+        });
+    } else {
+        encoder->ops.emplace_back([entries = group->entries, dynamic = std::vector(offsets.begin(), offsets.end())] {
+            bind(*entries, dynamic);
+        });
     }
 }
 
@@ -651,21 +668,22 @@ WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice, WGPUPipelineLayout
 void wgpuPipelineLayoutRelease(WGPUPipelineLayout) {}
 
 WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice, WGPUBindGroupDescriptor const *d) {
-    auto *group = new WGPUBindGroupImpl;
+    auto entries = std::make_shared<std::vector<WGPUBindGroupImpl::Entry>>();
+    entries->reserve(d->entryCount);
     for (std::size_t i = 0; i < d->entryCount; ++i) {
         const WGPUBindGroupEntry &e = d->entries[i];
         if (e.textureView) {
-            group->entries.push_back({e.binding, 0, 0, 0, false, false, e.textureView->texture->id});
+            entries->push_back({e.binding, 0, 0, 0, false, false, e.textureView->texture->id});
             continue;
         }
         bool uniform = false, dynamic = false;
         for (const auto &le : d->layout->entries)
             if (le.binding == e.binding) uniform = le.uniform, dynamic = le.dynamic;
         const std::uint64_t size = e.size == WGPU_WHOLE_SIZE ? e.buffer->size - e.offset : e.size;
-        group->entries.push_back({e.binding, e.buffer->id, e.offset, size, uniform, dynamic, 0});
+        entries->push_back({e.binding, e.buffer->id, e.offset, size, uniform, dynamic, 0});
     }
-    std::sort(group->entries.begin(), group->entries.end(), [](const auto &a, const auto &b) { return a.binding < b.binding; });
-    return group;
+    std::sort(entries->begin(), entries->end(), [](const auto &a, const auto &b) { return a.binding < b.binding; });
+    return new WGPUBindGroupImpl{std::move(entries)};
 }
 
 void wgpuBindGroupRelease(WGPUBindGroup group) { delete group; }
@@ -840,8 +858,7 @@ void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder p, WGPUComputePipe
 }
 
 void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder p, uint32_t, WGPUBindGroup group, size_t count, uint32_t const *offsets) {
-    std::vector<std::uint32_t> dynamic(offsets, offsets + count);
-    p->encoder->ops.push_back([g = *group, dynamic = std::move(dynamic)] { bind(g, dynamic); });
+    record_bind(p->encoder, group, {offsets, count});
 }
 
 void wgpuComputePassEncoderDispatchWorkgroups(WGPUComputePassEncoder p, uint32_t x, uint32_t y, uint32_t z) {
@@ -959,8 +976,7 @@ void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder p, WGPUColor co
 }
 
 void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder p, uint32_t, WGPUBindGroup group, size_t count, uint32_t const *offsets) {
-    std::vector<std::uint32_t> dynamic(offsets, offsets + count);
-    p->encoder->ops.push_back([g = *group, dynamic = std::move(dynamic)] { bind(g, dynamic); });
+    record_bind(p->encoder, group, {offsets, count});
 }
 
 void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder p, uint32_t vertices, uint32_t, uint32_t first, uint32_t) {
