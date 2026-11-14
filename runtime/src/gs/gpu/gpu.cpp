@@ -619,17 +619,24 @@ void decode_collect() {
 bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     decode_collect();
     const auto take_free = [&]() {
+        // Best fit preserves larger contiguous slots for future textures.
+        // Free blocks are ordered by offset, not by size.
+        std::size_t best = g_decode_free.size();
         for (std::size_t i = 0; i < g_decode_free.size(); ++i) {
-            auto &block = g_decode_free[i];
-            if (block.words < words) continue;
-            offset = block.offset;
-            block.offset += words;
-            block.words -= words;
-            if (!block.words) g_decode_free.erase(g_decode_free.begin() + i);
-            g_decode_reclaimed_words += words;
-            return true;
+            const auto available = g_decode_free[i].words;
+            if (available < words) continue;
+            if (best == g_decode_free.size() || available < g_decode_free[best].words)
+                best = i;
+            if (available == words) break;
         }
-        return false;
+        if (best == g_decode_free.size()) return false;
+        auto &block = g_decode_free[best];
+        offset = block.offset;
+        block.offset += words;
+        block.words -= words;
+        if (!block.words) g_decode_free.erase(g_decode_free.begin() + best);
+        g_decode_reclaimed_words += words;
+        return true;
     };
     if (take_free()) return true;
     if (g_decoded_used + words <= kDecodedWords) {
