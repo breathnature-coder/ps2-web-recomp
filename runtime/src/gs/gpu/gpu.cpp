@@ -1397,6 +1397,7 @@ bool flush_native(std::uint32_t prims) {
     // Cache the feedback partition computed during native eligibility checking.
     // A zero entry means the range was not evaluated in the prepass.
     std::vector<std::uint32_t> feedback_ends(prims, 0);
+    std::vector<Outline> run_outlines;  // reused across state runs
     // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
     // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
     // batch to the compute rasterizer costs.
@@ -1411,7 +1412,7 @@ bool flush_native(std::uint32_t prims) {
                 among += j - i;
                 // Build outlines once for the entire state run. The previous
                 // partitioner rebuilt outlines for each new feedback group.
-                std::vector<Outline> run_outlines;
+                run_outlines.clear();
                 run_outlines.reserve(j - i);
                 for (std::uint32_t q = i; q < j; ++q)
                     run_outlines.push_back(outline(b.prims.data() + q * kPrimWords));
