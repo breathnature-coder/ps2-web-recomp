@@ -105,6 +105,9 @@ if(NOT PS2_GPU_RESOLVED STREQUAL "none")
         target_include_directories(ps2runtime PRIVATE "${PS2_WGPU_DIR}/include")
         target_compile_definitions(ps2runtime PUBLIC PS2_GPU_GL)
         if(NINTENDO_SWITCH)
+            # Device A/B testing showed a severe GT4 regression with the decoded cache enabled.
+            # Keep an explicit PS2_DECODE_CACHE=1 override for further profiling.
+            target_compile_definitions(ps2runtime PRIVATE PS2_DECODE_CACHE_DEFAULT_OFF)
             # devkitPro's switch-mesa (Mesa 20.1) by default. PS2_SWITCH_GL=mesa-switch
             # links a newer Mesa port instead (danfromtico/mesa-switch, Mesa 26: nvc0,
             # or Zink on NVK Vulkan), through the CMake package it installs. Its
@@ -147,6 +150,9 @@ endif()
 option(PS2_BUILD_TESTS "Build native synthetic runtime tests (no game data required)" OFF)
 if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     enable_testing()
+    add_executable(decoded_arena_test tests/decoded_arena_test.cpp)
+    target_include_directories(decoded_arena_test PRIVATE runtime/src)
+    add_test(NAME decoded_arena COMMAND decoded_arena_test)
     foreach(name IN ITEMS sif_scratchpad kernel_exit_delete_thread gt3_initialization gt3_state)
         add_executable(${name}_test tests/${name}_test.cpp)
         target_include_directories(${name}_test PRIVATE runtime/src)

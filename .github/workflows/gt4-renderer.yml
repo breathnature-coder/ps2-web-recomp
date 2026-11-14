@@ -1,0 +1,58 @@
+name: GT4 renderer build checks
+
+on:
+  push:
+    branches:
+      - perf/gt4-decode-sync-metrics
+  pull_request:
+  workflow_dispatch:
+
+# Keep only the newest validation run per branch or pull request. Frequent
+# renderer fixes otherwise queue obsolete full builds ahead of the latest one.
+concurrency:
+  group: gt4-renderer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang curl unzip
+      - name: Fetch WebGPU SDK
+        run: sh scripts/fetch_wgpu.sh
+      - name: Configure renderer
+        run: cmake -S . -B build-gpu -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=webgpu
+      - name: Compile renderer and runtime
+        run: cmake --build build-gpu --target ps2runtime -j 2
+
+
+  gl-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and EGL headers
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang curl unzip libegl1-mesa-dev libgl-dev
+      - name: Fetch WebGPU headers
+        run: sh scripts/fetch_wgpu.sh
+      - name: Configure OpenGL renderer
+        run: cmake -S . -B build-gl -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=gl
+      - name: Compile OpenGL renderer and runtime
+        run: cmake --build build-gl --target ps2runtime -j 2
+
+  runtime-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang
+      - name: Configure synthetic tests
+        run: cmake -S . -B build-tests -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=none -DPS2_BUILD_TESTS=ON
+      - name: Build synthetic tests
+        run: cmake --build build-tests -j 2
+      - name: Run synthetic tests
+        run: ctest --test-dir build-tests --output-on-failure
