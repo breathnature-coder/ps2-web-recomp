@@ -2513,7 +2513,8 @@ void profile_submit() {
     wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
+    std::vector<std::uint32_t> measured_commands;
+    measured_commands.reserve(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
         if (c.pipeline == kNative) {
@@ -2522,10 +2523,15 @@ void profile_submit() {
         }
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
         writes.querySet = g_profile_queries;
-        writes.beginningOfPassWriteIndex = i * 2;
-        writes.endOfPassWriteIndex = i * 2 + 1;
+        const bool measure_command = measured_commands.size() < kMax;
+        if (measure_command) {
+            const auto query = static_cast<std::uint32_t>(measured_commands.size());
+            writes.beginningOfPassWriteIndex = query * 2;
+            writes.endOfPassWriteIndex = query * 2 + 1;
+            measured_commands.push_back(i);
+        }
         WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-        if (i < n) cd.timestampWrites = &writes;
+        if (measure_command) cd.timestampWrites = &writes;
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
         wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
         const std::uint32_t offset = c.param * kParamStride;
@@ -2535,6 +2541,7 @@ void profile_submit() {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
+    const auto n = static_cast<std::uint32_t>(measured_commands.size());
     if (n) {
         wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, n * 16);
@@ -2554,11 +2561,12 @@ void profile_submit() {
         wait_until(done);
         const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
         std::size_t info = 0;
-        for (std::uint32_t i = 0; t && i < n; ++i) {
+        for (std::uint32_t query = 0; t && query < n; ++query) {
+            const std::uint32_t i = measured_commands[query];
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
             std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i,
-                         g_commands[i].pipeline == kNative ? "native" : kEntryPoints[g_commands[i].pipeline],
-                         static_cast<unsigned long long>(t[i * 2 + 1] > t[i * 2] ? t[i * 2 + 1] - t[i * 2] : 0), g_commands[i].x, g_commands[i].y);
+                         kEntryPoints[g_commands[i].pipeline],
+                         static_cast<unsigned long long>(t[query * 2 + 1] > t[query * 2] ? t[query * 2 + 1] - t[query * 2] : 0), g_commands[i].x, g_commands[i].y);
             if (info < g_command_info.size() && g_command_info[info].index == i)
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
