@@ -35,7 +35,7 @@ int main() {
                 const bool expected = request != 0 &&
                     static_cast<std::uint64_t>(cursor) + request <= cap;
                 if (decoded_arena_can_append(cursor, request, cap) != expected) {
-                    std::fprintf(stderr, "decoded arena mismatch: used=%u words=%u capacity=%u\\n",
+                    std::fprintf(stderr, "decoded arena mismatch: used=%u words=%u capacity=%u\n",
                                  cursor, request, cap);
                     return 1;
                 }
