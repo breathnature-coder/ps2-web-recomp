@@ -676,7 +676,13 @@ void plan_decodes(std::uint32_t prims) {
     if (!g_decode) return;
     const bool cache = decode_cache_on();
     if (!cache) {
+        // The uncached path resets the append cursor after each submit.
+        // Recycled offsets from the persistent cache must never be mixed
+        // with those transient allocations.
         g_decoded_cache.clear();
+        g_decode_free.clear();
+        g_decode_retired.clear();
+        g_decode_free_dirty = false;
         if (prims <= kDecodePrims) return;
     }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
@@ -728,7 +734,10 @@ void plan_decodes(std::uint32_t prims) {
             }
         }
         std::uint32_t decoded_offset = 0;
-        if (!decode_allocate(words, decoded_offset)) {
+        if (!(cache ? decode_allocate(words, decoded_offset)
+                    : (g_decoded_used + words <= kDecodedWords
+                        ? (decoded_offset = g_decoded_used, g_decoded_used += words, true)
+                        : false))) {
             // Never overwrite a decoded slot while queued native passes (or
             // already submitted GPU work) may still reference its offset.
             // Keep existing cached textures alive; this miss uses the direct
