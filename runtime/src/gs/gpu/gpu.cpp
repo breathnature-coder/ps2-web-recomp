@@ -1443,6 +1443,15 @@ bool flush_native(std::uint32_t prims) {
                     feedback_ends[from] = end;
                     from = end;
                     ++groups;
+                    // Even if every remaining primitive requires feedback,
+                    // the allowed group budget cannot catch up. Fall back
+                    // immediately instead of completing costly SAT grouping.
+                    if (groups > 16u + (among + (prims - j)) / 4u) {
+                        g_why_prims[kWhyCount - 3] += prims;
+                        ++g_why_batches[kWhyCount - 3];
+                        g_refusal_counted = true;
+                        return false;
+                    }
                 }
             }
             i = j;
