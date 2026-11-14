@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
