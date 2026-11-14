@@ -919,6 +919,7 @@ WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
 WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
 WGPUBindGroupLayout g_backdrop_layout = nullptr;
 std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
+std::uint64_t g_feedback_pass_restarts = 0;
 std::uint64_t g_feedback_copy_pixels = 0;
 std::uint64_t g_feedback_group_calls = 0;
 std::uint64_t g_feedback_outline_tests = 0;
@@ -2334,6 +2335,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                     wgpuRenderPassEncoderEnd(rp);
                     wgpuRenderPassEncoderRelease(rp);
                     rp = nullptr;
+                    ++g_feedback_pass_restarts;
                 }
                 WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
                 from.texture = first.color->texture;
@@ -2490,7 +2492,7 @@ void submitted() {
     last_words = g_decode_words;
     last_restarts = g_decode_restarts;
     last_saved_words = g_decode_saved_words;
-    static std::uint64_t last_feedback = 0, last_copies = 0, last_copy_pixels = 0;
+    static std::uint64_t last_feedback = 0, last_copies = 0, last_copy_pixels = 0, last_pass_restarts = 0;
     const std::uint64_t feedback_copies = g_feedback_copies - last_copies;
     const std::uint64_t feedback_pixels = g_feedback_copy_pixels - last_copy_pixels;
     if (g_feedback_draws != last_feedback)
@@ -2501,7 +2503,8 @@ void submitted() {
                      static_cast<double>(feedback_copies) / seconds,
                      static_cast<double>(feedback_pixels) / seconds,
                      static_cast<double>(feedback_pixels) / static_cast<double>(feedback_copies),
-                     static_cast<double>(feedback_copies) / seconds, g_scale);
+                     static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds, g_scale);
+    last_pass_restarts = g_feedback_pass_restarts;
     last_feedback = g_feedback_draws;
     last_copies = g_feedback_copies;
     last_copy_pixels = g_feedback_copy_pixels;
