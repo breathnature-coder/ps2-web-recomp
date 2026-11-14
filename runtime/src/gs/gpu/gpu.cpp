@@ -2322,6 +2322,7 @@ void submitted() {
     static std::uint64_t last_invalidated = 0, last_cold = 0, last_small = 0;
     static std::uint64_t last_admission_skips = 0, last_admission_texels = 0;
     static std::uint64_t last_capacity_bypasses = 0, last_capacity_texels = 0;
+    static std::uint64_t last_decode_evictions = 0, last_decode_reclaimed = 0;
     const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
     if (hits + misses) {
         const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
@@ -2348,6 +2349,12 @@ void submitted() {
                  static_cast<double>(g_decode_capacity_texels - last_capacity_texels) / seconds,
                  static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
                  static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %zu pending blocks, %zu free spans\\n",
+                 static_cast<double>(g_decode_evictions - last_decode_evictions) / seconds,
+                 static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
+                 g_decode_retired.size(), g_decode_free.size());
+    last_decode_evictions = g_decode_evictions;
+    last_decode_reclaimed = g_decode_reclaimed_words;
     last_capacity_bypasses = g_decode_capacity_bypasses;
     last_capacity_texels = g_decode_capacity_texels;
     last_admission_skips = g_decode_admission_skips;
@@ -2569,6 +2576,19 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
+    // The queue completion callback gates reuse of decoded texture slots.
+    // The serial belongs to the commands just submitted, before submitted()
+    // advances g_serial. A failed callback never authorizes reclamation.
+    auto *completed_serial = new std::uint64_t(g_serial);
+    WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
+    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *userdata, void *) {
+        std::unique_ptr<std::uint64_t> serial(static_cast<std::uint64_t *>(userdata));
+        if (status == WGPUQueueWorkDoneStatus_Success)
+            g_decode_completed_serial = std::max(g_decode_completed_serial, *serial);
+    };
+    decode_done.userdata1 = completed_serial;
+    wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (measure) {
@@ -2851,6 +2871,8 @@ bool init(Mode m) {
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
     g_decoded_cache.clear();
+    g_decode_free.clear();
+    g_decode_retired.clear();
     g_decoded_used = 0;
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
@@ -3416,6 +3438,8 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
     wrote(Range{0, kMemorySize});
     g_decoded_cache.clear();
+    g_decode_free.clear();
+    g_decode_retired.clear();
     g_decoded_used = 0;
     g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
     if (from == to && vram.size() == words * to) {
