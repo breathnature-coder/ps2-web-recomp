@@ -952,6 +952,11 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     out.alpha_factor = false;
     out.feedback = true;
     out.draws = !(zte && ztst == 0);
+    // ATST=NEVER cannot write anything with AFAIL=KEEP. AFAIL=ZB_ONLY
+    // is also a no-op when depth writes are disabled. Do not schedule
+    // feedback copies or render-pass restarts for these draws.
+    if ((flags & 64u) && atst == 0 && (afail == 0 || (afail == 2 && !write_z)))
+        out.draws = false;
     out.key = (has_depth ? 1u : 0u) | ((zte ? ztst : 1u) << 1) | (write_z ? 8u : 0u) | (0xFu << 4) | (has_depth && zte && exact ? 1u << 16 : 0u) | (1u << 17);
     return true;
 }
