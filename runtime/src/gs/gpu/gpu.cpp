@@ -1021,7 +1021,7 @@ WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
 WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
 WGPUBindGroupLayout g_backdrop_layout = nullptr;
 std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
-std::uint64_t g_feedback_pass_restarts = 0;
+std::uint64_t g_feedback_pass_restarts = 0, g_feedback_copies_merged = 0;
 std::uint64_t g_feedback_copy_pixels = 0;
 std::uint64_t g_feedback_group_calls = 0;
 std::uint64_t g_feedback_outline_tests = 0;
@@ -1704,8 +1704,6 @@ bool flush_native(std::uint32_t prims) {
                         // scissor. Use it for rasterization as well as copy.
                         pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
                                               cy1 - cy0, 0.0f, true});
-                        ++g_feedback_copies;
-                        g_feedback_copy_pixels += static_cast<std::uint64_t>(cx1 - cx0) * (cy1 - cy0);
                         g_feedback_draws += to - from;
                     }
                     from = to;
@@ -2409,6 +2407,24 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
+// A shared snapshot is valid until a draw touches a later group's copy
+// rectangle. Keep the search bounded and avoid copying large gaps.
+bool extend_feedback_copy(NativeDraw &copy, const NativeDraw &next, std::uint64_t &pixels) {
+    const auto right = copy.x + copy.w, bottom = copy.y + copy.h;
+    const auto next_right = next.x + next.w, next_bottom = next.y + next.h;
+    if (copy.x < next_right && next.x < right && copy.y < next_bottom && next.y < bottom) return false;
+    const auto x = std::min(copy.x, next.x), y = std::min(copy.y, next.y);
+    const auto width = std::max(right, next_right) - x, height = std::max(bottom, next_bottom) - y;
+    const auto combined = pixels + static_cast<std::uint64_t>(next.w) * next.h;
+    if (static_cast<std::uint64_t>(width) * height > combined + combined / 4) return false;
+    copy.x = x;
+    copy.y = y;
+    copy.w = width;
+    copy.h = height;
+    pixels = combined;
+    return true;
+}
+
 // The render passes of the native renderer from command i on; successive ones on the same targets share a pass.
 // Returns the last command taken.
 std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
@@ -2435,13 +2451,31 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
     bool backdrop_bound = false;
     for (;;) {
-        for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
+        const auto &draws = g_native_passes[g_commands[i].x].draws;
+        std::size_t snapshot_end = 0;
+        for (std::size_t draw = 0; draw < draws.size(); ++draw) {
+            const auto &d = draws[draw];
             if (!d.pipeline) {
+                if (draw < snapshot_end) {
+                    ++g_feedback_copies_merged;
+                    continue;
+                }
+                NativeDraw copy = d;
+                auto pixels = static_cast<std::uint64_t>(copy.w) * copy.h;
+                snapshot_end = draw + 2;
+                // Each copy command is immediately followed by its draw,
+                // which is clipped to exactly the copied rectangle.
+                while (snapshot_end < draws.size() && snapshot_end - draw < 16 &&
+                       !draws[snapshot_end].pipeline && extend_feedback_copy(copy, draws[snapshot_end], pixels)) {
+                    snapshot_end += 2;
+                }
+                ++g_feedback_copies;
+                g_feedback_copy_pixels += static_cast<std::uint64_t>(copy.w) * copy.h;
 #ifdef PS2_GPU_GL
                 // GL copies into a separate texture without rebinding the
                 // framebuffer or resetting state used by the next draw.
                 if (rp && ps2GlCopyFeedbackInPass(enc, first.color->texture, first.color->backdrop,
-                                                  d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale)) continue;
+                                                  copy.x * g_scale, copy.y * g_scale, copy.w * g_scale, copy.h * g_scale)) continue;
 #endif
                 // WebGPU copies must run between render passes.
                 if (rp) {
@@ -2453,8 +2487,8 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
                 from.texture = first.color->texture;
                 to.texture = first.color->backdrop;
-                from.origin = to.origin = WGPUOrigin3D{d.x * g_scale, d.y * g_scale, 0};
-                const WGPUExtent3D size{d.w * g_scale, d.h * g_scale, 1};
+                from.origin = to.origin = WGPUOrigin3D{copy.x * g_scale, copy.y * g_scale, 0};
+                const WGPUExtent3D size{copy.w * g_scale, copy.h * g_scale, 1};
                 wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
                 current = nullptr;
                 constant = 0.0f;
@@ -2623,17 +2657,20 @@ void submitted() {
     last_restarts = g_decode_restarts;
     last_saved_words = g_decode_saved_words;
     static std::uint64_t last_feedback = 0, last_copies = 0, last_copy_pixels = 0, last_pass_restarts = 0;
+    static std::uint64_t last_merged = 0;
     const std::uint64_t feedback_copies = g_feedback_copies - last_copies;
     const std::uint64_t feedback_pixels = g_feedback_copy_pixels - last_copy_pixels;
     if (g_feedback_draws != last_feedback)
-        std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
+        std::fprintf(stderr, "[native] reading the target: %.0f prims a second across %.0f copies\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
                      static_cast<double>(feedback_copies) / seconds);
     if (feedback_copies)
-        std::fprintf(stderr, "[native] feedback copies: %.0f/s, %.0f source pixels/s, %.0f pixels/copy, %.0f render pass restarts/s (scale %u)\n",
+        std::fprintf(stderr, "[native] feedback copies: %.0f/s, %.0f source pixels/s, %.0f pixels/copy, %.0f render pass restarts/s, %.0f copies merged/s (scale %u)\n",
                      static_cast<double>(feedback_copies) / seconds,
                      static_cast<double>(feedback_pixels) / seconds,
                      static_cast<double>(feedback_pixels) / static_cast<double>(feedback_copies),
-                     static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds, g_scale);
+                     static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds,
+                     static_cast<double>(g_feedback_copies_merged - last_merged) / seconds, g_scale);
+    last_merged = g_feedback_copies_merged;
     last_pass_restarts = g_feedback_pass_restarts;
     last_feedback = g_feedback_draws;
     last_copies = g_feedback_copies;
