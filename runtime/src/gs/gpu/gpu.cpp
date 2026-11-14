@@ -582,7 +582,7 @@ struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; }
 std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
 std::uint64_t g_decode_completed_serial = 0;
-std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0;
+std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0, g_decode_tail_words = 0;
 void decode_retire(const Decoded &d) {
     // Keep pending blocks ordered by the GPU serial that protects them.
     // Collection only visits blocks that can actually be recycled.
@@ -621,6 +621,7 @@ void decode_collect() {
     while (!g_decode_free.empty()) {
         const DecodeBlock &tail = g_decode_free.back();
         if (tail.offset + tail.words != g_decoded_used) break;
+        g_decode_tail_words += tail.words;
         g_decoded_used = tail.offset;
         g_decode_free.pop_back();
     }
@@ -2464,7 +2465,7 @@ void submitted() {
     static std::uint64_t last_invalidated = 0, last_cold = 0, last_small = 0;
     static std::uint64_t last_admission_skips = 0, last_admission_texels = 0;
     static std::uint64_t last_capacity_bypasses = 0, last_capacity_texels = 0;
-    static std::uint64_t last_decode_evictions = 0, last_decode_reclaimed = 0;
+    static std::uint64_t last_decode_evictions = 0, last_decode_reclaimed = 0, last_decode_tail = 0;
     const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
     if (hits + misses) {
         const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
@@ -2491,12 +2492,14 @@ void submitted() {
                  static_cast<double>(g_decode_capacity_texels - last_capacity_texels) / seconds,
                  static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
                  static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
-    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %zu pending blocks, %zu free spans\n",
+    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %.0f texels/s returned to tail, %zu pending blocks, %zu free spans\n",
                  static_cast<double>(g_decode_evictions - last_decode_evictions) / seconds,
                  static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
+                 static_cast<double>(g_decode_tail_words - last_decode_tail) / seconds,
                  g_decode_retired.size(), g_decode_free.size());
     last_decode_evictions = g_decode_evictions;
     last_decode_reclaimed = g_decode_reclaimed_words;
+    last_decode_tail = g_decode_tail_words;
     last_capacity_bypasses = g_decode_capacity_bypasses;
     last_capacity_texels = g_decode_capacity_texels;
     last_admission_skips = g_decode_admission_skips;
