@@ -1361,6 +1361,9 @@ bool outlines_meet(const Outline &a, const Outline &b) {
     // pixel, so avoid expensive separating-axis tests for distant primitives.
     if (a.max_x <= b.min_x || b.max_x <= a.min_x ||
         a.max_y <= b.min_y || b.max_y <= a.min_y) return false;
+    // Sprites are axis-aligned rectangles: their AABBs are their exact
+    // geometry, so no separating-axis projections are needed for this pair.
+    if (a.corners == 4 && b.corners == 4) return true;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
         for (int i = 0; i < p.corners; ++i) {
