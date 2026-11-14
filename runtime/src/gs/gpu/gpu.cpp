@@ -2726,6 +2726,9 @@ void submitted() {
 }
 
 void track_decode_completion(std::uint64_t serial) {
+    // Only persistent entries can be reclaimed by GPU completion serial.
+    // Transient decodes reuse their offsets in queue order.
+    if (!g_decode || !decode_cache_on()) return;
     auto *completed_serial = new std::uint64_t(serial);
     WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
