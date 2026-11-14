@@ -515,7 +515,10 @@ bool texture_written_since(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm
     const std::uint64_t row_pages = std::max<std::uint32_t>(1, bw * 64 / pw);
     const std::uint64_t width_pages = ((1ull << tw) + pw - 1) / pw;
     const std::uint64_t height_pages = ((1ull << th) + ph - 1) / ph;
-    if (width_pages >= row_pages) return written_since(bounds, when);
+    // GS base pointers are 256-byte aligned, not necessarily 8 KiB aligned.
+    // An unaligned GS page straddles two tracked physical pages.
+    if (width_pages >= row_pages || ((static_cast<std::uint64_t>(bp) * 256) & 8191ull))
+        return written_since(bounds, when);
     const std::uint64_t base_page = (static_cast<std::uint64_t>(bp) * 256) >> 13;
     for (std::uint64_t y = 0; y < height_pages; ++y) {
         const std::uint64_t row = base_page + y * row_pages;
@@ -577,6 +580,7 @@ struct Decoded {
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
 std::vector<DecodeBlock> g_decode_retired, g_decode_free;
+bool g_decode_free_dirty = false;
 std::uint64_t g_decode_completed_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0;
 void decode_retire(const Decoded &d) {
@@ -586,10 +590,12 @@ void decode_collect() {
     for (std::size_t i = 0; i < g_decode_retired.size();) {
         if (g_decode_retired[i].retire_serial > g_decode_completed_serial) { ++i; continue; }
         g_decode_free.push_back(g_decode_retired[i]);
+        g_decode_free_dirty = true;
         g_decode_retired[i] = g_decode_retired.back();
         g_decode_retired.pop_back();
     }
-    if (g_decode_free.empty()) return;
+    if (g_decode_free.empty() || !g_decode_free_dirty) return;
+    g_decode_free_dirty = false;
     std::sort(g_decode_free.begin(), g_decode_free.end(),
               [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
     std::size_t out = 0;
@@ -2873,6 +2879,7 @@ bool init(Mode m) {
     g_decoded_cache.clear();
     g_decode_free.clear();
     g_decode_retired.clear();
+    g_decode_free_dirty = false;
     g_decoded_used = 0;
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
     g_cache_copy.assign(kCacheWords, 0);
@@ -3440,6 +3447,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     g_decoded_cache.clear();
     g_decode_free.clear();
     g_decode_retired.clear();
+    g_decode_free_dirty = false;
     g_decoded_used = 0;
     g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
     if (from == to && vram.size() == words * to) {
