@@ -710,7 +710,15 @@ bool decode_admission_on() {
 }
 
 bool decode_cache_on() {
-    static const bool on = !std::getenv("PS2_DECODE_CACHE") || std::atoi(std::getenv("PS2_DECODE_CACHE")) != 0;
+    // Switch defaults to the uncached path until the GT4 cache regression is resolved.
+    // An explicit PS2_DECODE_CACHE=1 still enables the cache for A/B testing.
+#ifdef PS2_DECODE_CACHE_DEFAULT_OFF
+    constexpr bool default_on = false;
+#else
+    constexpr bool default_on = true;
+#endif
+    const char *env = std::getenv("PS2_DECODE_CACHE");
+    static const bool on = env ? std::atoi(env) != 0 : default_on;
     return on;
 }
 
