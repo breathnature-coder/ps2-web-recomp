@@ -711,7 +711,9 @@ std::uint64_t g_decode_capacity_bypasses = 0, g_decode_capacity_texels = 0;
 // Optional cache-key churn diagnostics. Disabled in normal gameplay to avoid
 // extra hash lookups on every texture setup.
 std::unordered_map<DecodeKey, std::uint64_t, DecodeKeyHash> g_decode_key_probe;
+std::unordered_set<DecodeKey, DecodeKeyHash> g_decode_key_history;
 std::uint64_t g_decode_clut_churn = 0, g_decode_key_first_seen = 0;
+std::uint64_t g_decode_repeat_absent = 0, g_decode_first_absent = 0;
 bool decode_key_diagnostics_on() {
     static const bool enabled = std::getenv("PS2_DECODE_KEY_DIAG") &&
                                 std::atoi(std::getenv("PS2_DECODE_KEY_DIAG")) != 0;
@@ -790,6 +792,12 @@ void plan_decodes(std::uint32_t prims) {
         } else {
             ++g_decode_cold;
             if (cache && decode_key_diagnostics_on()) {
+                // A repeated exact key that is no longer resident indicates
+                // capacity churn, admission bypass, or prior invalidation;
+                // it must not be mislabeled as a CLUT identity change.
+                if (g_decode_key_history.size() >= 16384u) g_decode_key_history.clear();
+                if (g_decode_key_history.insert(key).second) ++g_decode_first_absent;
+                else ++g_decode_repeat_absent;
                 // Probe by texture setup with CLUT identity stripped. If this
                 // signature repeats with another CLUT hash, the texture is
                 // missing because the palette identity changed.
@@ -2542,6 +2550,12 @@ void submitted() {
     }
     if (decode_key_diagnostics_on()) {
         static std::uint64_t last_churn = 0, last_first_seen = 0;
+        static std::uint64_t last_repeat = 0, last_first = 0;
+        std::fprintf(stderr, "[native] decode absent diagnostics: %.0f recurring exact keys/s, %.0f first-seen exact keys/s\n",
+                     static_cast<double>(g_decode_repeat_absent - last_repeat) / seconds,
+                     static_cast<double>(g_decode_first_absent - last_first) / seconds);
+        last_repeat = g_decode_repeat_absent;
+        last_first = g_decode_first_absent;
         std::fprintf(stderr, "[native] decode key diagnostics: %.0f CLUT-key changes/s, %.0f new texture signatures/s, %zu tracked signatures\n",
                      static_cast<double>(g_decode_clut_churn - last_churn) / seconds,
                      static_cast<double>(g_decode_key_first_seen - last_first_seen) / seconds,
