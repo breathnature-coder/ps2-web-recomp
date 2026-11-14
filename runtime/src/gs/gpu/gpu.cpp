@@ -2546,8 +2546,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-    cd.timestampWrites = nullptr;  // a submit with native passes in it has several compute passes: the first is the one timed
+    // Native-only submissions should not create an empty compute pass.
+    // Timestamp queries are attached to the first actual compute pass.
+    WGPUComputePassEncoder pass = nullptr;
+    bool first_compute_pass = true;
     Pipeline current = kPipelines;
     ++g_submits;
     ++g_total_passes;
@@ -2564,6 +2566,10 @@ void submit(WGPUTextureView present_view = nullptr) {
         }
         if (!pass) {
             pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            if (first_compute_pass) {
+                cd.timestampWrites = nullptr;
+                first_compute_pass = false;
+            }
             current = kPipelines;
         }
         ++g_dispatches[c.pipeline];
@@ -2580,7 +2586,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    if (measure) {
+    if (measure && !first_compute_pass) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
     }
@@ -2621,7 +2627,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
-    if (measure) {
+    if (measure && !first_compute_pass) {
         g_query_pending = true;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
