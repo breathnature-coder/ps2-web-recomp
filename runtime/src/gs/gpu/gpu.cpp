@@ -700,6 +700,15 @@ std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded aga
 std::uint64_t g_decode_invalidated = 0, g_decode_cold = 0, g_decode_small = 0;
 std::uint64_t g_decode_admission_skips = 0, g_decode_admission_texels = 0;
 std::uint64_t g_decode_capacity_bypasses = 0, g_decode_capacity_texels = 0;
+// Optional cache-key churn diagnostics. Disabled in normal gameplay to avoid
+// extra hash lookups on every texture setup.
+std::unordered_map<DecodeKey, std::uint64_t, DecodeKeyHash> g_decode_key_probe;
+std::uint64_t g_decode_clut_churn = 0, g_decode_key_first_seen = 0;
+bool decode_key_diagnostics_on() {
+    static const bool enabled = std::getenv("PS2_DECODE_KEY_DIAG") &&
+                                std::atoi(std::getenv("PS2_DECODE_KEY_DIAG")) != 0;
+    return enabled;
+}
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
@@ -764,6 +773,22 @@ void plan_decodes(std::uint32_t prims) {
             g_decoded_cache.erase(found);
         } else {
             ++g_decode_cold;
+            if (cache && decode_key_diagnostics_on()) {
+                // Probe by texture setup with CLUT identity stripped. If this
+                // signature repeats with another CLUT hash, the texture is
+                // missing because the palette identity changed.
+                DecodeKey base = key;
+                base.clut = 0;
+                const auto probe = g_decode_key_probe.find(base);
+                if (probe == g_decode_key_probe.end()) {
+                    ++g_decode_key_first_seen;
+                    if (g_decode_key_probe.size() >= 8192u) g_decode_key_probe.clear();
+                    g_decode_key_probe.emplace(base, key.clut);
+                } else if (probe->second != key.clut) {
+                    ++g_decode_clut_churn;
+                    probe->second = key.clut;
+                }
+            }
         }
         // Decoding costs a dispatch and every texel: for a few primitives reading GS memory directly is cheaper.
         if (prims <= kDecodePrims) {
@@ -2498,6 +2523,15 @@ void submitted() {
                      static_cast<double>(g_decode_invalidated - last_invalidated) / seconds,
                      static_cast<double>(g_decode_cold - last_cold) / seconds,
                      static_cast<double>(g_decode_small - last_small) / seconds);
+    }
+    if (decode_key_diagnostics_on()) {
+        static std::uint64_t last_churn = 0, last_first_seen = 0;
+        std::fprintf(stderr, "[native] decode key diagnostics: %.0f CLUT-key changes/s, %.0f new texture signatures/s, %zu tracked signatures\n",
+                     static_cast<double>(g_decode_clut_churn - last_churn) / seconds,
+                     static_cast<double>(g_decode_key_first_seen - last_first_seen) / seconds,
+                     g_decode_key_probe.size());
+        last_churn = g_decode_clut_churn;
+        last_first_seen = g_decode_key_first_seen;
     }
     last_invalidated = g_decode_invalidated;
     last_cold = g_decode_cold;
