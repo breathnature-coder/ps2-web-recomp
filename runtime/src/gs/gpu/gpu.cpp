@@ -503,6 +503,28 @@ bool written_since(const Range &r, std::uint64_t when) {
     return false;
 }
 
+// Texture rectangles may cover only a few pages per GS row. The bounding
+// Range includes untouched pages between those rows, causing false cache
+// invalidations. Check only the texture's pages when rows do not wrap.
+// For unusual widths, retain the conservative contiguous-range check.
+bool texture_written_since(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm,
+                           std::uint32_t tw, std::uint32_t th,
+                           const Range &bounds, std::uint64_t when) {
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    const std::uint64_t row_pages = std::max<std::uint32_t>(1, bw * 64 / pw);
+    const std::uint64_t width_pages = ((1ull << tw) + pw - 1) / pw;
+    const std::uint64_t height_pages = ((1ull << th) + ph - 1) / ph;
+    if (width_pages >= row_pages) return written_since(bounds, when);
+    const std::uint64_t base_page = (static_cast<std::uint64_t>(bp) * 256) >> 13;
+    for (std::uint64_t y = 0; y < height_pages; ++y) {
+        const std::uint64_t row = base_page + y * row_pages;
+        for (std::uint64_t x = 0; x < width_pages; ++x)
+            if (g_page_written[(row + x) & 511u] >= when) return true;
+    }
+    return false;
+}
+
 void mark_rendered(const Range &r) {
     for (std::uint64_t at = r.lo; at < r.hi; at += 8192) g_rendered[(at >> 13) & 511u] = true;
     wrote(r);
@@ -586,7 +608,7 @@ void plan_decodes(std::uint32_t prims) {
         const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
         const auto found = g_decoded_cache.find(key);
         if (found != g_decoded_cache.end()) {
-            if (!written_since(texels, found->second.when)) {
+            if (!texture_written_since(w[12], w[13], w[14], tw, th, texels, found->second.when)) {
                 w[24] = found->second.offset;
                 ++g_decode_hits;
                 g_decode_saved_words += 1ull << (tw + th);
