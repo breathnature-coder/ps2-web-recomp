@@ -579,20 +579,22 @@ struct Decoded {
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
-std::vector<DecodeBlock> g_decode_retired, g_decode_free;
+std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
+std::vector<DecodeBlock> g_decode_free;
 bool g_decode_free_dirty = false;
 std::uint64_t g_decode_completed_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0;
 void decode_retire(const Decoded &d) {
-    g_decode_retired.push_back({d.offset, d.words, d.last_use_serial});
+    // Keep pending blocks ordered by the GPU serial that protects them.
+    // Collection only visits blocks that can actually be recycled.
+    g_decode_retired.emplace(d.last_use_serial, DecodeBlock{d.offset, d.words, d.last_use_serial});
 }
 void decode_collect() {
-    for (std::size_t i = 0; i < g_decode_retired.size();) {
-        if (g_decode_retired[i].retire_serial > g_decode_completed_serial) { ++i; continue; }
-        g_decode_free.push_back(g_decode_retired[i]);
+    while (!g_decode_retired.empty() &&
+           g_decode_retired.begin()->first <= g_decode_completed_serial) {
+        g_decode_free.push_back(g_decode_retired.begin()->second);
         g_decode_free_dirty = true;
-        g_decode_retired[i] = g_decode_retired.back();
-        g_decode_retired.pop_back();
+        g_decode_retired.erase(g_decode_retired.begin());
     }
     if (g_decode_free.empty() || !g_decode_free_dirty) return;
     g_decode_free_dirty = false;
