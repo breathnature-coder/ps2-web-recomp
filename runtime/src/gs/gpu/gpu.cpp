@@ -1499,6 +1499,8 @@ bool flush_native(std::uint32_t prims) {
         if (native_debug()) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
         if (native_debug()) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
         if (state.draws && x0 < x1 && y0 < y1) {
+            // One state run uses the same pipeline for every feedback group.
+            const WGPURenderPipeline pipeline = native_pipeline(state.key);
             std::array<std::uint32_t, kParamStride / 4> record{};
             std::memcpy(record.data(), w, kSetupWords * 4);
             record[0] = state.flags;
@@ -1509,7 +1511,7 @@ bool flush_native(std::uint32_t prims) {
             record[36] = state.premultiply;
             if (!state.feedback) {
                 g_param_records.push_back(record);
-                pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
+                pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
                                       y1 - y0, state.constant});
             } else {
                 // The draw's primitives go in groups of which no two can cover the same pixel: each group reads the
@@ -1555,7 +1557,7 @@ bool flush_native(std::uint32_t prims) {
                         // The feedback group's bounding box already encloses every
                         // primitive in this draw and is clipped to the setup
                         // scissor. Use it for rasterization as well as copy.
-                        pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
+                        pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
                                               cy1 - cy0, 0.0f, true});
                         ++g_feedback_copies;
                         g_feedback_copy_pixels += static_cast<std::uint64_t>(cx1 - cx0) * (cy1 - cy0);
