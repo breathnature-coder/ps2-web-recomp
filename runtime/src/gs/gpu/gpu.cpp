@@ -1443,6 +1443,7 @@ bool flush_native(std::uint32_t prims) {
     static std::vector<std::uint32_t> feedback_ends;
     feedback_ends.assign(prims, 0);
     static std::vector<Outline> run_outlines;  // reused across batches and state runs
+    std::uint32_t planned_feedback_groups = 0;
     // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
     // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
     // batch to the compute rasterizer costs.
@@ -1466,6 +1467,7 @@ bool flush_native(std::uint32_t prims) {
                     feedback_ends[from] = end;
                     from = end;
                     ++groups;
+                    ++planned_feedback_groups;
                     // Even if every remaining primitive requires feedback,
                     // the allowed group budget cannot catch up. Fall back
                     // immediately instead of completing costly SAT grouping.
@@ -1523,6 +1525,10 @@ bool flush_native(std::uint32_t prims) {
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     NativePass pass{color, depth, {}};
+    // Feedback groups emit one copy command and one draw each. Reserve
+    // those slots once, with room for at most one non-feedback draw per
+    // primitive, instead of growing the command vector in the hot loop.
+    pass.draws.reserve(static_cast<std::size_t>(prims) + 2ull * planned_feedback_groups);
     if (native_debug()) std::fprintf(stderr, "[batch] %llu: %u prims, fbp %X zbp %X\n", static_cast<unsigned long long>(g_native_batches), prims, b.fbp, b.zbp);
     for (std::uint32_t i = 0; i < prims;) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
