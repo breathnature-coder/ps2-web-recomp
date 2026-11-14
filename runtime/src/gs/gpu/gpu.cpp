@@ -1295,6 +1295,7 @@ void plan_decodes(std::uint32_t prims);
 // A primitive's outline, for telling whether two of a feedback draw can cover the same pixel.
 struct Outline {
     float x[4], y[4];
+    float min_x, max_x, min_y, max_y;
     int corners;
 };
 
@@ -1313,12 +1314,24 @@ Outline outline(const std::uint32_t *rec) {
         }
         o.corners = 3;
     }
+    o.min_x = o.max_x = o.x[0];
+    o.min_y = o.max_y = o.y[0];
+    for (int i = 1; i < o.corners; ++i) {
+        o.min_x = std::min(o.min_x, o.x[i]);
+        o.max_x = std::max(o.max_x, o.x[i]);
+        o.min_y = std::min(o.min_y, o.y[i]);
+        o.max_y = std::max(o.max_y, o.y[i]);
+    }
     return o;
 }
 
 // Whether the insides of two convex outlines meet (touching along an edge is not meeting: the fill rule gives a
 // pixel on a shared edge to one of them). A separating axis is along some edge of one of the two.
 bool outlines_meet(const Outline &a, const Outline &b) {
+    // AABB is a conservative broad phase: disjoint boxes cannot share a
+    // pixel, so avoid expensive separating-axis tests for distant primitives.
+    if (a.max_x <= b.min_x || b.max_x <= a.min_x ||
+        a.max_y <= b.min_y || b.max_y <= a.min_y) return false;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
         for (int i = 0; i < p.corners; ++i) {
