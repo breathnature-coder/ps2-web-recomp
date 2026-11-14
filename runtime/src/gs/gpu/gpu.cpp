@@ -580,6 +580,7 @@ std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_deco
 std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded again
 std::uint64_t g_decode_invalidated = 0, g_decode_cold = 0, g_decode_small = 0;
 std::uint64_t g_decode_admission_skips = 0, g_decode_admission_texels = 0;
+std::uint64_t g_decode_capacity_bypasses = 0, g_decode_capacity_texels = 0;
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
@@ -604,7 +605,6 @@ void plan_decodes(std::uint32_t prims) {
         if (prims <= kDecodePrims) return;
     }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    bool restarted = false;
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
         if (!(w[0] & 2u)) continue;
@@ -651,17 +651,13 @@ void plan_decodes(std::uint32_t prims) {
             }
         }
         if (g_decoded_used + words > kDecodedWords) {
-            // Full: start over, and over this batch too, whose textures found so far may be where new ones go.
-            g_decoded_cache.clear();
-            g_decoded_used = 0;
-            ++g_decode_restarts;
-            if (!restarted && i > 0) {
-                restarted = true;
-                g_decodes.clear();
-                for (std::uint32_t k = 0; k < setups; ++k) b.setups[k * kSetupWords + 24] = 0xFFFFFFFFu;
-                i = ~0u;  // the loop's ++ makes it 0
-                continue;
-            }
+            // Never overwrite a decoded slot while queued native passes (or
+            // already submitted GPU work) may still reference its offset.
+            // Keep existing cached textures alive; this miss uses the direct
+            // GS-memory sampler until a synchronized reclamation is possible.
+            ++g_decode_capacity_bypasses;
+            g_decode_capacity_texels += words;
+            continue;
         }
         w[24] = g_decoded_used;
         g_decodes.push_back({i, g_decoded_used, words});
