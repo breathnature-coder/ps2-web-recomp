@@ -799,7 +799,10 @@ void plan_decodes(std::uint32_t prims) {
         }
         w[24] = decoded_offset;
         g_decodes.push_back({i, decoded_offset, words});
-        g_decoded_cache[key] = {decoded_offset, g_write_clock + 1, words, g_serial};
+        // Uncached Switch builds must not populate the persistent hash table:
+        // it is discarded at the start of the next batch and can never yield
+        // a cross-batch hit. Avoid per-texture hashing and allocations.
+        if (cache) g_decoded_cache[key] = {decoded_offset, g_write_clock + 1, words, g_serial};
         ++g_decode_misses;
         g_decode_words += words;
     }
