@@ -571,8 +571,73 @@ struct DecodeKeyHash {
 struct Decoded {
     std::uint32_t offset;
     std::uint64_t when;  // the write clock when it was queued
+    std::uint32_t words;
+    std::uint64_t last_use_serial;
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
+struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
+std::vector<DecodeBlock> g_decode_retired, g_decode_free;
+std::uint64_t g_decode_completed_serial = 0;
+std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0;
+void decode_retire(const Decoded &d) {
+    g_decode_retired.push_back({d.offset, d.words, d.last_use_serial});
+}
+void decode_collect() {
+    for (std::size_t i = 0; i < g_decode_retired.size();) {
+        if (g_decode_retired[i].retire_serial > g_decode_completed_serial) { ++i; continue; }
+        g_decode_free.push_back(g_decode_retired[i]);
+        g_decode_retired[i] = g_decode_retired.back();
+        g_decode_retired.pop_back();
+    }
+    if (g_decode_free.empty()) return;
+    std::sort(g_decode_free.begin(), g_decode_free.end(),
+              [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
+    std::size_t out = 0;
+    for (const DecodeBlock &block : g_decode_free) {
+        if (out && g_decode_free[out - 1].offset + g_decode_free[out - 1].words == block.offset)
+            g_decode_free[out - 1].words += block.words;
+        else g_decode_free[out++] = block;
+    }
+    g_decode_free.resize(out);
+}
+bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
+    decode_collect();
+    const auto take_free = [&]() {
+        for (std::size_t i = 0; i < g_decode_free.size(); ++i) {
+            auto &block = g_decode_free[i];
+            if (block.words < words) continue;
+            offset = block.offset;
+            block.offset += words;
+            block.words -= words;
+            if (!block.words) g_decode_free.erase(g_decode_free.begin() + i);
+            g_decode_reclaimed_words += words;
+            return true;
+        }
+        return false;
+    };
+    if (take_free()) return true;
+    if (g_decoded_used + words <= kDecodedWords) {
+        offset = g_decoded_used;
+        g_decoded_used += words;
+        return true;
+    }
+    // Never evict data referenced by an uncompleted GPU submission.
+    while (true) {
+        auto victim = g_decoded_cache.end();
+        for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
+            if (it->second.last_use_serial <= g_decode_completed_serial &&
+                (victim == g_decoded_cache.end() ||
+                 it->second.last_use_serial < victim->second.last_use_serial))
+                victim = it;
+        if (victim == g_decoded_cache.end()) return false;
+        decode_retire(victim->second);
+        g_decoded_cache.erase(victim);
+        ++g_decode_evictions;
+        decode_collect();
+        if (take_free()) return true;
+    }
+}
+
 // Admission history is independent of the decoded buffer: a full buffer reset
 // must not erase evidence that a texture is used repeatedly.
 std::unordered_map<DecodeKey, std::uint8_t, DecodeKeyHash> g_decode_seen;
@@ -620,11 +685,13 @@ void plan_decodes(std::uint32_t prims) {
         if (found != g_decoded_cache.end()) {
             if (!texture_written_since(w[12], w[13], w[14], tw, th, texels, found->second.when)) {
                 w[24] = found->second.offset;
+                found->second.last_use_serial = g_serial;
                 ++g_decode_hits;
                 g_decode_saved_words += 1ull << (tw + th);
                 continue;
             }
             ++g_decode_invalidated;
+            decode_retire(found->second);
             g_decoded_cache.erase(found);
         } else {
             ++g_decode_cold;
@@ -650,7 +717,8 @@ void plan_decodes(std::uint32_t prims) {
                 continue;
             }
         }
-        if (g_decoded_used + words > kDecodedWords) {
+        std::uint32_t decoded_offset = 0;
+        if (!decode_allocate(words, decoded_offset)) {
             // Never overwrite a decoded slot while queued native passes (or
             // already submitted GPU work) may still reference its offset.
             // Keep existing cached textures alive; this miss uses the direct
@@ -659,10 +727,9 @@ void plan_decodes(std::uint32_t prims) {
             g_decode_capacity_texels += words;
             continue;
         }
-        w[24] = g_decoded_used;
-        g_decodes.push_back({i, g_decoded_used, words});
-        g_decoded_cache[key] = {g_decoded_used, g_write_clock + 1};
-        g_decoded_used += words;
+        w[24] = decoded_offset;
+        g_decodes.push_back({i, decoded_offset, words});
+        g_decoded_cache[key] = {decoded_offset, g_write_clock + 1, words, g_serial};
         ++g_decode_misses;
         g_decode_words += words;
     }
