@@ -748,7 +748,9 @@ void plan_decodes(std::uint32_t prims) {
         if (g_scale > 1 && rendered(texels)) continue;
         const bool palette = palette_psm(w[14]);
         const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
-        const auto found = g_decoded_cache.find(key);
+        // The transient (uncached) path cannot hit a persistent entry.
+        // Avoid hashing the key and probing an empty map on every setup.
+        const auto found = cache ? g_decoded_cache.find(key) : g_decoded_cache.end();
         if (found != g_decoded_cache.end()) {
             if (!texture_written_since(w[12], w[13], w[14], tw, th, texels, found->second.when)) {
                 w[24] = found->second.offset;
