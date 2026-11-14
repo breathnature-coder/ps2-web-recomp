@@ -1219,6 +1219,9 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
 bool flush_native(std::uint32_t prims) {
     const Timed timed(kCpuNative);
     Batch &b = g_batch;
+    // Cache the feedback partition computed during native eligibility checking.
+    // A zero entry means the range was not evaluated in the prepass.
+    std::vector<std::uint32_t> feedback_ends(prims, 0);
     // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
     // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
     // batch to the compute rasterizer costs.
@@ -1231,7 +1234,12 @@ bool flush_native(std::uint32_t prims) {
             NativeState state;
             if (native_state(b.setups.data() + rec[0] * kSetupWords, b.zte, state) && state.feedback && state.draws) {
                 among += j - i;
-                for (std::uint32_t from = i; from < j; from = feedback_group(from, j)) ++groups;
+                for (std::uint32_t from = i; from < j;) {
+                    const std::uint32_t end = feedback_group(from, j);
+                    feedback_ends[from] = end;
+                    from = end;
+                    ++groups;
+                }
             }
             i = j;
         }
@@ -1326,7 +1334,11 @@ bool flush_native(std::uint32_t prims) {
                 std::uint32_t from = i;
                 while (from < j) {
                     int gx0 = 1 << 30, gy0 = 1 << 30, gx1 = -1, gy1 = -1;
-                    const std::uint32_t to = feedback_group(from, j);
+                    // Reuse the exact partition validated above; preserve the
+                    // original calculation as a fallback for unplanned ranges.
+                    const std::uint32_t cached_end = feedback_ends[from];
+                    const std::uint32_t to = cached_end && cached_end <= j
+                        ? cached_end : feedback_group(from, j);
                     for (std::uint32_t q = from; q < to; ++q) {
                         const std::uint32_t *prim = b.prims.data() + q * kPrimWords;
                         gx0 = std::min(gx0, static_cast<int>(prim[2] & 0xFFFFu));
