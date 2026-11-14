@@ -1376,6 +1376,7 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline *precomputed = nullptr) {
     static std::vector<Outline> group;
     group.clear();
+    group.reserve(to - from);
     float group_min_x = 0, group_max_x = 0, group_min_y = 0, group_max_y = 0;
     ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
