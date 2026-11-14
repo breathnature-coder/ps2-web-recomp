@@ -615,6 +615,15 @@ void decode_collect() {
             g_decode_free.insert(it, block);
         }
     }
+    // A free block at the end of the append arena can be returned to the
+    // cursor outright. Repeated tail retirements can then release more space,
+    // avoiding needless LRU eviction and reducing fragmentation.
+    while (!g_decode_free.empty()) {
+        const DecodeBlock &tail = g_decode_free.back();
+        if (tail.offset + tail.words != g_decoded_used) break;
+        g_decoded_used = tail.offset;
+        g_decode_free.pop_back();
+    }
 }
 bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     decode_collect();
