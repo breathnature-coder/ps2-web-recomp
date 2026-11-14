@@ -1387,7 +1387,8 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline
     ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
         ++g_feedback_group_prims;
-        const Outline computed = precomputed ? Outline{} : outline(g_batch.prims.data() + q * kPrimWords);
+        Outline computed;
+        if (!precomputed) computed = outline(g_batch.prims.data() + q * kPrimWords);
         const Outline &o = precomputed ? precomputed[q - from] : computed;
         const bool may_overlap = q != from &&
             o.max_x > group_min_x && o.min_x < group_max_x &&
