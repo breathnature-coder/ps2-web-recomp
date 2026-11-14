@@ -746,6 +746,7 @@ WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
 WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
 WGPUBindGroupLayout g_backdrop_layout = nullptr;
 std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
+std::uint64_t g_feedback_copy_pixels = 0;  // unscaled source pixels copied for feedback
 bool g_refusal_counted = false;  // flush_native said why it gave a batch up
 WGPUBindGroup g_native_group = nullptr;
 WGPUShaderModule g_native_module = nullptr;
@@ -1336,6 +1337,7 @@ bool flush_native(std::uint32_t prims) {
                         pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
                                               y1 - y0, 0.0f, true});
                         ++g_feedback_copies;
+                        g_feedback_copy_pixels += static_cast<std::uint64_t>(cx1 - cx0) * (cy1 - cy0);
                         g_feedback_draws += to - from;
                     }
                     from = to;
@@ -2179,12 +2181,21 @@ void submitted() {
     last_words = g_decode_words;
     last_restarts = g_decode_restarts;
     last_saved_words = g_decode_saved_words;
-    static std::uint64_t last_feedback = 0, last_copies = 0;
+    static std::uint64_t last_feedback = 0, last_copies = 0, last_copy_pixels = 0;
+    const std::uint64_t feedback_copies = g_feedback_copies - last_copies;
+    const std::uint64_t feedback_pixels = g_feedback_copy_pixels - last_copy_pixels;
     if (g_feedback_draws != last_feedback)
         std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
-                     static_cast<double>(g_feedback_copies - last_copies) / seconds);
+                     static_cast<double>(feedback_copies) / seconds);
+    if (feedback_copies)
+        std::fprintf(stderr, "[native] feedback copies: %.0f/s, %.0f source pixels/s, %.0f pixels/copy, %.0f render pass restarts/s (scale %u)\n",
+                     static_cast<double>(feedback_copies) / seconds,
+                     static_cast<double>(feedback_pixels) / seconds,
+                     static_cast<double>(feedback_pixels) / static_cast<double>(feedback_copies),
+                     static_cast<double>(feedback_copies) / seconds, g_scale);
     last_feedback = g_feedback_draws;
     last_copies = g_feedback_copies;
+    last_copy_pixels = g_feedback_copy_pixels;
     static std::uint64_t last_tiles = 0, last_passes = 0;
     if (g_lut_tiles != last_tiles)
         std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
