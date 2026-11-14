@@ -627,6 +627,10 @@ void decode_collect() {
     }
 }
 bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
+    // An impossible request must not evict otherwise reusable cache entries.
+    // Normal texture admission already caps requests, but keep this allocator
+    // safe for future callers as well.
+    if (!words || words > kDecodedWords) return false;
     decode_collect();
     const auto take_free = [&]() {
         // Best fit preserves larger contiguous slots for future textures.
