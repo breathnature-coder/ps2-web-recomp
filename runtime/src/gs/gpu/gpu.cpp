@@ -648,7 +648,7 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         return true;
     };
     if (take_free()) return true;
-    if (g_decoded_used + words <= kDecodedWords) {
+    if (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used) {
         offset = g_decoded_used;
         g_decoded_used += words;
         return true;
