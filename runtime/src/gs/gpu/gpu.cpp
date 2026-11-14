@@ -573,9 +573,13 @@ struct Decoded {
     std::uint64_t when;  // the write clock when it was queued
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
+// Admission history is independent of the decoded buffer: a full buffer reset
+// must not erase evidence that a texture is used repeatedly.
+std::unordered_map<DecodeKey, std::uint8_t, DecodeKeyHash> g_decode_seen;
 std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_decode_restarts = 0;
 std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded again
 std::uint64_t g_decode_invalidated = 0, g_decode_cold = 0, g_decode_small = 0;
+std::uint64_t g_decode_admission_skips = 0, g_decode_admission_texels = 0;
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
@@ -626,6 +630,20 @@ void plan_decodes(std::uint32_t prims) {
         }
         const std::uint32_t words = 1u << (tw + th);
         if (words > kDecodedWords / 4) continue;
+        // Large, one-off textures consume the decoded buffer and trigger
+        // expensive full-cache resets. Leave their sampling on the direct
+        // GS-memory path until a second encounter establishes reuse.
+        // Small textures stay eager: their decode and footprint are cheap.
+        if (cache && words >= 4096u) {
+            if (g_decode_seen.size() >= 8192u) g_decode_seen.clear();
+            auto [seen, inserted] = g_decode_seen.try_emplace(key, 0u);
+            if (seen->second < 2u) ++seen->second;
+            if (seen->second < 2u) {
+                ++g_decode_admission_skips;
+                g_decode_admission_texels += words;
+                continue;
+            }
+        }
         if (g_decoded_used + words > kDecodedWords) {
             // Full: start over, and over this batch too, whose textures found so far may be where new ones go.
             g_decoded_cache.clear();
@@ -2223,6 +2241,7 @@ void submitted() {
     }
     static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0, last_saved_words = 0;
     static std::uint64_t last_invalidated = 0, last_cold = 0, last_small = 0;
+    static std::uint64_t last_admission_skips = 0, last_admission_texels = 0;
     const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
     if (hits + misses) {
         const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
@@ -2241,6 +2260,11 @@ void submitted() {
     last_invalidated = g_decode_invalidated;
     last_cold = g_decode_cold;
     last_small = g_decode_small;
+    std::fprintf(stderr, "[native] decode admission: %.0f cold large textures/s bypassed, %.0f texels/s not predecoded\\n",
+                 static_cast<double>(g_decode_admission_skips - last_admission_skips) / seconds,
+                 static_cast<double>(g_decode_admission_texels - last_admission_texels) / seconds);
+    last_admission_skips = g_decode_admission_skips;
+    last_admission_texels = g_decode_admission_texels;
     last_hits = g_decode_hits;
     last_misses = g_decode_misses;
     last_words = g_decode_words;
