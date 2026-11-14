@@ -1378,27 +1378,28 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 // Where the group of a feedback draw's primitives that starts at `from` ends: before the first one, short of `to`,
 // that can cover a pixel one of the group covers.
 std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline *precomputed = nullptr) {
-    static std::vector<Outline> group;
-    group.clear();
-    group.reserve(to - from);
+    // The eligibility prepass already owns contiguous outlines for this run.
+    // Compare them in place instead of copying every outline into a second
+    // vector for each feedback group. The fallback retains its own workspace.
+    static std::vector<Outline> fallback_group;
+    if (!precomputed) fallback_group.clear();
     float group_min_x = 0, group_max_x = 0, group_min_y = 0, group_max_y = 0;
     ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
         ++g_feedback_group_prims;
-        const Outline o = precomputed ? precomputed[q - from] : outline(g_batch.prims.data() + q * kPrimWords);
-        // Skip every SAT test when this primitive misses the bounding box
-        // of the entire group. This is especially useful for spread-out GT4
-        // geometry; the exact overlap predicate remains unchanged.
-        const bool may_overlap = !group.empty() &&
+        const Outline computed = precomputed ? Outline{} : outline(g_batch.prims.data() + q * kPrimWords);
+        const Outline &o = precomputed ? precomputed[q - from] : computed;
+        const bool may_overlap = q != from &&
             o.max_x > group_min_x && o.min_x < group_max_x &&
             o.max_y > group_min_y && o.min_y < group_max_y;
         if (may_overlap) {
-            for (const Outline &other : group) {
+            for (std::uint32_t prev = from; prev < q; ++prev) {
+                const Outline &other = precomputed ? precomputed[prev - from] : fallback_group[prev - from];
                 ++g_feedback_outline_tests;
                 if (outlines_meet(o, other)) return q;
             }
         }
-        if (group.empty()) {
+        if (q == from) {
             group_min_x = o.min_x; group_max_x = o.max_x;
             group_min_y = o.min_y; group_max_y = o.max_y;
         } else {
@@ -1407,7 +1408,7 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline
             group_min_y = std::min(group_min_y, o.min_y);
             group_max_y = std::max(group_max_y, o.max_y);
         }
-        group.push_back(o);
+        if (!precomputed) fallback_group.push_back(o);
     }
     return to;
 }
