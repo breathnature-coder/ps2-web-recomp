@@ -277,7 +277,8 @@ bool stats_on() {
     return on;
 }
 
-const char *const kRenderName = "render";
+// Pass timing includes feedback copies issued between draws.
+const char *const kRenderName = "render_with_feedback";
 GLuint g_pass_query = 0;  // the timer query of the render pass being issued
 std::size_t g_pass_entry = 0;
 
@@ -851,8 +852,9 @@ void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e, WGPUTexelCopyT
 // the separate backdrop texture and leaves the draw framebuffer bound.
 bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder e, WGPUTexture source, WGPUTexture backdrop,
                             std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) {
-    // Timed passes keep copies outside the render GPU query.
-    if (stats_on()) return false;
+    // Keep the same command stream with profiling enabled. The pass timer
+    // includes these copies, reported as render_with_feedback.
+
     WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     from.texture = source;
     to.texture = backdrop;
