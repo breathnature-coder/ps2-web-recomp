@@ -797,6 +797,21 @@ void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder e, WGPUTexelCopyT
     });
 }
 
+// Draws and copies execute in order on the same GL context. The copy writes
+// the separate backdrop texture and leaves the draw framebuffer bound.
+bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder e, WGPUTexture source, WGPUTexture backdrop,
+                            std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) {
+    // Timed passes keep copies outside the render GPU query.
+    if (stats_on()) return false;
+    WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    from.texture = source;
+    to.texture = backdrop;
+    from.origin = to.origin = WGPUOrigin3D{x, y, 0};
+    const WGPUExtent3D size{width, height, 1};
+    wgpuCommandEncoderCopyTextureToTexture(e, &from, &to, &size);
+    return true;
+}
+
 void wgpuCommandEncoderCopyBufferToBuffer(WGPUCommandEncoder e, WGPUBuffer src, uint64_t src_offset, WGPUBuffer dst, uint64_t dst_offset, uint64_t size) {
     const GLuint s = src->id, d = dst->id;
     e->ops.push_back([s, d, src_offset, dst_offset, size] {

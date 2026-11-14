@@ -31,6 +31,8 @@ extern const char kNativeShader[];
 // The OpenGL layer's (gl/webgpu_gl.cpp): a write to this buffer from its start replaces all of it, so the driver
 // may hand out new storage instead of waiting for the GPU to be done with the old.
 extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
+extern "C" bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder encoder, WGPUTexture source, WGPUTexture backdrop,
+                                        std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 #endif
 
 namespace ps2::gs {
@@ -2435,8 +2437,13 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     for (;;) {
         for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
             if (!d.pipeline) {
-                // The colour target as it is now, for the feedback draw that follows: a copy cannot be made inside
-                // a pass, so this one ends and another begins.
+#ifdef PS2_GPU_GL
+                // GL copies into a separate texture without rebinding the
+                // framebuffer or resetting state used by the next draw.
+                if (rp && ps2GlCopyFeedbackInPass(enc, first.color->texture, first.color->backdrop,
+                                                  d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale)) continue;
+#endif
+                // WebGPU copies must run between render passes.
                 if (rp) {
                     wgpuRenderPassEncoderEnd(rp);
                     wgpuRenderPassEncoderRelease(rp);
