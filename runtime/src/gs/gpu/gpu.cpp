@@ -627,21 +627,25 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         g_decoded_used += words;
         return true;
     }
-    // Never evict data referenced by an uncompleted GPU submission.
-    while (true) {
-        auto victim = g_decoded_cache.end();
-        for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
-            if (it->second.last_use_serial <= g_decode_completed_serial &&
-                (victim == g_decoded_cache.end() ||
-                 it->second.last_use_serial < victim->second.last_use_serial))
-                victim = it;
-        if (victim == g_decoded_cache.end()) return false;
+    // Select reclaim candidates once, oldest first. Repeatedly scanning the
+    // entire hash table for each victim was O(entries * evictions) per miss.
+    // Never evict textures referenced by queued or unfinished GPU work.
+    std::vector<decltype(g_decoded_cache.begin())> candidates;
+    candidates.reserve(g_decoded_cache.size());
+    for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
+        if (it->second.last_use_serial <= g_decode_completed_serial)
+            candidates.push_back(it);
+    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
+        return a->second.last_use_serial < b->second.last_use_serial;
+    });
+    for (const auto victim : candidates) {
         decode_retire(victim->second);
         g_decoded_cache.erase(victim);
         ++g_decode_evictions;
         decode_collect();
         if (take_free()) return true;
     }
+    return false;
 }
 
 // Admission history is independent of the decoded buffer: a full buffer reset
