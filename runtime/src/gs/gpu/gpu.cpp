@@ -2267,7 +2267,15 @@ void queue_pre(const PreOp &op) {
     // An upload could change the colour correction's table or what it reads: what is collected is done first.
     if (!op.clut) {
         lut_flush();
-        wrote(op.range);
+        // Upload dependency ordering uses the conservative range. Cache
+        // invalidation only needs the destination pages: region() also
+        // includes every page between TBP and the first destination row.
+        if (op.x1 < 2048u && op.y1 < 2048u)
+            wrote(pages(op.rec[0], op.rec[1], op.rec[2],
+                        static_cast<int>(op.x0), static_cast<int>(op.y0),
+                        static_cast<int>(op.x1), static_cast<int>(op.y1)));
+        else
+            wrote(op.range);
     }
     g_pre.push_back(op);
 }
