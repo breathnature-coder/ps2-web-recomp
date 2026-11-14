@@ -2349,7 +2349,7 @@ void submitted() {
                  static_cast<double>(g_decode_capacity_texels - last_capacity_texels) / seconds,
                  static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
                  static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
-    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %zu pending blocks, %zu free spans\\n",
+    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %zu pending blocks, %zu free spans\n",
                  static_cast<double>(g_decode_evictions - last_decode_evictions) / seconds,
                  static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
                  g_decode_retired.size(), g_decode_free.size());
