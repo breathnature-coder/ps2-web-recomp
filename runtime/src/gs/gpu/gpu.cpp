@@ -544,6 +544,7 @@ struct Decoded {
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_decode_restarts = 0;
 std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded again
+std::uint64_t g_decode_invalidated = 0, g_decode_cold = 0, g_decode_small = 0;
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
@@ -582,10 +583,16 @@ void plan_decodes(std::uint32_t prims) {
                 g_decode_saved_words += 1ull << (tw + th);
                 continue;
             }
+            ++g_decode_invalidated;
             g_decoded_cache.erase(found);
+        } else {
+            ++g_decode_cold;
         }
         // Decoding costs a dispatch and every texel: for a few primitives reading GS memory directly is cheaper.
-        if (prims <= kDecodePrims) continue;
+        if (prims <= kDecodePrims) {
+            ++g_decode_small;
+            continue;
+        }
         const std::uint32_t words = 1u << (tw + th);
         if (words > kDecodedWords / 4) continue;
         if (g_decoded_used + words > kDecodedWords) {
@@ -2184,6 +2191,7 @@ void submitted() {
         std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
     }
     static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0, last_saved_words = 0;
+    static std::uint64_t last_invalidated = 0, last_cold = 0, last_small = 0;
     const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
     if (hits + misses) {
         const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
@@ -2194,7 +2202,14 @@ void submitted() {
                      hit_rate, static_cast<double>(g_decode_saved_words - last_saved_words) / seconds,
                      g_decoded_cache.size(), static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
                      static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+        std::fprintf(stderr, "[native] decode cache misses: %.0f invalidated/s, %.0f absent/s, %.0f small-batch skips/s\n",
+                     static_cast<double>(g_decode_invalidated - last_invalidated) / seconds,
+                     static_cast<double>(g_decode_cold - last_cold) / seconds,
+                     static_cast<double>(g_decode_small - last_small) / seconds);
     }
+    last_invalidated = g_decode_invalidated;
+    last_cold = g_decode_cold;
+    last_small = g_decode_small;
     last_hits = g_decode_hits;
     last_misses = g_decode_misses;
     last_words = g_decode_words;
