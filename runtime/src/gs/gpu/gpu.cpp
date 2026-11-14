@@ -721,7 +721,7 @@ void plan_decodes(std::uint32_t prims) {
         g_decoded_cache.clear();
         g_decode_free.clear();
         g_decode_retired.clear();
-            if (prims <= kDecodePrims) return;
+        if (prims <= kDecodePrims) return;
     }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
     for (std::uint32_t i = 0; i < setups; ++i) {
@@ -773,7 +773,7 @@ void plan_decodes(std::uint32_t prims) {
         }
         std::uint32_t decoded_offset = 0;
         if (!(cache ? decode_allocate(words, decoded_offset)
-                    : (g_decoded_used + words <= kDecodedWords
+                    : (g_decoded_used <= kDecodedWords && words <= kDecodedWords - g_decoded_used
                         ? (decoded_offset = g_decoded_used, g_decoded_used += words, true)
                         : false))) {
             // Never overwrite a decoded slot while queued native passes (or
