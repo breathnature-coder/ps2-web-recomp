@@ -3511,7 +3511,13 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
-    std::uint64_t content = g_clut_content[g_clut_slot];
+    // An eight-bit CSM1=0 load overwrites all 256 palette entries that
+    // PSMT8/PSMT8H can sample. The previous CLUT slot is irrelevant to
+    // those entries. Hashing it made identical reloads produce different
+    // keys forever, defeating decoded texture reuse.
+    // Partial loads still depend on the previous slot contents.
+    const bool full_palette = !csm && rec[6] != 0;
+    std::uint64_t content = full_palette ? 0u : g_clut_content[g_clut_slot];
     for (int k = 2; k < 10; ++k) content = mix(content, rec[k]);
     g_clut_content[next] = mix(content, last_written(op.range));
     g_clut_source[next] = {cbp, cpsm == PSMCT32 && !csm && rec[6] != 0};
