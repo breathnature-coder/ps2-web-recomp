@@ -1538,8 +1538,11 @@ bool flush_native(std::uint32_t prims) {
                         record[32] = prim_offset + from * kPrimWords;
                         g_param_records.push_back(record);
                         pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
-                        pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
-                                              y1 - y0, 0.0f, true});
+                        // The feedback group's bounding box already encloses every
+                        // primitive in this draw and is clipped to the setup
+                        // scissor. Use it for rasterization as well as copy.
+                        pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
+                                              cy1 - cy0, 0.0f, true});
                         ++g_feedback_copies;
                         g_feedback_copy_pixels += static_cast<std::uint64_t>(cx1 - cx0) * (cy1 - cy0);
                         g_feedback_draws += to - from;
