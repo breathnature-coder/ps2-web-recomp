@@ -516,15 +516,23 @@ bool texture_written_since(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm
     const std::uint64_t row_pages = std::max<std::uint32_t>(1, bw * 64 / pw);
     const std::uint64_t width_pages = ((1ull << tw) + pw - 1) / pw;
     const std::uint64_t height_pages = ((1ull << th) + ph - 1) / ph;
-    // GS base pointers are 256-byte aligned, not necessarily 8 KiB aligned.
-    // An unaligned GS page straddles two tracked physical pages.
-    if (width_pages >= row_pages || ((static_cast<std::uint64_t>(bp) * 256) & 8191ull))
-        return written_since(bounds, when);
-    const std::uint64_t base_page = (static_cast<std::uint64_t>(bp) * 256) >> 13;
+    // A texture row occupies only width_pages of its GS stride. Checking
+    // the bounding interval also checks unrelated pages between rows and
+    // invalidates perfectly reusable textures. A non-page-aligned TBP
+    // straddles two physical tracking pages per logical GS page: check both
+    // instead of falling back to the overly broad bounding interval.
+    if (width_pages >= row_pages) return written_since(bounds, when);
+    const std::uint64_t base_bytes = static_cast<std::uint64_t>(bp) * 256;
+    const std::uint64_t base_page = base_bytes >> 13;
+    const bool straddles = (base_bytes & 8191ull) != 0;
     for (std::uint64_t y = 0; y < height_pages; ++y) {
         const std::uint64_t row = base_page + y * row_pages;
-        for (std::uint64_t x = 0; x < width_pages; ++x)
-            if (g_page_written[(row + x) & 511u] >= when) return true;
+        for (std::uint64_t x = 0; x < width_pages; ++x) {
+            const std::uint64_t page = row + x;
+            if (g_page_written[page & 511u] >= when ||
+                (straddles && g_page_written[(page + 1) & 511u] >= when))
+                return true;
+        }
     }
     return false;
 }
