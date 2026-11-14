@@ -2726,18 +2726,18 @@ void submitted() {
 }
 
 void track_decode_completion(std::uint64_t serial) {
-    // Only persistent entries can be reclaimed by GPU completion serial.
-    // Transient decodes reuse their offsets in queue order.
-    if (!g_decode || !decode_cache_on()) return;
-    auto *completed_serial = new std::uint64_t(serial);
+    // One outstanding marker is enough: the next one covers every submit
+    // queued before it. Keep the serial fixed while its callback is pending.
+    static std::uint64_t pending_serial = 0;
+    if (!g_decode || !decode_cache_on() || pending_serial) return;
+    pending_serial = serial;
     WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
-    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *userdata, void *) {
-        std::unique_ptr<std::uint64_t> completed(static_cast<std::uint64_t *>(userdata));
+    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *, void *) {
         if (status == WGPUQueueWorkDoneStatus_Success)
-            g_decode_completed_serial = std::max(g_decode_completed_serial, *completed);
+            g_decode_completed_serial = std::max(g_decode_completed_serial, pending_serial);
+        pending_serial = 0;
     };
-    decode_done.userdata1 = completed_serial;
     wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
 }
 
