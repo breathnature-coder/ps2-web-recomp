@@ -1152,8 +1152,19 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
         if (!source_c && !dest_c) {
             sf = source_1;
             df = dest_1;
+        } else if ((c == 1 && fpsm == PSMCT24) || (c >= 2 && !(skip & 1u) && (w[9] == 0 || w[9] == 0x80u))) {
+            // PSMCT24 supplies a GS destination alpha of 0x80. FIX at
+            // either endpoint also reduces to integer color coefficients.
+            // Unit factors preserve the GS result without blend rounding.
+            const int scale = c == 1 || w[9] == 0x80u;
+            const int source = source_1 + source_c * scale;
+            const int dest = dest_1 + dest_c * scale;
+            if (source > 1 || dest > 1 || (source < 0 && dest < 0)) return why(c == 1 ? 9 : 11);
+            sf = std::abs(source);
+            df = std::abs(dest);
+            op = source < 0 ? 2u : dest < 0 ? 1u : 0u;
         } else if (c == 1) {
-            return why(9);  // destination alpha: the texture keeps alpha, not alpha as a factor
+            return why(9);  // 32-bit destination alpha can vary per pixel
         } else if (!dest_c && !source_1) {
             // C only scales the source colour: the shader does it, with the GS's own rounding and for any C.
             out.premultiply = 1u | (c >= 2 ? 2u : 0u) | (source_c < 0 ? 4u : 0u);
