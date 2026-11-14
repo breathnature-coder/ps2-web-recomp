@@ -2266,7 +2266,7 @@ void submitted() {
     std::fprintf(stderr, "[native] decode admission: %.0f cold large textures/s bypassed, %.0f texels/s not predecoded\\n",
                  static_cast<double>(g_decode_admission_skips - last_admission_skips) / seconds,
                  static_cast<double>(g_decode_admission_texels - last_admission_texels) / seconds);
-    std::fprintf(stderr, "[native] decode capacity: %.0f bypasses/s, %.0f texels/s direct, %.1f/%.1f MiB occupied\\n",
+    std::fprintf(stderr, "[native] decode capacity: %.0f bypasses/s, %.0f texels/s direct, %.1f/%.1f MiB occupied\n",
                  static_cast<double>(g_decode_capacity_bypasses - last_capacity_bypasses) / seconds,
                  static_cast<double>(g_decode_capacity_texels - last_capacity_texels) / seconds,
                  static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
