@@ -48,9 +48,7 @@ constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
 constexpr std::uint32_t kSetupWords = 25;
-// 32 MiB decoded texture cache: test whether GT4's frequent full-cache resets
-// and low reuse rate are primarily caused by the previous 16 MiB capacity.
-constexpr std::uint32_t kDecodedWords = 8u << 20;
+constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
 Mode g_mode = Mode::off;
