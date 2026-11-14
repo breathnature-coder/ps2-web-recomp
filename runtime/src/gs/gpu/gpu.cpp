@@ -2612,14 +2612,23 @@ void profile_submit() {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (n) {
-        bool done = false;
+        struct MapResult {
+            bool done = false;
+            bool success = false;
+        } mapped;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
-        cb.userdata1 = &done;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *userdata, void *) {
+            auto &result = *static_cast<MapResult *>(userdata);
+            result.success = status == WGPUMapAsyncStatus_Success;
+            result.done = true;
+        };
+        cb.userdata1 = &mapped;
         wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, n * 16, cb);
-        wait_until(done);
-        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
+        wait_until(mapped.done);
+        const auto *t = mapped.success
+            ? static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16))
+            : nullptr;
         std::size_t info = 0;
         for (std::uint32_t query = 0; t && query < n; ++query) {
             const std::uint32_t i = measured_commands[query];
@@ -2631,7 +2640,8 @@ void profile_submit() {
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
         }
-        wgpuBufferUnmap(g_profile_read);
+        if (mapped.success) wgpuBufferUnmap(g_profile_read);
+        else std::fprintf(stderr, "[gpu] profiling timestamp buffer mapping failed\n");
     }
     submitted();
 }
