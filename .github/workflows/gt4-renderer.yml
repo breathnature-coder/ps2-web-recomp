@@ -7,6 +7,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Keep only the newest validation run per branch or pull request. Frequent
+# renderer fixes otherwise queue obsolete full builds ahead of the latest one.
+concurrency:
+  group: gt4-renderer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gpu-compile:
     runs-on: ubuntu-24.04
