@@ -1142,23 +1142,25 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     out.premultiply = 0;
     out.alpha_factor = false;
     if ((flags & 8u) && (mask & 7u)) {
-        if ((flags & 1024u) || !(flags & 2048u)) return why(8);  // blending per pixel alpha, or colours that wrap
         const std::uint32_t a = (modes >> 12) & 3u, b = (modes >> 14) & 3u, c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
         // (A - B) * C + D as what multiplies the source and the destination colour: so many times C, plus one or not.
         const int source_c = (a == 0) - (b == 0), dest_c = (a == 1) - (b == 1);
         const int source_1 = d == 0, dest_1 = d == 1;
         std::uint32_t op = 0;
         int sf, df;
-        if (!source_c && !dest_c) {
+        const bool zero_product = (!source_c && !dest_c) || (c >= 2 && w[9] == 0 && !(skip & 1u));
+        // If the blend always returns Cs, PABE's unblended result is the
+        // same. Native shading already wraps the source channels to bytes.
+        if (((flags & 1024u) || !(flags & 2048u)) && !(zero_product && source_1)) return why(8);
+        if (zero_product) {
             sf = source_1;
             df = dest_1;
-        } else if ((c == 1 && fpsm == PSMCT24) || (c >= 2 && !(skip & 1u) && (w[9] == 0 || w[9] == 0x80u))) {
-            // PSMCT24 supplies a GS destination alpha of 0x80. FIX at
-            // either endpoint also reduces to integer color coefficients.
+        } else if ((c == 1 && fpsm == PSMCT24) || (c >= 2 && !(skip & 1u) && w[9] == 0x80u)) {
+            // PSMCT24 supplies a GS destination alpha of 0x80.
+            // FIX=0x80 also reduces to integer color coefficients.
             // Unit factors preserve the GS result without blend rounding.
-            const int scale = c == 1 || w[9] == 0x80u;
-            const int source = source_1 + source_c * scale;
-            const int dest = dest_1 + dest_c * scale;
+            const int source = source_1 + source_c;
+            const int dest = dest_1 + dest_c;
             if (source > 1 || dest > 1 || (source < 0 && dest < 0)) return why(c == 1 ? 9 : 11);
             sf = std::abs(source);
             df = std::abs(dest);
