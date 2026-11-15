@@ -3723,7 +3723,19 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
             // the same 8x2 rectangle, regardless of the destination bank.
             const int x = static_cast<int>((cou + k) * 16);
             const int y = static_cast<int>(cov);
-            const auto written = csm ? last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y)) : csm1_written;
+            auto written = csm1_written;
+            if (csm) {
+                if (cpsm == PSMCT32 || cpsm == PSMCT24) {
+                    // COU aligns the 16 entries to two 8-pixel GS blocks.
+                    // Each 256-byte block lies in one physical page, even
+                    // with an unaligned CBP or VRAM wrap.
+                    const auto first_page = address32(cbp, cbw, x, y) >> 13;
+                    const auto second_page = address32(cbp, cbw, x + 8, y) >> 13;
+                    written = std::max(g_page_written[first_page], g_page_written[second_page]);
+                } else {
+                    written = last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y));
+                }
+            }
             const auto layout = csm ? mix(mix(cbw, cou + k), cov) : (rec[6] ? k + 1u : 0u);
             identity.banks[dst] = mix(mix(source, layout), written);
         }
