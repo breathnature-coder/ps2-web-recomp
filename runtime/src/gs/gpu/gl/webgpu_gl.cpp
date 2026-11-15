@@ -694,6 +694,11 @@ void wgpuQueueSubmit(WGPUQueue, size_t count, WGPUCommandBuffer const *commands)
     current();
     swap_pending();
     const auto start = Clock::now();
+    // Decoded slots are GPU-only storage. A later submission may reuse a
+    // slot read by an earlier draw: order those reads before subsequent
+    // shader writes without waiting for completion on the CPU. The existing
+    // post-dispatch barrier handles visibility from decode writes to reads.
+    if (count) glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     for (std::size_t i = 0; i < count; ++i)
         for (const Op &op : commands[i]->ops) op();
     g_stats.issue_ms += ms_since(start);
