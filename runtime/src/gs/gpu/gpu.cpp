@@ -482,19 +482,67 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
 // When each page of GS memory was last written, by a clock that counts the writes as they are queued (which is the
 // order the GPU makes them in): a texture decoded after the last write to its pages still holds (see plan_decodes).
 std::uint64_t g_write_clock = 0, g_page_written[512] = {};
+// Palette identities also track small uploads at the GS's 256-byte block
+// granularity. Broad writes remain page-based; querying both epochs keeps
+// rendering, copies and unsupported upload formats conservative.
+std::uint64_t g_clut_page_written[512] = {}, g_clut_block_written[kMemorySize / 256] = {};
+std::uint64_t g_clut_precise_uploads = 0;
+
+void wrote_page(std::uint32_t page) {
+    g_page_written[page & 511u] = g_write_clock;
+    g_clut_page_written[page & 511u] = g_write_clock;
+}
 
 void wrote(const Range &r) {
     ++g_write_clock;
     if (r.hi - r.lo >= kMemorySize) {
         std::fill(std::begin(g_page_written), std::end(g_page_written), g_write_clock);
+        std::fill(std::begin(g_clut_page_written), std::end(g_clut_page_written), g_write_clock);
         return;
     }
-    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) g_page_written[(at >> 13) & 511u] = g_write_clock;
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) wrote_page(static_cast<std::uint32_t>(at >> 13));
+}
+
+bool wrote_small_upload32(std::uint32_t bp, std::uint32_t bw,
+                          std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) {
+    if (x0 > x1 || y0 > y1 || x1 >= 2048u || y1 >= 2048u) return false;
+    const std::uint32_t nx = x1 / 8 - x0 / 8 + 1, ny = y1 / 8 - y0 / 8 + 1;
+    // Bound CPU work; large uploads retain the existing page-level path.
+    if (nx * ny > 64u) return false;
+    ++g_write_clock;
+    ++g_clut_precise_uploads;
+    for (std::uint32_t y = y0 / 8; y <= y1 / 8; ++y) {
+        for (std::uint32_t x = x0 / 8; x <= x1 / 8; ++x) {
+            const auto block = address32(bp, bw, x * 8, y * 8) >> 8;
+            g_clut_block_written[block] = g_write_clock;
+            // Texture validation still sees every touched page. Only the
+            // palette identity distinguishes unrelated blocks in that page.
+            g_page_written[block >> 5] = g_write_clock;
+        }
+    }
+    return true;
+}
+
+std::uint64_t clut_block_written(std::uint32_t block) {
+    block &= kMemorySize / 256 - 1;
+    return std::max(g_clut_block_written[block], g_clut_page_written[block >> 5]);
 }
 
 std::uint64_t last_written(const Range &r) {
+    if (r.hi - r.lo >= kMemorySize)
+        return *std::max_element(std::begin(g_page_written), std::end(g_page_written));
     std::uint64_t last = 0;
-    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) last = std::max(last, g_page_written[(at >> 13) & 511u]);
+    for (std::uint64_t at = r.lo & ~255ull; at < r.hi;) {
+        // Full physical pages can use the aggregate texture epoch. Inspect
+        // individual blocks only at partial page boundaries.
+        if ((at & 8191u) == 0 && r.hi - at >= 8192u) {
+            last = std::max(last, g_page_written[(at >> 13) & 511u]);
+            at += 8192;
+        } else {
+            last = std::max(last, clut_block_written(static_cast<std::uint32_t>(at >> 8)));
+            at += 256;
+        }
+    }
     return last;
 }
 
@@ -2327,25 +2375,30 @@ void queue_pre(const PreOp &op) {
         lut_flush();
         // Keep the dependency range conservative, but avoid invalidating
         // untouched pages between destination rows of a narrow upload.
-        if (op.x1 < 2048u && op.y1 < 2048u) {
-            std::uint32_t pw, ph;
-            page_size(op.rec[2], pw, ph);
-            const std::uint32_t stride = std::max(1u, op.rec[1] * 64 / pw);
-            const std::uint32_t first = op.x0 / pw, last = op.x1 / pw;
-            const std::uint32_t span = last - first + 1 + (op.rec[0] % 32 != 0);
-            if (span < stride && op.y0 / ph != op.y1 / ph) {
-                ++g_write_clock;
-                const std::uint32_t base = op.rec[0] / 32 + first;
-                for (std::uint32_t y = op.y0 / ph; y <= op.y1 / ph; ++y)
-                    for (std::uint32_t x = 0; x < span; ++x)
-                        g_page_written[(base + y * stride + x) & 511u] = g_write_clock;
+        const bool precise = decode_cache_on() &&
+            (op.rec[2] == PSMCT32 || op.rec[2] == PSMCT24) &&
+            wrote_small_upload32(op.rec[0], op.rec[1], op.x0, op.y0, op.x1, op.y1);
+        if (!precise) {
+            if (op.x1 < 2048u && op.y1 < 2048u) {
+                std::uint32_t pw, ph;
+                page_size(op.rec[2], pw, ph);
+                const std::uint32_t stride = std::max(1u, op.rec[1] * 64 / pw);
+                const std::uint32_t first = op.x0 / pw, last = op.x1 / pw;
+                const std::uint32_t span = last - first + 1 + (op.rec[0] % 32 != 0);
+                if (span < stride && op.y0 / ph != op.y1 / ph) {
+                    ++g_write_clock;
+                    const std::uint32_t base = op.rec[0] / 32 + first;
+                    for (std::uint32_t y = op.y0 / ph; y <= op.y1 / ph; ++y)
+                        for (std::uint32_t x = 0; x < span; ++x)
+                            wrote_page(base + y * stride + x);
+                } else {
+                    wrote(pages(op.rec[0], op.rec[1], op.rec[2],
+                                static_cast<int>(op.x0), static_cast<int>(op.y0),
+                                static_cast<int>(op.x1), static_cast<int>(op.y1)));
+                }
             } else {
-                wrote(pages(op.rec[0], op.rec[1], op.rec[2],
-                            static_cast<int>(op.x0), static_cast<int>(op.y0),
-                            static_cast<int>(op.x1), static_cast<int>(op.y1)));
+                wrote(op.range);
             }
-        } else {
-            wrote(op.range);
         }
     }
     g_pre.push_back(op);
@@ -2753,6 +2806,10 @@ void submitted() {
                  static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
                  static_cast<double>(g_decode_tail_words - last_decode_tail) / seconds,
                  g_decode_retired.size(), g_decode_free.size());
+    static std::uint64_t last_precise_uploads = 0;
+    std::fprintf(stderr, "[native] CLUT tracking: %.0f small uploads/s tracked by block\n",
+                 static_cast<double>(g_clut_precise_uploads - last_precise_uploads) / seconds);
+    last_precise_uploads = g_clut_precise_uploads;
     static std::uint64_t last_insufficient_space = 0, last_fragmented_space = 0;
     std::fprintf(stderr, "[native] decode preserved: %.0f insufficient-space skips/s, %.0f fragmented-space skips/s\n",
                  static_cast<double>(g_decode_insufficient_space - last_insufficient_space) / seconds,
@@ -3791,11 +3848,11 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
             if (csm) {
                 if (cpsm == PSMCT32 || cpsm == PSMCT24) {
                     // COU aligns the 16 entries to two 8-pixel GS blocks.
-                    // Each 256-byte block lies in one physical page, even
-                    // with an unaligned CBP or VRAM wrap.
-                    const auto first_page = address32(cbp, cbw, x, y) >> 13;
-                    const auto second_page = address32(cbp, cbw, x + 8, y) >> 13;
-                    written = std::max(g_page_written[first_page], g_page_written[second_page]);
+                    // Block epochs exclude small uploads elsewhere in the
+                    // same page, including with an unaligned CBP or wrap.
+                    const auto first_block = address32(cbp, cbw, x, y) >> 8;
+                    const auto second_block = address32(cbp, cbw, x + 8, y) >> 8;
+                    written = std::max(clut_block_written(first_block), clut_block_written(second_block));
                 } else {
                     written = last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y));
                 }
