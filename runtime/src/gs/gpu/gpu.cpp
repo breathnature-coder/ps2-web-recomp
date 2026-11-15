@@ -599,37 +599,40 @@ std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
 std::uint64_t g_decode_completed_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0, g_decode_tail_words = 0;
+void decode_release_block(const DecodeBlock &block) {
+    auto it = std::lower_bound(g_decode_free.begin(), g_decode_free.end(), block.offset,
+                               [](const DecodeBlock &free, std::uint32_t offset) {
+                                   return free.offset < offset;
+                               });
+    const auto index = static_cast<std::size_t>(it - g_decode_free.begin());
+    if (index && g_decode_free[index - 1].offset + g_decode_free[index - 1].words == block.offset) {
+        g_decode_free[index - 1].words += block.words;
+        if (index < g_decode_free.size() &&
+            g_decode_free[index - 1].offset + g_decode_free[index - 1].words == g_decode_free[index].offset) {
+            g_decode_free[index - 1].words += g_decode_free[index].words;
+            g_decode_free.erase(g_decode_free.begin() + index);
+        }
+    } else if (index < g_decode_free.size() &&
+               block.offset + block.words == g_decode_free[index].offset) {
+        g_decode_free[index].offset = block.offset;
+        g_decode_free[index].words += block.words;
+    } else {
+        g_decode_free.insert(it, block);
+    }
+}
 void decode_retire(const Decoded &d) {
-    // Keep pending blocks ordered by the GPU serial that protects them.
-    // Collection only visits blocks that can actually be recycled.
-    g_decode_retired.emplace(d.last_use_serial, DecodeBlock{d.offset, d.words, d.last_use_serial});
+    const DecodeBlock block{d.offset, d.words, d.last_use_serial};
+    // Completed victims need no pending-map node or later collection pass.
+    // Unfinished references keep the same serial protection as before.
+    if (d.last_use_serial <= g_decode_completed_serial) decode_release_block(block);
+    else g_decode_retired.emplace(d.last_use_serial, block);
 }
 void decode_collect() {
-    // Keep free blocks sorted and coalesced as each completed retirement
-    // arrives, instead of re-sorting the entire list for every LRU victim.
     while (!g_decode_retired.empty() &&
            g_decode_retired.begin()->first <= g_decode_completed_serial) {
         const DecodeBlock block = g_decode_retired.begin()->second;
         g_decode_retired.erase(g_decode_retired.begin());
-        auto it = std::lower_bound(g_decode_free.begin(), g_decode_free.end(), block.offset,
-                                   [](const DecodeBlock &free, std::uint32_t offset) {
-                                       return free.offset < offset;
-                                   });
-        const auto index = static_cast<std::size_t>(it - g_decode_free.begin());
-        if (index && g_decode_free[index - 1].offset + g_decode_free[index - 1].words == block.offset) {
-            g_decode_free[index - 1].words += block.words;
-            if (index < g_decode_free.size() &&
-                g_decode_free[index - 1].offset + g_decode_free[index - 1].words == g_decode_free[index].offset) {
-                g_decode_free[index - 1].words += g_decode_free[index].words;
-                g_decode_free.erase(g_decode_free.begin() + index);
-            }
-        } else if (index < g_decode_free.size() &&
-                   block.offset + block.words == g_decode_free[index].offset) {
-            g_decode_free[index].offset = block.offset;
-            g_decode_free[index].words += block.words;
-        } else {
-            g_decode_free.insert(it, block);
-        }
+        decode_release_block(block);
     }
     // A free block at the end of the append arena can be returned to the
     // cursor outright. Repeated tail retirements can then release more space,
@@ -683,9 +686,18 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     static std::vector<DecodeCacheIterator> candidates;
     candidates.clear();
     candidates.reserve(g_decoded_cache.size());
-    for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it)
-        if (it->second.last_use_serial <= g_decode_completed_serial)
+    // Count all space that could be made available without waiting. If
+    // even this upper bound cannot fit the request, preserve the cache:
+    // evicting every eligible texture would only end in the same bypass.
+    std::uint64_t reclaimable = kDecodedWords - g_decoded_used;
+    for (const auto &block : g_decode_free) reclaimable += block.words;
+    for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it) {
+        if (it->second.last_use_serial <= g_decode_completed_serial) {
             candidates.push_back(it);
+            reclaimable += it->second.words;
+        }
+    }
+    if (reclaimable < words) return false;
     // Heap construction is linear. Extract only as many oldest entries as
     // allocation needs instead of sorting every eligible texture.
     const auto newer = [](const auto &a, const auto &b) {
