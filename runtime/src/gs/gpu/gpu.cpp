@@ -599,6 +599,7 @@ std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
 std::uint64_t g_decode_completed_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0, g_decode_tail_words = 0;
+std::uint64_t g_decode_insufficient_space = 0, g_decode_fragmented_space = 0;
 void decode_release_block(const DecodeBlock &block) {
     auto it = std::lower_bound(g_decode_free.begin(), g_decode_free.end(), block.offset,
                                [](const DecodeBlock &free, std::uint32_t offset) {
@@ -686,6 +687,10 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     static std::vector<DecodeCacheIterator> candidates;
     candidates.clear();
     candidates.reserve(g_decoded_cache.size());
+    // Unfinished allocations divide the arena into independent regions.
+    // Free space on opposite sides of one cannot satisfy a single texture.
+    static std::vector<DecodeBlock> protected_blocks;
+    protected_blocks.clear();
     // Count all space that could be made available without waiting. If
     // even this upper bound cannot fit the request, preserve the cache:
     // evicting every eligible texture would only end in the same bypass.
@@ -695,9 +700,35 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         if (it->second.last_use_serial <= g_decode_completed_serial) {
             candidates.push_back(it);
             reclaimable += it->second.words;
+        } else {
+            const auto &d = it->second;
+            protected_blocks.push_back({d.offset, d.words, d.last_use_serial});
         }
     }
-    if (reclaimable < words) return false;
+    if (reclaimable < words) {
+        ++g_decode_insufficient_space;
+        return false;
+    }
+    for (const auto &[serial, block] : g_decode_retired) protected_blocks.push_back(block);
+    if (!protected_blocks.empty()) {
+        std::sort(protected_blocks.begin(), protected_blocks.end(),
+                  [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
+        std::uint32_t end = 0;
+        bool fits = false;
+        for (const auto &block : protected_blocks) {
+            if (block.offset - end >= words) {
+                fits = true;
+                break;
+            }
+            end = block.offset + block.words;
+        }
+        // Include unallocated space at the tail. Adjacent completed blocks
+        // may coalesce with it when their retirements rewind the cursor.
+        if (!fits && kDecodedWords - end < words) {
+            ++g_decode_fragmented_space;
+            return false;
+        }
+    }
     // Heap construction is linear. Extract only as many oldest entries as
     // allocation needs instead of sorting every eligible texture.
     const auto newer = [](const auto &a, const auto &b) {
@@ -2707,6 +2738,12 @@ void submitted() {
                  static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
                  static_cast<double>(g_decode_tail_words - last_decode_tail) / seconds,
                  g_decode_retired.size(), g_decode_free.size());
+    static std::uint64_t last_insufficient_space = 0, last_fragmented_space = 0;
+    std::fprintf(stderr, "[native] decode preserved: %.0f insufficient-space skips/s, %.0f fragmented-space skips/s\n",
+                 static_cast<double>(g_decode_insufficient_space - last_insufficient_space) / seconds,
+                 static_cast<double>(g_decode_fragmented_space - last_fragmented_space) / seconds);
+    last_insufficient_space = g_decode_insufficient_space;
+    last_fragmented_space = g_decode_fragmented_space;
     last_decode_evictions = g_decode_evictions;
     last_decode_reclaimed = g_decode_reclaimed_words;
     last_decode_tail = g_decode_tail_words;
