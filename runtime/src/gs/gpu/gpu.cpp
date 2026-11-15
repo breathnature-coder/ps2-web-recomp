@@ -537,6 +537,13 @@ std::uint64_t clut_csm1_bank_written32(std::uint32_t bp, std::uint32_t bank) {
     return clut_block_written(address32(bp, 1u, j & 15u, j >> 4u) >> 8);
 }
 
+std::uint64_t clut_csm1_bank_written16(std::uint32_t bp, std::uint32_t bank) {
+    // In both PSMCT16 and PSMCT16S the 16x16 CSM1 source occupies
+    // blocks 0 and 1. Banks 0..7 read the upper 16x8 block, banks 8..15
+    // the lower one. A 16-entry load reads bank zero's source rectangle.
+    return clut_block_written(bp + (bank >> 3u));
+}
+
 std::uint64_t last_written(const Range &r) {
     if (r.hi - r.lo >= kMemorySize)
         return *std::max_element(std::begin(g_page_written), std::end(g_page_written));
@@ -3836,17 +3843,11 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
         const std::uint32_t banks = rec[6] ? 16u : 1u;
         const std::uint32_t first = csm ? rec[5] : (rec[6] ? 0u : rec[5] & 15u);
         const std::uint64_t source = mix(mix(cbp, cpsm), csm);
-        // CSM1 reads the first 8x2 or 16x16 texels. For color formats
-        // their swizzled storage fits in 64 bytes, or 1024/512 bytes.
-        // Expanding this to an entire logical page can incorrectly include
-        // the next physical page when CBP is not page aligned.
-        Range palette_range = op.range;
-        if (!csm && (cpsm == PSMCT32 || cpsm == PSMCT24 || cpsm == PSMCT16 || cpsm == PSMCT16S)) {
-            const std::uint64_t bytes = rec[6] ? ((cpsm == PSMCT32 || cpsm == PSMCT24) ? 1024u : 512u) : 64u;
-            palette_range = {static_cast<std::uint64_t>(cbp) * 256, static_cast<std::uint64_t>(cbp) * 256 + bytes};
-        }
-        const bool csm1_block_banks = !csm && (cpsm == PSMCT32 || cpsm == PSMCT24);
-        const std::uint64_t csm1_written = (csm || csm1_block_banks) ? 0u : last_written(palette_range);
+        const bool csm1_32 = !csm && (cpsm == PSMCT32 || cpsm == PSMCT24);
+        const bool csm1_16 = !csm && (cpsm == PSMCT16 || cpsm == PSMCT16S);
+        // Recognized CSM1 formats use the physical blocks of each bank.
+        // Unknown formats retain the conservative dependency range.
+        const std::uint64_t csm1_written = (csm || csm1_32 || csm1_16) ? 0u : last_written(op.range);
         for (std::uint32_t k = 0; k < banks; ++k) {
             const std::uint32_t dst = (first + k) & 31u;
             if (dst >= identity.banks.size()) continue;  // the sampler cannot select these entries
@@ -3854,7 +3855,9 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
             // the same 8x2 rectangle, regardless of the destination bank.
             const int x = static_cast<int>((cou + k) * 16);
             const int y = static_cast<int>(cov);
-            auto written = csm1_block_banks ? clut_csm1_bank_written32(cbp, rec[6] ? k : 0u) : csm1_written;
+            const std::uint32_t source_bank = rec[6] ? k : 0u;
+            auto written = csm1_32 ? clut_csm1_bank_written32(cbp, source_bank)
+                : csm1_16 ? clut_csm1_bank_written16(cbp, source_bank) : csm1_written;
             if (csm) {
                 if (cpsm == PSMCT32 || cpsm == PSMCT24) {
                     // COU aligns the 16 entries to two 8-pixel GS blocks.
