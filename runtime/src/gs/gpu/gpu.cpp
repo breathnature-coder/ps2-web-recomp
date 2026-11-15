@@ -3706,7 +3706,16 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
         const std::uint32_t banks = rec[6] ? 16u : 1u;
         const std::uint32_t first = csm ? rec[5] : (rec[6] ? 0u : rec[5] & 15u);
         const std::uint64_t source = mix(mix(cbp, cpsm), csm);
-        const std::uint64_t csm1_written = csm ? 0u : last_written(op.range);
+        // CSM1 reads the first 8x2 or 16x16 texels. For color formats
+        // their swizzled storage fits in 64 bytes, or 1024/512 bytes.
+        // Expanding this to an entire logical page can incorrectly include
+        // the next physical page when CBP is not page aligned.
+        Range palette_range = op.range;
+        if (!csm && (cpsm == PSMCT32 || cpsm == PSMCT24 || cpsm == PSMCT16 || cpsm == PSMCT16S)) {
+            const std::uint64_t bytes = rec[6] ? ((cpsm == PSMCT32 || cpsm == PSMCT24) ? 1024u : 512u) : 64u;
+            palette_range = {static_cast<std::uint64_t>(cbp) * 256, static_cast<std::uint64_t>(cbp) * 256 + bytes};
+        }
+        const std::uint64_t csm1_written = csm ? 0u : last_written(palette_range);
         for (std::uint32_t k = 0; k < banks; ++k) {
             const std::uint32_t dst = (first + k) & 31u;
             if (dst >= identity.banks.size()) continue;  // the sampler cannot select these entries
