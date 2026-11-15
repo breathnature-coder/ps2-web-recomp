@@ -257,8 +257,9 @@ using Clock = std::chrono::steady_clock;
 struct Stats {
     Clock::time_point since = Clock::now();
     std::uint64_t dispatches = 0, submits = 0, writes = 0, write_bytes = 0, reads = 0, read_bytes = 0, copies = 0, presents = 0, binds = 0,
-                  binds_skipped = 0;
+                  binds_skipped = 0, fences = 0, polls = 0;
     double issue_ms = 0, write_ms = 0, wait_ms = 0, read_ms = 0, swap_ms = 0;
+    double fence_ms = 0, poll_ms = 0, query_ms = 0;
     struct Entry {
         const char *name;
         double gpu_ms;
@@ -307,19 +308,23 @@ void collect_queries(bool wait) {
 
 void report_stats() {
     if (!stats_on()) return;
-    const double elapsed = ms_since(g_stats.since);
-    if (elapsed < 1000.0) return;
+    if (ms_since(g_stats.since) < 1000.0) return;
+    const auto query_start = Clock::now();
     collect_queries(false);
+    g_stats.query_ms += ms_since(query_start);
+    const double elapsed = ms_since(g_stats.since);
     const double per = 1000.0 / elapsed;
     double gpu = 0;
     for (const auto &e : g_stats.entries) gpu += e.gpu_ms;
     std::fprintf(stderr,
                  "[gl] per s: %llu dispatches in %llu submits, %llu copies, %llu presents | ms/s: issue %.0f write %.0f (%llux %.1f MB) "
-                 "wait %.0f read %.0f (%llux %.1f MB) swap %.0f | binds %llu skipped %llu | gpu %.0f:",
+                 "wait %.0f read %.0f (%llux %.1f MB) swap %.0f | sync: fence %.1f (%llux) poll %.1f (%llux) query %.1f ms/s | binds %llu skipped %llu | gpu %.0f:",
                  (unsigned long long)(g_stats.dispatches * per), (unsigned long long)(g_stats.submits * per), (unsigned long long)(g_stats.copies * per),
                  (unsigned long long)(g_stats.presents * per), g_stats.issue_ms * per, g_stats.write_ms * per, (unsigned long long)(g_stats.writes * per),
                  g_stats.write_bytes * per / 1048576.0, g_stats.wait_ms * per, g_stats.read_ms * per, (unsigned long long)(g_stats.reads * per),
-                 g_stats.read_bytes * per / 1048576.0, g_stats.swap_ms * per, (unsigned long long)(g_stats.binds * per),
+                 g_stats.read_bytes * per / 1048576.0, g_stats.swap_ms * per, g_stats.fence_ms * per,
+                 (unsigned long long)(g_stats.fences * per), g_stats.poll_ms * per, (unsigned long long)(g_stats.polls * per),
+                 g_stats.query_ms * per, (unsigned long long)(g_stats.binds * per),
                  (unsigned long long)(g_stats.binds_skipped * per), gpu * per);
     auto sorted = g_stats.entries;
     std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.gpu_ms > b.gpu_ms; });
@@ -446,18 +451,32 @@ std::deque<Pending> g_pending;
 
 void fence(std::function<void()> done) {
     current();
+    const bool measured = stats_on();
+    const auto start = measured ? Clock::now() : Clock::time_point{};
     g_pending.push_back({glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), std::move(done)});
     glFlush();
+    if (measured) {
+        g_stats.fence_ms += ms_since(start);
+        ++g_stats.fences;
+    }
 }
 
 void process(bool wait) {
     current();
     while (!g_pending.empty()) {
         Pending &p = g_pending.front();
-        GLenum r = glClientWaitSync(p.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        // fence() has already flushed this marker. Polling must not request
+        // another flush of commands submitted after it.
+        const bool measured = stats_on();
+        const auto poll_start = measured ? Clock::now() : Clock::time_point{};
+        GLenum r = glClientWaitSync(p.fence, 0, 0);
+        if (measured) {
+            g_stats.poll_ms += ms_since(poll_start);
+            ++g_stats.polls;
+        }
         if (wait && r == GL_TIMEOUT_EXPIRED) {
             const auto start = Clock::now();
-            while (r == GL_TIMEOUT_EXPIRED) r = glClientWaitSync(p.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000);
+            while (r == GL_TIMEOUT_EXPIRED) r = glClientWaitSync(p.fence, 0, 100'000'000);
             g_stats.wait_ms += ms_since(start);
         }
         if (r == GL_TIMEOUT_EXPIRED) return;  // later fences cannot be done either
