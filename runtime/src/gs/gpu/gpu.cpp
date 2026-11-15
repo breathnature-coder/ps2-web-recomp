@@ -661,7 +661,10 @@ std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
 struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
 std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
-std::uint64_t g_decode_completed_serial = 0;
+// Highest batch whose slots may be overwritten by a later GPU decode.
+// GL uses submission ordering plus a storage barrier; other backends wait
+// for completion. This value is not a CPU-visible GPU completion signal.
+std::uint64_t g_decode_reusable_serial = 0;
 std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0, g_decode_tail_words = 0;
 std::uint64_t g_decode_insufficient_space = 0, g_decode_fragmented_space = 0;
 void decode_release_block(const DecodeBlock &block) {
@@ -687,14 +690,14 @@ void decode_release_block(const DecodeBlock &block) {
 }
 void decode_retire(const Decoded &d) {
     const DecodeBlock block{d.offset, d.words, d.last_use_serial};
-    // Completed victims need no pending-map node or later collection pass.
-    // Unfinished references keep the same serial protection as before.
-    if (d.last_use_serial <= g_decode_completed_serial) decode_release_block(block);
+    // Reusable victims need no pending-map node or later collection pass.
+    // Current unsubmitted references retain their serial protection.
+    if (d.last_use_serial <= g_decode_reusable_serial) decode_release_block(block);
     else g_decode_retired.emplace(d.last_use_serial, block);
 }
 void decode_collect() {
     while (!g_decode_retired.empty() &&
-           g_decode_retired.begin()->first <= g_decode_completed_serial) {
+           g_decode_retired.begin()->first <= g_decode_reusable_serial) {
         const DecodeBlock block = g_decode_retired.begin()->second;
         g_decode_retired.erase(g_decode_retired.begin());
         decode_release_block(block);
@@ -744,14 +747,15 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     }
     // Select reclaim candidates once, oldest first. Repeatedly scanning the
     // entire hash table for each victim was O(entries * evictions) per miss.
-    // Never evict textures referenced by queued or unfinished GPU work.
+    // Never evict textures referenced by the current unsubmitted batch.
+    // The backend's safe reuse serial protects earlier submissions.
     // Keep scratch capacity across allocation misses to avoid repeated heap
     // allocation when the decoded cache is under pressure.
     using DecodeCacheIterator = decltype(g_decoded_cache.begin());
     static std::vector<DecodeCacheIterator> candidates;
     candidates.clear();
     candidates.reserve(g_decoded_cache.size());
-    // Unfinished allocations divide the arena into independent regions.
+    // Allocations beyond the safe reuse serial divide the arena into regions.
     // Free space on opposite sides of one cannot satisfy a single texture.
     static std::vector<DecodeBlock> protected_blocks;
     protected_blocks.clear();
@@ -761,7 +765,7 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
     std::uint64_t reclaimable = kDecodedWords - g_decoded_used;
     for (const auto &block : g_decode_free) reclaimable += block.words;
     for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it) {
-        if (it->second.last_use_serial <= g_decode_completed_serial) {
+        if (it->second.last_use_serial <= g_decode_reusable_serial) {
             candidates.push_back(it);
             reclaimable += it->second.words;
         } else {
@@ -878,6 +882,17 @@ bool decode_cache_on() {
         return env ? std::atoi(env) != 0 : default_on;
     }();
     return on;
+}
+
+bool decode_queue_reuse_on() {
+#ifdef PS2_GPU_GL
+    // Keep the previous CPU-fence path available for a controlled A/B test.
+    static const bool on = !std::getenv("PS2_DECODE_QUEUE_REUSE") ||
+                            std::atoi(std::getenv("PS2_DECODE_QUEUE_REUSE")) != 0;
+    return on;
+#else
+    return false;
+#endif
 }
 
 void plan_decodes(std::uint32_t prims) {
@@ -997,10 +1012,10 @@ void plan_decodes(std::uint32_t prims) {
                     : (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)
                         ? (decoded_offset = g_decoded_used, g_decoded_used += words, true)
                         : false))) {
-            // Never overwrite a decoded slot while queued native passes (or
-            // already submitted GPU work) may still reference its offset.
+            // Never overwrite a slot still protected by the backend reuse
+            // serial, especially one referenced by the current command batch.
             // Keep existing cached textures alive; this miss uses the direct
-            // GS-memory sampler until a synchronized reclamation is possible.
+            // GS-memory sampler until safe reclamation is possible.
             ++g_decode_capacity_bypasses;
             g_decode_capacity_texels += words;
             continue;
@@ -2822,6 +2837,7 @@ void submitted() {
                  static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
                  static_cast<double>(g_decode_tail_words - last_decode_tail) / seconds,
                  g_decode_retired.size(), g_decode_free.size());
+    std::fprintf(stderr, "[native] decode reuse: %s\n", !decode_cache_on() ? "disabled" : decode_queue_reuse_on() ? "queue-ordered" : "completion-fenced");
     static std::uint64_t last_precise_uploads = 0;
     std::fprintf(stderr, "[native] CLUT tracking: %.0f small uploads/s tracked by block\n",
                  static_cast<double>(g_clut_precise_uploads - last_precise_uploads) / seconds);
@@ -2900,17 +2916,26 @@ void submitted() {
     since = std::chrono::steady_clock::now();
 }
 
-void track_decode_completion(std::uint64_t serial) {
+void track_decode_submission(std::uint64_t serial) {
+    if (!g_decode || !decode_cache_on()) return;
+    if (decode_queue_reuse_on()) {
+        // The GL backend begins every submission with a shader-storage
+        // barrier. g_decoded is written only by GPU decode dispatches, so
+        // those later writes wait for all earlier shader reads. No host
+        // completion callback is needed to recycle a submitted batch's slots.
+        g_decode_reusable_serial = std::max(g_decode_reusable_serial, serial);
+        return;
+    }
     // One outstanding marker is enough: the next one covers every submit
     // queued before it. Keep the serial fixed while its callback is pending.
     static std::uint64_t pending_serial = 0;
-    if (!g_decode || !decode_cache_on() || pending_serial) return;
+    if (pending_serial) return;
     pending_serial = serial;
     WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
     decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
     decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *, void *) {
         if (status == WGPUQueueWorkDoneStatus_Success)
-            g_decode_completed_serial = std::max(g_decode_completed_serial, pending_serial);
+            g_decode_reusable_serial = std::max(g_decode_reusable_serial, pending_serial);
         pending_serial = 0;
     };
     wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
@@ -2969,7 +2994,7 @@ void profile_submit() {
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
-    track_decode_completion(g_serial);
+    track_decode_submission(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (n) {
@@ -3114,10 +3139,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
-    // The queue completion callback gates reuse of decoded texture slots.
-    // The serial belongs to the commands just submitted, before submitted()
-    // advances g_serial. A failed callback never authorizes reclamation.
-    track_decode_completion(g_serial);
+    // Authorize reuse only for the batch just submitted. The current batch
+    // serial advances in submitted(); it remains protected during recording.
+    // GL orders reuse on the GPU; the fallback uses completion callbacks.
+    track_decode_submission(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (measure && !first_compute_pass) {
