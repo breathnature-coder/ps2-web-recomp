@@ -2642,8 +2642,13 @@ void submitted() {
     static std::uint64_t last_capacity_bypasses = 0, last_capacity_texels = 0;
     static std::uint64_t last_decode_evictions = 0, last_decode_reclaimed = 0, last_decode_tail = 0;
     const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
-    if (hits + misses) {
-        const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses);
+    // Every eligible lookup either hits, finds a stale entry, or is absent.
+    // Admission and capacity bypasses remain misses even without a decode.
+    const auto invalidated = g_decode_invalidated - last_invalidated;
+    const auto absent = g_decode_cold - last_cold;
+    const auto lookups = hits + invalidated + absent;
+    if (lookups) {
+        const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(lookups);
         std::fprintf(stderr, "[native] decoded textures a second: %.0f found, %.0f decoded (%.0f texels), %.0f times the buffer full\n",
                      static_cast<double>(hits) / seconds, static_cast<double>(misses) / seconds,
                      static_cast<double>(g_decode_words - last_words) / seconds, static_cast<double>(g_decode_restarts - last_restarts) / seconds);
@@ -2651,6 +2656,9 @@ void submitted() {
                      hit_rate, static_cast<double>(g_decode_saved_words - last_saved_words) / seconds,
                      g_decoded_cache.size(), static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
                      static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+        std::fprintf(stderr, "[native] decode lookups: %.0f/s, %.0f hits/s, %.0f misses/s (cache %s)\n",
+                     static_cast<double>(lookups) / seconds, static_cast<double>(hits) / seconds,
+                     static_cast<double>(invalidated + absent) / seconds, decode_cache_on() ? "on" : "off");
         std::fprintf(stderr, "[native] decode cache misses: %.0f invalidated/s, %.0f absent/s, %.0f small-batch skips/s\n",
                      static_cast<double>(g_decode_invalidated - last_invalidated) / seconds,
                      static_cast<double>(g_decode_cold - last_cold) / seconds,
