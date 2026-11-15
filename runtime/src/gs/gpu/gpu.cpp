@@ -728,6 +728,21 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
             ++g_decode_fragmented_space;
             return false;
         }
+        // A completed texture in a smaller isolated region cannot help
+        // this request, even after every neighbour in that region is freed.
+        // Keep those entries resident and retain LRU order among the useful
+        // candidates. The sorted GPU-protected blocks delimit each region.
+        std::erase_if(candidates, [&](const DecodeCacheIterator &candidate) {
+            const auto next = std::upper_bound(protected_blocks.begin(), protected_blocks.end(),
+                                               candidate->second.offset,
+                                               [](std::uint32_t offset, const DecodeBlock &block) {
+                                                   return offset < block.offset;
+                                               });
+            const std::uint32_t hi = next == protected_blocks.end() ? kDecodedWords : next->offset;
+            const std::uint32_t lo = next == protected_blocks.begin() ? 0u
+                : (next - 1)->offset + (next - 1)->words;
+            return hi - lo < words;
+        });
     }
     // Heap construction is linear. Extract only as many oldest entries as
     // allocation needs instead of sorting every eligible texture.
