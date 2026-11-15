@@ -528,6 +528,15 @@ std::uint64_t clut_block_written(std::uint32_t block) {
     return std::max(g_clut_block_written[block], g_clut_page_written[block >> 5]);
 }
 
+std::uint64_t clut_csm1_bank_written32(std::uint32_t bp, std::uint32_t bank) {
+    // The shader swaps index bits 3 and 4 for a 256-entry CSM1 load.
+    // Each resulting 16-entry bank occupies one 8x2 rectangle within a
+    // single physical 256-byte block. Bank zero also covers a 16-entry load.
+    const std::uint32_t k = bank * 16u;
+    const std::uint32_t j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+    return clut_block_written(address32(bp, 1u, j & 15u, j >> 4u) >> 8);
+}
+
 std::uint64_t last_written(const Range &r) {
     if (r.hi - r.lo >= kMemorySize)
         return *std::max_element(std::begin(g_page_written), std::end(g_page_written));
@@ -3836,7 +3845,8 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
             const std::uint64_t bytes = rec[6] ? ((cpsm == PSMCT32 || cpsm == PSMCT24) ? 1024u : 512u) : 64u;
             palette_range = {static_cast<std::uint64_t>(cbp) * 256, static_cast<std::uint64_t>(cbp) * 256 + bytes};
         }
-        const std::uint64_t csm1_written = csm ? 0u : last_written(palette_range);
+        const bool csm1_block_banks = !csm && (cpsm == PSMCT32 || cpsm == PSMCT24);
+        const std::uint64_t csm1_written = (csm || csm1_block_banks) ? 0u : last_written(palette_range);
         for (std::uint32_t k = 0; k < banks; ++k) {
             const std::uint32_t dst = (first + k) & 31u;
             if (dst >= identity.banks.size()) continue;  // the sampler cannot select these entries
@@ -3844,7 +3854,7 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
             // the same 8x2 rectangle, regardless of the destination bank.
             const int x = static_cast<int>((cou + k) * 16);
             const int y = static_cast<int>(cov);
-            auto written = csm1_written;
+            auto written = csm1_block_banks ? clut_csm1_bank_written32(cbp, rec[6] ? k : 0u) : csm1_written;
             if (csm) {
                 if (cpsm == PSMCT32 || cpsm == PSMCT24) {
                     // COU aligns the 16 entries to two 8-pixel GS blocks.
@@ -3857,7 +3867,9 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
                     written = last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y));
                 }
             }
-            const auto layout = csm ? mix(mix(cbw, cou + k), cov) : (rec[6] ? k + 1u : 0u);
+            // Bank zero reads the same ordered colors in both 16-entry
+            // and 256-entry CSM1 loads, so the load size is not part of its key.
+            const auto layout = csm ? mix(mix(cbw, cou + k), cov) : (rec[6] ? k : 0u);
             identity.banks[dst] = mix(mix(source, layout), written);
         }
         identity.refresh_eight();
