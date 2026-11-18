@@ -31,6 +31,7 @@ extern const char kNativeShader[];
 // The OpenGL layer's (gl/webgpu_gl.cpp): a write to this buffer from its start replaces all of it, so the driver
 // may hand out new storage instead of waiting for the GPU to be done with the old.
 extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
+extern "C" void ps2GlSetDecodeQueueReuse(bool enabled);
 extern "C" bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder encoder, WGPUTexture source, WGPUTexture backdrop,
                                         std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 #endif
@@ -886,8 +887,9 @@ bool decode_cache_on() {
 
 bool decode_queue_reuse_on() {
 #ifdef PS2_GPU_GL
-    // Keep the previous CPU-fence path available for a controlled A/B test.
-    static const bool on = !std::getenv("PS2_DECODE_QUEUE_REUSE") ||
+    // Experimental: Switch feedback reported worse stutter. Require an
+    // explicit opt-in until a controlled device comparison shows a benefit.
+    static const bool on = std::getenv("PS2_DECODE_QUEUE_REUSE") &&
                             std::atoi(std::getenv("PS2_DECODE_QUEUE_REUSE")) != 0;
     return on;
 #else
@@ -3430,6 +3432,11 @@ bool init(Mode m) {
     g_decoded_used = 0;
     std::fill(std::begin(g_clut_identity), std::end(g_clut_identity), ClutIdentity{});
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+#ifdef PS2_GPU_GL
+    // Use the same decision for allocator eligibility and the GL barrier.
+    // Disabling the experiment must restore both parts of the old path.
+    ps2GlSetDecodeQueueReuse(g_decode && decode_cache_on() && decode_queue_reuse_on());
+#endif
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {

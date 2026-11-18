@@ -42,6 +42,10 @@ jobs:
         run: cmake -S . -B build-gl -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=gl
       - name: Compile OpenGL renderer and runtime
         run: cmake --build build-gl --target ps2runtime -j 2
+      - name: Check decode reuse barrier gate
+        run: |
+          clang++ -std=c++20 -O1 -Iruntime/include -Iruntime/src -Ithird_party/wgpu-native/include tests/gs_gl_queue_reuse_gate_test.cpp runtime/src/gs/gpu/gl/glapi.cpp runtime/src/gs/gpu/gl/shaders.cpp -lEGL -o build-gl/gs-gl-reuse-gate
+          build-gl/gs-gl-reuse-gate
 
   runtime-tests:
     runs-on: ubuntu-24.04

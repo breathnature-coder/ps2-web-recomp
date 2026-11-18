@@ -165,6 +165,7 @@ WGPUInstanceImpl g_instance;
 WGPUAdapterImpl g_adapter;
 WGPUDeviceImpl g_device;
 WGPUQueueImpl g_queue;
+bool g_decode_queue_reuse = false;
 WGPUQuerySetImpl g_query_set;
 WGPUPipelineLayoutImpl g_pipeline_layout;
 WGPUTextureImpl g_texture;
@@ -608,6 +609,8 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *, W
 
 WGPUQueue wgpuDeviceGetQueue(WGPUDevice) { return &g_queue; }
 
+void ps2GlSetDecodeQueueReuse(bool enabled) { g_decode_queue_reuse = enabled; }
+
 WGPUBool wgpuDevicePoll(WGPUDevice, WGPUBool wait, WGPUSubmissionIndex const *) {
     process(wait);
     return g_pending.empty();
@@ -698,7 +701,7 @@ void wgpuQueueSubmit(WGPUQueue, size_t count, WGPUCommandBuffer const *commands)
     // slot read by an earlier draw: order those reads before subsequent
     // shader writes without waiting for completion on the CPU. The existing
     // post-dispatch barrier handles visibility from decode writes to reads.
-    if (count) glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    if (count && g_decode_queue_reuse) glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     for (std::size_t i = 0; i < count; ++i)
         for (const Op &op : commands[i]->ops) op();
     g_stats.issue_ms += ms_since(start);
