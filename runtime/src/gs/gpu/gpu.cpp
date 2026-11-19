@@ -657,8 +657,35 @@ struct Decoded {
     std::uint64_t when;  // first write serial after decode or successful validation
     std::uint32_t words;
     std::uint64_t last_use_serial;
+    // unordered_map keeps node addresses stable across rehashes. Linking
+    // nodes directly avoids a second allocation or hash lookup on each hit.
+    const DecodeKey *key = nullptr;
+    Decoded *older = nullptr, *newer = nullptr;
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
+Decoded *g_decode_oldest = nullptr, *g_decode_newest = nullptr;
+
+void decode_lru_unlink(Decoded &d) {
+    if (d.older) d.older->newer = d.newer;
+    else if (g_decode_oldest == &d) g_decode_oldest = d.newer;
+    if (d.newer) d.newer->older = d.older;
+    else if (g_decode_newest == &d) g_decode_newest = d.older;
+    d.older = d.newer = nullptr;
+}
+
+void decode_lru_touch(Decoded &d) {
+    if (g_decode_newest == &d) return;
+    decode_lru_unlink(d);
+    d.older = g_decode_newest;
+    if (g_decode_newest) g_decode_newest->newer = &d;
+    else g_decode_oldest = &d;
+    g_decode_newest = &d;
+}
+
+void decode_cache_clear() {
+    g_decode_oldest = g_decode_newest = nullptr;
+    g_decoded_cache.clear();
+}
 struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
 std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
 std::vector<DecodeBlock> g_decode_free;
@@ -696,6 +723,23 @@ void decode_retire(const Decoded &d) {
     if (d.last_use_serial <= g_decode_reusable_serial) decode_release_block(block);
     else g_decode_retired.emplace(d.last_use_serial, block);
 }
+void decode_cache_erase(decltype(g_decoded_cache.begin()) it) {
+    decode_retire(it->second);
+    decode_lru_unlink(it->second);
+    g_decoded_cache.erase(it);
+}
+
+void decode_cache_store(const DecodeKey &key, Decoded value) {
+    auto [it, inserted] = g_decoded_cache.try_emplace(key, value);
+    if (!inserted) {
+        decode_retire(it->second);
+        decode_lru_unlink(it->second);
+        it->second = value;
+    }
+    it->second.key = &it->first;
+    decode_lru_touch(it->second);
+}
+
 void decode_collect() {
     while (!g_decode_retired.empty() &&
            g_decode_retired.begin()->first <= g_decode_reusable_serial) {
@@ -746,39 +790,24 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
         g_decoded_used += words;
         return true;
     }
-    // Select reclaim candidates once, oldest first. Repeatedly scanning the
-    // entire hash table for each victim was O(entries * evictions) per miss.
-    // Never evict textures referenced by the current unsubmitted batch.
-    // The backend's safe reuse serial protects earlier submissions.
-    // Keep scratch capacity across allocation misses to avoid repeated heap
-    // allocation when the decoded cache is under pressure.
-    using DecodeCacheIterator = decltype(g_decoded_cache.begin());
-    static std::vector<DecodeCacheIterator> candidates;
-    candidates.clear();
-    candidates.reserve(g_decoded_cache.size());
-    // Allocations beyond the safe reuse serial divide the arena into regions.
-    // Free space on opposite sides of one cannot satisfy a single texture.
+    // The LRU chain is ordered by monotonically increasing batch serials.
+    // Inspect only its protected suffix; eligible entries need no table scan
+    // or candidate heap rebuild on each allocation miss.
     static std::vector<DecodeBlock> protected_blocks;
     protected_blocks.clear();
-    // Count all space that could be made available without waiting. If
-    // even this upper bound cannot fit the request, preserve the cache:
-    // evicting every eligible texture would only end in the same bypass.
-    std::uint64_t reclaimable = kDecodedWords - g_decoded_used;
-    for (const auto &block : g_decode_free) reclaimable += block.words;
-    for (auto it = g_decoded_cache.begin(); it != g_decoded_cache.end(); ++it) {
-        if (it->second.last_use_serial <= g_decode_reusable_serial) {
-            candidates.push_back(it);
-            reclaimable += it->second.words;
-        } else {
-            const auto &d = it->second;
-            protected_blocks.push_back({d.offset, d.words, d.last_use_serial});
-        }
+    std::uint64_t reclaimable = kDecodedWords;
+    for (auto *d = g_decode_newest; d && d->last_use_serial > g_decode_reusable_serial; d = d->older) {
+        protected_blocks.push_back({d->offset, d->words, d->last_use_serial});
+        reclaimable -= d->words;
+    }
+    for (const auto &[serial, block] : g_decode_retired) {
+        protected_blocks.push_back(block);
+        reclaimable -= block.words;
     }
     if (reclaimable < words) {
         ++g_decode_insufficient_space;
         return false;
     }
-    for (const auto &[serial, block] : g_decode_retired) protected_blocks.push_back(block);
     if (!protected_blocks.empty()) {
         std::sort(protected_blocks.begin(), protected_blocks.end(),
                   [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
@@ -797,34 +826,27 @@ bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
             ++g_decode_fragmented_space;
             return false;
         }
-        // A completed texture in a smaller isolated region cannot help
-        // this request, even after every neighbour in that region is freed.
-        // Keep those entries resident and retain LRU order among the useful
-        // candidates. The sorted GPU-protected blocks delimit each region.
-        std::erase_if(candidates, [&](const DecodeCacheIterator &candidate) {
+    }
+    // Walk useful victims in LRU order. The next pointer is captured before
+    // erasing a map node; no iterator survives an insertion or rehash.
+    for (auto *victim = g_decode_oldest; victim && victim->last_use_serial <= g_decode_reusable_serial;) {
+        auto *next_victim = victim->newer;
+        if (!protected_blocks.empty()) {
             const auto next = std::upper_bound(protected_blocks.begin(), protected_blocks.end(),
-                                               candidate->second.offset,
+                                               victim->offset,
                                                [](std::uint32_t offset, const DecodeBlock &block) {
                                                    return offset < block.offset;
                                                });
             const std::uint32_t hi = next == protected_blocks.end() ? kDecodedWords : next->offset;
             const std::uint32_t lo = next == protected_blocks.begin() ? 0u
                 : (next - 1)->offset + (next - 1)->words;
-            return hi - lo < words;
-        });
-    }
-    // Heap construction is linear. Extract only as many oldest entries as
-    // allocation needs instead of sorting every eligible texture.
-    const auto newer = [](const auto &a, const auto &b) {
-        return a->second.last_use_serial > b->second.last_use_serial;
-    };
-    std::make_heap(candidates.begin(), candidates.end(), newer);
-    while (!candidates.empty()) {
-        std::pop_heap(candidates.begin(), candidates.end(), newer);
-        const auto victim = candidates.back();
-        candidates.pop_back();  // discard its iterator before erasing the entry
-        decode_retire(victim->second);
-        g_decoded_cache.erase(victim);
+            if (hi - lo < words) {
+                victim = next_victim;
+                continue;  // this isolated region cannot help the request
+            }
+        }
+        decode_cache_erase(g_decoded_cache.find(*victim->key));
+        victim = next_victim;
         ++g_decode_evictions;
         decode_collect();
         if (take_free()) return true;
@@ -906,7 +928,7 @@ void plan_decodes(std::uint32_t prims) {
         // The uncached path resets the append cursor after each submit.
         // Recycled offsets from the persistent cache must never be mixed
         // with those transient allocations.
-        g_decoded_cache.clear();
+        decode_cache_clear();
         g_decode_free.clear();
         g_decode_retired.clear();
         if (prims <= kDecodePrims) return;
@@ -956,13 +978,13 @@ void plan_decodes(std::uint32_t prims) {
                 w[24] = decoded.offset;
                 decoded.when = g_write_clock + 1;
                 decoded.last_use_serial = g_serial;
+                decode_lru_touch(decoded);
                 ++g_decode_hits;
                 g_decode_saved_words += decoded.words;
                 continue;
             }
             ++g_decode_invalidated;
-            decode_retire(found->second);
-            g_decoded_cache.erase(found);
+            decode_cache_erase(found);
         } else {
             ++g_decode_cold;
             if (cache && decode_key_diagnostics_on()) {
@@ -1027,7 +1049,7 @@ void plan_decodes(std::uint32_t prims) {
         // Uncached Switch builds must not populate the persistent hash table:
         // it is discarded at the start of the next batch and can never yield
         // a cross-batch hit. Avoid per-texture hashing and allocations.
-        if (cache) g_decoded_cache[key] = {decoded_offset, g_write_clock + 1, words, g_serial};
+        if (cache) decode_cache_store(key, {decoded_offset, g_write_clock + 1, words, g_serial});
         ++g_decode_misses;
         g_decode_words += words;
     }
@@ -3426,7 +3448,7 @@ bool init(Mode m) {
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
-    g_decoded_cache.clear();
+    decode_cache_clear();
     g_decode_free.clear();
     g_decode_retired.clear();
     g_decoded_used = 0;
@@ -4036,7 +4058,7 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
     wrote(Range{0, kMemorySize});
-    g_decoded_cache.clear();
+    decode_cache_clear();
     g_decode_free.clear();
     g_decode_retired.clear();
     g_decoded_used = 0;
