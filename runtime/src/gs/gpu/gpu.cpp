@@ -1,5 +1,6 @@
 #include "gpu.hpp"
 #include "decoded_arena.h"
+#include "path_profile.h"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
@@ -1196,6 +1197,76 @@ std::uint64_t g_feedback_copy_pixels = 0;
 std::uint64_t g_feedback_group_calls = 0;
 std::uint64_t g_feedback_outline_tests = 0;
 std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
+PathProfile g_path_profile;
+bool path_profile_on() {
+    static const bool on = std::getenv("PS2_GS_PATH_STATS") && std::strcmp(std::getenv("PS2_GS_PATH_STATS"), "1") == 0;
+    return on;
+}
+
+// Count work scheduled by flush_batch; this is CPU preparation time, not GPU
+// elapsed time or a claim that the batch caused all future queue stalls.
+struct PathSample {
+    bool enabled = path_profile_on();
+    PathKey key{};
+    PathCost before{};
+    std::chrono::steady_clock::time_point start;
+    explicit PathSample(std::uint32_t prims) {
+        if (!enabled) return;
+        const Batch &b = g_batch;
+        key = path_key(b.setups.data() + b.prims[0] * kSetupWords, b.prims[1]);
+        for (std::uint32_t i = 1; i < prims; ++i) {
+            const auto *p = b.prims.data() + i * kPrimWords;
+            if (path_key(b.setups.data() + p[0] * kSetupWords, p[1]) != key) {
+                key[9] = 1; // First family is only a label for this mixed batch.
+                break;
+            }
+        }
+        before.prims = prims;
+        before.stores = g_stores; before.loads = g_loads;
+        before.copies = g_feedback_copies; before.copy_pixels = g_feedback_copy_pixels;
+        start = std::chrono::steady_clock::now();
+    }
+    void finish(bool native) {
+        if (!enabled) return;
+        PathCost cost;
+        cost.cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        cost.batches = 1; cost.prims = before.prims; cost.native = native; cost.mixed = key[9];
+        cost.stores = g_stores - before.stores; cost.loads = g_loads - before.loads;
+        cost.copies = g_feedback_copies - before.copies; cost.copy_pixels = g_feedback_copy_pixels - before.copy_pixels;
+        g_path_profile.add(key, cost);
+    }
+};
+
+void report_paths() {
+    if (!path_profile_on()) return;
+    static auto since = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - since).count();
+    if (seconds < 5.0) return;
+    const auto print = [](const PathCost &c) {
+        std::fprintf(stderr, " batches=%.0f prims=%.0f native_batches=%.0f mixed_batches=%.0f cpu_prepare_ms=%.3f stores=%.0f loads=%.0f feedback_copies=%.0f feedback_source_pixels=%.0f\n",
+                     double(c.batches), double(c.prims), double(c.native), double(c.mixed), c.cpu_ms,
+                     double(c.stores), double(c.loads), double(c.copies), double(c.copy_pixels));
+    };
+    std::fprintf(stderr, "[gs-path] window_s=%.3f families=%zu total", seconds, g_path_profile.rows.size());
+    print(g_path_profile.total);
+    using Row = decltype(g_path_profile.rows)::value_type;
+    std::vector<const Row *> order;
+    for (const auto &row : g_path_profile.rows) order.push_back(&row);
+    std::sort(order.begin(), order.end(), [](const Row *a, const Row *b) {
+        if (a->second.cpu_ms != b->second.cpu_ms) return a->second.cpu_ms > b->second.cpu_ms;
+        return a->first < b->first;
+    });
+    for (std::size_t i = 0; i < std::min<std::size_t>(8, order.size()); ++i) {
+        std::fprintf(stderr, "[gs-path] family=");
+        for (auto word : order[i]->first) std::fprintf(stderr, "%08X:", word);
+        print(order[i]->second);
+    }
+    std::fprintf(stderr, "[gs-path] overflow");
+    print(g_path_profile.overflow);
+    g_path_profile.clear();
+    since = now;
+}
 bool g_refusal_counted = false;  // flush_native said why it gave a batch up
 WGPUBindGroup g_native_group = nullptr;
 WGPUShaderModule g_native_module = nullptr;
@@ -2291,6 +2362,8 @@ void flush_batch() {
     // 140 such batches a frame, each read by the next: a tile of the picture, then a palette made from it.
     // PS2_NATIVE_SMALL=<pixels> sets how small (4096 by default, 0 for never).
     static const long small = std::getenv("PS2_NATIVE_SMALL") ? std::atol(std::getenv("PS2_NATIVE_SMALL")) : 4096;
+    PathSample path_sample(prims);
+    bool used_native = false;
     bool native = b.native && g_native_batches < limit;
     if (native && static_cast<long>(b.maxx - b.minx + 1) * (b.maxy - b.miny + 1) <= small) {
         bool in_memory = true;
@@ -2305,6 +2378,7 @@ void flush_batch() {
         }
     }
     if (native && flush_native(prims)) {
+        used_native = true;
         ++g_native_batches;
         g_native_prims += prims;
         census(prims, false);
@@ -2320,6 +2394,7 @@ void flush_batch() {
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     // Whatever was drawn over the counting texture of GT4's colour correction, it no longer counts.
     if (g_lut.count_ok && pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy).overlaps(g_lut.count_range.lo, g_lut.count_range.hi)) g_lut.count_ok = false;
+    path_sample.finish(used_native);
     clear_batch();
 }
 
@@ -2756,6 +2831,7 @@ void submitted() {
     g_native_passes.clear();
     release_retired();
     if (g_trace > 0) std::fprintf(stderr, "[trace] ---- submitted, %d to go\n", --g_trace);
+    report_paths();
     // PS2_GL_STATS (the Switch build's --stats) or PS2_NATIVE_STATS: once a second, how much each rasterizer drew
     // and how often a target went to GS memory and back. What stays with the compute rasterizer is what costs.
     static const bool report = g_native && (std::getenv("PS2_GL_STATS") || std::getenv("PS2_NATIVE_STATS"));
