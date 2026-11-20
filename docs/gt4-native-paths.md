@@ -51,6 +51,43 @@ ordinary batch flushing are not attributed here. Compare with existing global
 timing/transfer counters; do not mistake partial attribution for total traffic.
 Short sessions ending before the reporting boundary may have no output.
 
+## Surface conversion attribution
+
+The same switch also emits `[gs-transfer]` in the same five-second window.
+Unlike batch-family costs, these buckets include **all** calls to store/load
+native surfaces, including calls outside ordinary batch flushing. Each operation
+is counted once. This is not a count of all GPU copies, uploads or readbacks.
+
+| Store cause | Meaning |
+| --- | --- |
+| 0 | Other/default synchronization, including copy/readback/display callers |
+| 1 | Texture read by a native batch |
+| 2 | Target of a compute batch |
+| 3 | Texture read by a compute batch |
+| 4 | Upload or CLUT operation |
+| 5 | Overlapping native target |
+| 6 | Native surface retirement/eviction |
+| 7 | Explicit sync-all |
+
+Load causes are a **decimal bit mask**: bits 0..5 use the corresponding write
+causes above, bit 6 means newly allocated surface, and bit 7 means forced reload
+by the existing PS2_NATIVE_SYNC diagnostic. A surface remembers all invalidating
+causes until loaded, even across report windows. For example, mask 80 combines
+initial allocation (64) and upload/CLUT (16). Its bytes belong to that combination
+once, not independently to both causes. Reasons describe the pending stale span;
+they do not partition that span by exact writer or identify the originating VU.
+
+`source_pixels` is the unscaled scheduled rectangle area. `native_rect_bytes`
+is its native RGBA8/Depth32Float footprint: area × scale² × 4. It is **not**
+measured DRAM traffic, GS-format payload size, or GPU time. A repeated conversion
+counts repeatedly. Page-aligned stale spans and store rectangles can include
+untouched pixels, making these values useful for identifying amplification.
+
+First compare large store/load buckets with GPU timings. A low draw count with
+large conversion footprints can be a stronger candidate than a frequent cheap
+draw. Retaining a target is safe only after proving all aliasing consumers can
+read the retained representation or have a correctly ordered fallback.
+
 ## Next implementation gates
 
 1. Correlate VU code hashes and GIF sequences with costly families. Add transfer
@@ -74,11 +111,15 @@ Short sessions ending before the reporting boundary may have no output.
 - Bounded-family accounting test passes with AddressSanitizer and UBSan, and
   with warnings treated as errors. It checks relocation-insensitive grouping,
   significant state differences, saturation, overflow conservation and reset.
+- Surface accounting tests cover scale-squared footprints, values exceeding
+  32 bits, mixed invalidation buckets without double counting, and reset.
 - Renderer syntax checks pass for both GL and WebGPU configurations.
 - On Mesa llvmpipe, 12 deterministic synthetic race scenes produce byte-identical
   GS memory dumps with path statistics enabled and disabled. This comparison is
   between the two GPU runs; it does not assert equality with the software GS
   reference or prove GT4-specific visual correctness.
+- After adding surface-conversion attribution, the enabled 12-scene dump also
+  matches the pre-change disabled-statistics dump byte for byte.
 - CMake is unavailable in the local environment; the GL comparison executable
   was built directly from the runtime sources with GCC. The new accounting test
   is registered with CTest for the existing CI workflow.

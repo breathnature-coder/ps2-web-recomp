@@ -1154,6 +1154,7 @@ struct Surface {
     bool dirty = false;  // the texture is newer than GS memory inside this rectangle
     int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
     int stale0 = 0, stale1 = -1;  // GS memory is newer than the texture in these rows
+    std::uint32_t stale_causes = 64; // Diagnostic only: initial allocation, then write-cause bits.
     std::uint64_t used = 0;
 };
 
@@ -1198,6 +1199,7 @@ std::uint64_t g_feedback_group_calls = 0;
 std::uint64_t g_feedback_outline_tests = 0;
 std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
 PathProfile g_path_profile;
+SurfaceTraffic g_surface_traffic;
 bool path_profile_on() {
     static const bool on = std::getenv("PS2_GS_PATH_STATS") && std::strcmp(std::getenv("PS2_GS_PATH_STATS"), "1") == 0;
     return on;
@@ -1264,6 +1266,18 @@ void report_paths() {
     }
     std::fprintf(stderr, "[gs-path] overflow");
     print(g_path_profile.overflow);
+    // Includes transfers outside flush_batch (uploads, display, readback, etc.).
+    const auto transfers = [](const char *direction, const auto &buckets) {
+        for (std::size_t i = 0; i < buckets.size(); ++i) {
+            const auto &v = buckets[i];
+            if (!v.operations) continue;
+            std::fprintf(stderr, "[gs-transfer] %s=%zu operations=%.0f source_pixels=%.0f native_rect_bytes=%.0f\n",
+                         direction, i, double(v.operations), double(v.source_pixels), double(v.native_rect_bytes));
+        }
+    };
+    transfers("store_cause", g_surface_traffic.stores);
+    transfers("load_cause_mask", g_surface_traffic.loads);
+    g_surface_traffic.clear();
     g_path_profile.clear();
     since = now;
 }
@@ -1330,7 +1344,7 @@ bool native_debug() {
 }
 
 // What a target was written back to GS memory for, counted for the [native] line.
-const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", ""};
+const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", "native target alias"};
 std::uint64_t g_store_cause[6] = {};
 std::uint32_t g_sync_cause = 0;
 
@@ -1548,7 +1562,7 @@ bool surface_rows(const Surface &s, const Range &r, int &y0, int &y1) {
     return true;
 }
 
-void store_surface(Surface &s) {
+void store_surface(Surface &s, std::uint32_t profile_cause = ~0u) {
     if (!s.dirty) return;
     s.dirty = false;
     const std::uint32_t w = static_cast<std::uint32_t>(s.dx1 - s.dx0 + 1), h = static_cast<std::uint32_t>(s.dy1 - s.dy0 + 1);
@@ -1558,6 +1572,7 @@ void store_surface(Surface &s) {
     g_commands.push_back(c);
     wrote(pages(s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1));
     ++g_stores;
+    if (path_profile_on()) g_surface_traffic.stores[profile_cause == ~0u ? g_sync_cause : profile_cause].add(w, h, g_scale);
     ++g_store_cause[g_sync_cause];
     TRACE("store %s %X/%u/%02X rect %d,%d-%d,%d for %s", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1, kStoreCause[g_sync_cause]);
     if (g_trace > 0 && g_sync_range) std::fprintf(stderr, " %llX-%llX", static_cast<unsigned long long>(g_sync_range->lo), static_cast<unsigned long long>(g_sync_range->hi));
@@ -1583,16 +1598,17 @@ void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
             if (s.dirty && y0 <= s.dy1 && s.dy0 <= y1) store_surface(s);
             s.stale0 = y0;
             s.stale1 = y1;
+            if (path_profile_on()) s.stale_causes |= 1u << g_sync_cause;
         }
     }
 }
 
 void sync_all() {
-    for (const auto &p : g_surfaces) store_surface(*p);
+    for (const auto &p : g_surfaces) store_surface(*p, 7);
 }
 
 void retire_surface(std::size_t index) {
-    store_surface(*g_surfaces[index]);
+    store_surface(*g_surfaces[index], 6);
     g_retired.push_back(std::move(g_surfaces[index]));  // commands not yet submitted may still name it
     g_surfaces.erase(g_surfaces.begin() + static_cast<std::ptrdiff_t>(index));
 }
@@ -1670,6 +1686,10 @@ void load_surface(Surface &s) {
     g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
     g_native_passes.push_back(std::move(pass));
     TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.stale0, s.stale1);
+    if (path_profile_on()) {
+        g_surface_traffic.loads[s.stale_causes].add(s.width, static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), g_scale);
+        s.stale_causes = 0;
+    }
     s.stale0 = 0;
     s.stale1 = -1;
     ++g_loads;
@@ -1864,12 +1884,18 @@ bool flush_native(std::uint32_t prims) {
     g_sync_cause = 1;
     for (const Range &t : g_batch_reads) sync_memory(t, false);
     g_sync_cause = 0;
+    g_sync_cause = 5;
     sync_memory(fb, true, color);
     if (depth) sync_memory(z, b.zwrite, depth);
+    g_sync_cause = 0;
     // PS2_NATIVE_SYNC=1 reloads the targets before every batch and writes them back after it: slow, and what the
     // picture should be if the tracking of who holds the newer pixels were at fault.
     static const bool paranoid = std::getenv("PS2_NATIVE_SYNC") != nullptr;
     if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 1) {
+        if (path_profile_on()) {
+            color->stale_causes |= 128u;
+            if (depth) depth->stale_causes |= 128u;
+        }
         color->stale0 = 0;
         color->stale1 = static_cast<int>(color->height) - 1;
         if (depth) depth->stale0 = 0, depth->stale1 = static_cast<int>(depth->height) - 1;

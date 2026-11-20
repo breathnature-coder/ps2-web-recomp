@@ -39,5 +39,19 @@ int main() {
     auto mixed = base; mixed[9] = 1; c.mixed = 1;
     p.add(mixed, c); c.mixed = 0; p.add(base, c);
     CHECK(p.rows.size() == 2 && p.total.mixed == 1);
+    SurfaceTraffic traffic;
+    traffic.stores[6].add(640, 224, 1);
+    traffic.stores[6].add(64, 32, 2);
+    CHECK(traffic.stores[6].operations == 2);
+    CHECK(traffic.stores[6].source_pixels == 145408);
+    CHECK(traffic.stores[6].native_rect_bytes == 606208);
+    // Multiple invalidations are one mask bucket, not duplicated transfers.
+    traffic.loads[64 | 16 | 32].add(2048, 2048, 16);
+    CHECK(traffic.loads[112].native_rect_bytes == 4294967296ULL);
+    CHECK(traffic.loads[64].operations == 0 && traffic.loads[16].operations == 0);
+    traffic.loads[128].add(1, 1, 1);
+    traffic.clear();
+    for (const auto &v : traffic.stores) CHECK(v.operations == 0 && v.native_rect_bytes == 0);
+    for (const auto &v : traffic.loads) CHECK(v.operations == 0 && v.source_pixels == 0);
     return 0;
 }

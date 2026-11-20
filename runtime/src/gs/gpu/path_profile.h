@@ -5,6 +5,24 @@
 #include <map>
 
 namespace ps2::gs {
+struct SurfaceTransfer {
+    std::uint64_t operations = 0, source_pixels = 0, native_rect_bytes = 0;
+    void add(std::uint32_t width, std::uint32_t height, std::uint32_t scale) {
+        ++operations;
+        const std::uint64_t pixels = std::uint64_t(width) * height;
+        source_pixels += pixels;
+        // RGBA8 and Depth32Float native surfaces both occupy four bytes/texel.
+        // Rectangle footprint, not measured memory-controller traffic.
+        native_rect_bytes += pixels * scale * scale * 4;
+    }
+};
+struct SurfaceTraffic {
+    // Store: sync causes 0..5, eviction=6, explicit sync-all=7.
+    std::array<SurfaceTransfer, 8> stores{};
+    // Load: accumulated invalidation causes 0..5 as bits, initial allocation=bit 6, debug reload=bit 7.
+    std::array<SurfaceTransfer, 256> loads{};
+    void clear() { stores = {}; loads = {}; }
+};
 // A diagnostic family, NOT a rendering equivalence key. Addresses, dimensions,
 // CLUT contents, fog and vertex values deliberately do not identify a family.
 using PathKey = std::array<std::uint32_t, 10>;
