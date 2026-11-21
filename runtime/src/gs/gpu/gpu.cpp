@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 #include "decoded_arena.h"
 #include "path_profile.h"
+#include "stale_rows.h"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
@@ -1154,6 +1155,7 @@ struct Surface {
     bool dirty = false;  // the texture is newer than GS memory inside this rectangle
     int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
     int stale0 = 0, stale1 = -1;  // GS memory is newer than the texture in these rows
+    StaleRows stale_rows;
     std::uint32_t stale_causes = 64; // Diagnostic only: initial allocation, then write-cause bits.
     std::uint64_t used = 0;
 };
@@ -1200,6 +1202,11 @@ std::uint64_t g_feedback_outline_tests = 0;
 std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
 PathProfile g_path_profile;
 SurfaceTraffic g_surface_traffic;
+std::uint64_t g_sparse_saved_pixels = 0, g_sparse_gap_stores = 0;
+bool sparse_load_on() {
+    static const bool on = std::getenv("PS2_NATIVE_SPARSE_LOAD") && std::strcmp(std::getenv("PS2_NATIVE_SPARSE_LOAD"), "1") == 0;
+    return on;
+}
 bool path_profile_on() {
     static const bool on = std::getenv("PS2_GS_PATH_STATS") && std::strcmp(std::getenv("PS2_GS_PATH_STATS"), "1") == 0;
     return on;
@@ -1589,13 +1596,18 @@ void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
         if (s.dirty && surface_range(s, s.dy0, s.dy1).overlaps(r.lo, r.hi)) store_surface(s);
         int y0, y1;
         if (write && surface_rows(s, r, y0, y1)) {
-            // One span of stale rows is kept, so it can take in rows nothing wrote to. They are loaded again all the
-            // same: pixels only the texture has in them are written back before that.
+            // The baseline reloads the enclosing interval. The opt-in path retains gaps,
+            // but collapses to an enclosure after four spans. Preserve dirty pixels
+            // before any such conservative expansion can overwrite them.
+            if (sparse_load_on()) s.stale_rows.add(y0, y1);
             if (s.stale1 >= s.stale0) {
                 y0 = std::min(y0, s.stale0);
                 y1 = std::max(y1, s.stale1);
             }
-            if (s.dirty && y0 <= s.dy1 && s.dy0 <= y1) store_surface(s);
+            const bool touches_dirty = sparse_load_on() ? s.stale_rows.overlaps(s.dy0, s.dy1)
+                                                        : y0 <= s.dy1 && s.dy0 <= y1;
+            if (s.dirty && !touches_dirty && y0 <= s.dy1 && s.dy0 <= y1) ++g_sparse_gap_stores;
+            if (s.dirty && touches_dirty) store_surface(s);
             s.stale0 = y0;
             s.stale1 = y1;
             if (path_profile_on()) s.stale_causes |= 1u << g_sync_cause;
@@ -1673,6 +1685,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     s->group = wgpuDeviceCreateBindGroup(g_device, &bd);
     s->stale0 = 0;
     s->stale1 = static_cast<int>(height) - 1;  // nothing of GS memory is in it yet
+    if (sparse_load_on()) s->stale_rows.add(0, s->stale1);
     s->used = ++g_surface_clock;
     g_surfaces.push_back(std::move(s));
     return g_surfaces.back().get();
@@ -1681,18 +1694,28 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
 void load_surface(Surface &s) {
     if (s.stale1 < s.stale0) return;
     NativePass pass{s.depth ? nullptr : &s, s.depth ? &s : nullptr, {}};
-    pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw, s.psm}), 3, 0, static_cast<std::uint32_t>(s.stale0), s.width,
-                          static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), 0.0f});
+    const auto load = [&](int first, int last) {
+        const auto height = static_cast<std::uint32_t>(last - first + 1);
+        pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw, s.psm}), 3, 0,
+                              static_cast<std::uint32_t>(first), s.width, height, 0.0f});
+        TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, first, last);
+        if (path_profile_on()) g_surface_traffic.loads[s.stale_causes].add(s.width, height, g_scale);
+        ++g_loads;
+    };
+    if (sparse_load_on()) {
+        std::uint64_t rows = 0;
+        for (unsigned i = 0; i < s.stale_rows.count; ++i) {
+            load(s.stale_rows.spans[i].first, s.stale_rows.spans[i].last);
+            rows += s.stale_rows.spans[i].last - s.stale_rows.spans[i].first + 1;
+        }
+        g_sparse_saved_pixels += (std::uint64_t(s.stale1 - s.stale0 + 1) - rows) * s.width;
+    } else load(s.stale0, s.stale1);
     g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
     g_native_passes.push_back(std::move(pass));
-    TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.stale0, s.stale1);
-    if (path_profile_on()) {
-        g_surface_traffic.loads[s.stale_causes].add(s.width, static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), g_scale);
-        s.stale_causes = 0;
-    }
+    s.stale_causes = 0;
+    s.stale_rows.clear();
     s.stale0 = 0;
     s.stale1 = -1;
-    ++g_loads;
 }
 
 void plan_decodes(std::uint32_t prims);
@@ -1895,6 +1918,14 @@ bool flush_native(std::uint32_t prims) {
         if (path_profile_on()) {
             color->stale_causes |= 128u;
             if (depth) depth->stale_causes |= 128u;
+        }
+        if (sparse_load_on()) {
+            // Forced full reload also covers gaps we deliberately retained.
+            // Preserve those newer pixels before expanding the stale coverage.
+            store_surface(*color);
+            if (depth) store_surface(*depth);
+            color->stale_rows.add(0, static_cast<int>(color->height) - 1);
+            if (depth) depth->stale_rows.add(0, static_cast<int>(depth->height) - 1);
         }
         color->stale0 = 0;
         color->stale1 = static_cast<int>(color->height) - 1;
@@ -4183,6 +4214,8 @@ std::uint64_t corrected_tiles() { return g_lut_tiles; }
 
 void stats() {
     if (g_mode == Mode::off) return;
+    if (sparse_load_on()) std::fprintf(stderr, "[gpu] sparse loads: %.0f source pixels skipped, %.0f gap store decisions deferred\n",
+                                     double(g_sparse_saved_pixels), double(g_sparse_gap_stores));
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");

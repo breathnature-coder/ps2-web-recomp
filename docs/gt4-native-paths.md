@@ -90,6 +90,47 @@ read the retained representation or have a correctly ordered fallback.
 
 ## Next implementation gates
 
+### Experimental sparse surface reloads
+
+`@env PS2_NATIVE_SPARSE_LOAD=1` enables an opt-in resource-retention prototype.
+The default (unset or `0`) keeps the previous bounding-interval reload policy.
+This is an optimization of resource ownership in the existing renderer, not a
+deko3d backend or a GT4 semantic draw replacement.
+
+Each native surface retains up to four disjoint stale row spans. Reloads draw
+only those spans, inside one native pass; untouched gaps keep their newer native
+pixels. A fifth disjoint span collapses the list to its enclosing interval and
+preserves any dirty native pixels before that expanded reload. Initial surfaces
+and PS2_NATIVE_SYNC forced reloads still initialize the complete target.
+Before a forced full reload, the opt-in path writes back retained dirty pixels
+in the gaps; otherwise that diagnostic would destroy data the sparse path kept.
+The conservative GS address-overlap checks and compatibility renderer remain.
+Broad source dependency ranges can still invalidate the full interval, so this
+does not guarantee savings for typical GT4 uploads or draws.
+
+`[gpu] sparse loads` reports source pixels skipped relative to the enclosing
+interval, and gap store decisions deferred. The latter is NOT net stores saved:
+several decisions can concern the same dirty surface, which may later need a
+writeback. Compare actual store totals and frame time separately. `loads` now
+counts reload rectangles, not passes, when this option is enabled.
+
+Local Mesa llvmpipe validation:
+
+- Two targeted phases exercise disjoint top/bottom updates around dirty native
+  pixels, and overflow to five spans. Both modes match the software GS reference.
+  The prototype skips 143,360 source pixels; stores decrease from 6 to 5, while
+  reload rectangles increase from 3 to 4. These are synthetic workload counts,
+  not measured GT4 frame-rate improvements.
+- Forty deterministic synthetic race scenes have byte-identical GS memory and
+  display outputs between enabled and disabled modes (zero tolerance).
+- The targeted fixture also passes at 2x resolution and with forced full reloads
+  (`PS2_NATIVE_SYNC=1`); the latter includes the dirty-gap writeback regression.
+- The bounded interval test runs 100,000 insertion steps with coverage checks,
+  plus gap retention, collapse and boundary cases under ASan/UBSan.
+
+Switch timing and GT4 scene coverage are still unverified. Keep this opt-in until
+saved conversion work outweighs the extra draw and tracking costs on hardware.
+
 1. Correlate VU code hashes and GIF sequences with costly families. Add transfer
    byte/range and ownership-transition attribution before choosing a final pass.
 2. Candidate: ordinary textured opaque geometry. It is not yet established as
