@@ -2,6 +2,7 @@
 #include "decoded_arena.h"
 #include "path_profile.h"
 #include "stale_rows.h"
+#include "upload_span.h"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
@@ -2489,7 +2490,15 @@ void emit_pre(std::size_t upto) {
     }
     if (!g_surfaces.empty()) {
         g_sync_cause = 4;
-        for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
+        for (const PreOp &op : g_pre) {
+            UploadSpan span;
+            if (sparse_load_on() && !op.clut &&
+                upload_span32(op.rec[0], op.rec[1], op.rec[2], op.x0, op.y0, op.x1, op.y1, span)) {
+                Range touched;
+                touched.add(span.lo, span.hi);
+                sync_memory(touched, true);
+            } else sync_memory(op.range, !op.clut);
+        }
         g_sync_cause = 0;
     }
     if (g_trace > 0)

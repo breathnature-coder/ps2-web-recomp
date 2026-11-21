@@ -104,9 +104,14 @@ preserves any dirty native pixels before that expanded reload. Initial surfaces
 and PS2_NATIVE_SYNC forced reloads still initialize the complete target.
 Before a forced full reload, the opt-in path writes back retained dirty pixels
 in the gaps; otherwise that diagnostic would destroy data the sparse path kept.
-The conservative GS address-overlap checks and compatibility renderer remain.
-Broad source dependency ranges can still invalidate the full interval, so this
-does not guarantee savings for typical GT4 uploads or draws.
+For page-aligned CT32/CT24 uploads that stay inside both the buffer width and
+4 MiB GS memory, native surface synchronization now uses the enclosing pages of
+the upload rectangle, excluding untouched prefix pages before its starting Y.
+The original wider dependency remains in batch-conflict checks, CLUT ordering,
+upload reordering and LUT recognition. Unsupported formats, unaligned bases,
+out-of-width coordinates and potential memory/coordinate wrapping retain the
+old synchronization range. The compatibility renderer remains unchanged.
+This does not establish how often GT4 benefits from these guarded cases.
 
 `[gpu] sparse loads` reports source pixels skipped relative to the enclosing
 interval, and gap store decisions deferred. The latter is NOT net stores saved:
@@ -116,17 +121,22 @@ counts reload rectangles, not passes, when this option is enabled.
 
 Local Mesa llvmpipe validation:
 
-- Two targeted phases exercise disjoint top/bottom updates around dirty native
-  pixels, and overflow to five spans. Both modes match the software GS reference.
-  The prototype skips 143,360 source pixels; stores decrease from 6 to 5, while
-  reload rectangles increase from 3 to 4. These are synthetic workload counts,
-  not measured GT4 frame-rate improvements.
+- Eight targeted phases exercise CT32/CT24 uploads, shifted-base/destination-Y
+  addressing, disjoint updates around dirty pixels and overflow to five spans.
+  Both modes match the software GS reference, including CT24's retained alpha.
+  The prototype skips 573,440 source pixels; stores decrease from 24 to 20, while
+  reload rectangles increase from 9 to 13. These expanded synthetic workload
+  counts are not directly comparable with the earlier two-phase fixture, and
+  are not measured GT4 frame-rate improvements.
 - Forty deterministic synthetic race scenes have byte-identical GS memory and
   display outputs between enabled and disabled modes (zero tolerance).
 - The targeted fixture also passes at 2x resolution and with forced full reloads
   (`PS2_NATIVE_SYNC=1`); the latter includes the dirty-gap writeback regression.
 - The bounded interval test runs 100,000 insertion steps with coverage checks,
   plus gap retention, collapse and boundary cases under ASan/UBSan.
+- Upload-range tests use the existing GS swizzle implementation to verify every
+  addressed pixel of accepted rectangles from 10,000 generated candidates, plus
+  explicit rejection cases and the 4 MiB boundary. ASan/UBSan checks pass.
 
 Switch timing and GT4 scene coverage are still unverified. Keep this opt-in until
 saved conversion work outweighs the extra draw and tracking costs on hardware.
