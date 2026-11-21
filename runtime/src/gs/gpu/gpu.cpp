@@ -1,4 +1,8 @@
 #include "gpu.hpp"
+#include "decoded_arena.h"
+#include "path_profile.h"
+#include "stale_rows.h"
+#include "upload_span.h"
 #include "ps2/system.hpp"
 #include "ps2/video.hpp"
 
@@ -20,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
@@ -29,6 +34,9 @@ extern const char kNativeShader[];
 // The OpenGL layer's (gl/webgpu_gl.cpp): a write to this buffer from its start replaces all of it, so the driver
 // may hand out new storage instead of waiting for the GPU to be done with the old.
 extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
+extern "C" void ps2GlSetDecodeQueueReuse(bool enabled);
+extern "C" bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder encoder, WGPUTexture source, WGPUTexture backdrop,
+                                        std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 #endif
 
 namespace ps2::gs {
@@ -478,20 +486,121 @@ Range pages(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, int x0, int y
 // When each page of GS memory was last written, by a clock that counts the writes as they are queued (which is the
 // order the GPU makes them in): a texture decoded after the last write to its pages still holds (see plan_decodes).
 std::uint64_t g_write_clock = 0, g_page_written[512] = {};
+// Palette identities also track small uploads at the GS's 256-byte block
+// granularity. Broad writes remain page-based; querying both epochs keeps
+// rendering, copies and unsupported upload formats conservative.
+std::uint64_t g_clut_page_written[512] = {}, g_clut_block_written[kMemorySize / 256] = {};
+std::uint64_t g_clut_precise_uploads = 0;
+
+void wrote_page(std::uint32_t page) {
+    g_page_written[page & 511u] = g_write_clock;
+    g_clut_page_written[page & 511u] = g_write_clock;
+}
 
 void wrote(const Range &r) {
     ++g_write_clock;
     if (r.hi - r.lo >= kMemorySize) {
         std::fill(std::begin(g_page_written), std::end(g_page_written), g_write_clock);
+        std::fill(std::begin(g_clut_page_written), std::end(g_clut_page_written), g_write_clock);
         return;
     }
-    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) g_page_written[(at >> 13) & 511u] = g_write_clock;
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) wrote_page(static_cast<std::uint32_t>(at >> 13));
+}
+
+bool wrote_small_upload32(std::uint32_t bp, std::uint32_t bw,
+                          std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) {
+    if (x0 > x1 || y0 > y1 || x1 >= 2048u || y1 >= 2048u) return false;
+    const std::uint32_t nx = x1 / 8 - x0 / 8 + 1, ny = y1 / 8 - y0 / 8 + 1;
+    // Bound CPU work; large uploads retain the existing page-level path.
+    if (nx * ny > 64u) return false;
+    ++g_write_clock;
+    ++g_clut_precise_uploads;
+    for (std::uint32_t y = y0 / 8; y <= y1 / 8; ++y) {
+        for (std::uint32_t x = x0 / 8; x <= x1 / 8; ++x) {
+            const auto block = address32(bp, bw, x * 8, y * 8) >> 8;
+            g_clut_block_written[block] = g_write_clock;
+            // Texture validation still sees every touched page. Only the
+            // palette identity distinguishes unrelated blocks in that page.
+            g_page_written[block >> 5] = g_write_clock;
+        }
+    }
+    return true;
+}
+
+std::uint64_t clut_block_written(std::uint32_t block) {
+    block &= kMemorySize / 256 - 1;
+    return std::max(g_clut_block_written[block], g_clut_page_written[block >> 5]);
+}
+
+std::uint64_t clut_csm1_bank_written32(std::uint32_t bp, std::uint32_t bank) {
+    // The shader swaps index bits 3 and 4 for a 256-entry CSM1 load.
+    // Each resulting 16-entry bank occupies one 8x2 rectangle within a
+    // single physical 256-byte block. Bank zero also covers a 16-entry load.
+    const std::uint32_t k = bank * 16u;
+    const std::uint32_t j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+    return clut_block_written(address32(bp, 1u, j & 15u, j >> 4u) >> 8);
+}
+
+std::uint64_t clut_csm1_bank_written16(std::uint32_t bp, std::uint32_t bank) {
+    // In both PSMCT16 and PSMCT16S the 16x16 CSM1 source occupies
+    // blocks 0 and 1. Banks 0..7 read the upper 16x8 block, banks 8..15
+    // the lower one. A 16-entry load reads bank zero's source rectangle.
+    return clut_block_written(bp + (bank >> 3u));
 }
 
 std::uint64_t last_written(const Range &r) {
+    if (r.hi - r.lo >= kMemorySize)
+        return *std::max_element(std::begin(g_page_written), std::end(g_page_written));
     std::uint64_t last = 0;
-    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192) last = std::max(last, g_page_written[(at >> 13) & 511u]);
+    for (std::uint64_t at = r.lo & ~255ull; at < r.hi;) {
+        // Full physical pages can use the aggregate texture epoch. Inspect
+        // individual blocks only at partial page boundaries.
+        if ((at & 8191u) == 0 && r.hi - at >= 8192u) {
+            last = std::max(last, g_page_written[(at >> 13) & 511u]);
+            at += 8192;
+        } else {
+            last = std::max(last, clut_block_written(static_cast<std::uint32_t>(at >> 8)));
+            at += 256;
+        }
+    }
     return last;
+}
+
+// A decoded texture is stale as soon as any of its GS pages was written
+// after the decode was queued. Unlike last_written(), this can stop at
+// the first invalidating page instead of scanning the entire texture.
+bool written_since(const Range &r, std::uint64_t when) {
+    for (std::uint64_t at = r.lo & ~8191ull; at < r.hi; at += 8192)
+        if (g_page_written[(at >> 13) & 511u] >= when) return true;
+    return false;
+}
+
+// Texture rectangles may cover only a few pages per GS row. The bounding
+// Range includes untouched pages between those rows, causing false cache
+// invalidations. Check only the texture's pages when rows do not wrap.
+// For unusual widths, retain the conservative contiguous-range check.
+bool texture_written_since(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm,
+                           std::uint32_t tw, std::uint32_t th,
+                           std::uint64_t when) {
+    std::uint32_t pw, ph;
+    page_size(psm, pw, ph);
+    const std::uint32_t stride = std::max(1u, bw * 64 / pw);
+    const std::uint32_t width = ((1u << tw) + pw - 1) / pw;
+    const std::uint32_t height = ((1u << th) + ph - 1) / ph;
+    const std::uint32_t base = bp / 32;
+    // A non-aligned logical page overlaps the following tracking page.
+    // Include that page once per row instead of checking it for every texel page.
+    const std::uint32_t span = width + (bp % 32 != 0);
+    if (span >= stride) {
+        const std::uint64_t end = base + (height - 1) * stride + span;
+        return written_since(Range{base * 8192ull, end * 8192ull}, when);
+    }
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const std::uint32_t row = base + y * stride;
+        for (std::uint32_t x = 0; x < span; ++x)
+            if (g_page_written[(row + x) & 511u] >= when) return true;
+    }
+    return false;
 }
 
 void mark_rendered(const Range &r) {
@@ -510,45 +619,307 @@ struct Decode {
 };
 std::vector<Decode> g_decodes;
 
-// What a CLUT slot holds, as a number that is the same only for the same entries: each load mixes into the number of
-// the slot it copies the one of what it reads, and when that was last written (load_clut).
-std::uint64_t g_clut_content[kClutSlots] = {};
-
 std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
     h *= 0xFF51AFD7ED558CCDull;
     return h ^ (h >> 33);
 }
 
+// Indexed sampling reads either one 16-entry bank or all of the first
+// 256 entries. Track those banks independently of the GPU's rotating slots.
+struct ClutIdentity {
+    std::array<std::uint64_t, 16> banks{};
+    std::uint64_t eight = 0;
+
+    void refresh_eight() {
+        eight = 0;
+        for (const auto bank : banks) eight = mix(eight, bank);
+    }
+};
+ClutIdentity g_clut_identity[kClutSlots];
+
 // Textures decoded to 32-bit texels (decode in gs.wgsl), kept across batches and frames for as long as GS memory under
 // them is not written and, for a palette texture, while the CLUT is the same: a race frame reads the same textures
 // in many batches, and each decode was a dispatch and as many texels as the texture has. When the buffer is full
 // it starts over. PS2_DECODE_CACHE=0 decodes each batch's textures for that batch alone, as before.
 struct DecodeKey {
-    std::uint32_t tbp, tbw, tpsm, size, cpsm, csa, ta, aem;
+    std::uint32_t tbp, tbw, tpsm, size, cpsm, ta, aem;
     std::uint64_t clut;
     bool operator==(const DecodeKey &o) const {
-        return tbp == o.tbp && tbw == o.tbw && tpsm == o.tpsm && size == o.size && cpsm == o.cpsm && csa == o.csa && ta == o.ta && aem == o.aem && clut == o.clut;
+        return tbp == o.tbp && tbw == o.tbw && tpsm == o.tpsm && size == o.size && cpsm == o.cpsm && ta == o.ta && aem == o.aem && clut == o.clut;
     }
 };
 struct DecodeKeyHash {
     std::size_t operator()(const DecodeKey &k) const {
         std::uint64_t h = mix(mix(mix(mix(k.tbp, k.tbw), k.tpsm), k.size), k.cpsm);
-        return static_cast<std::size_t>(mix(mix(mix(mix(h, k.csa), k.ta), k.aem), k.clut));
+        return static_cast<std::size_t>(mix(mix(mix(h, k.ta), k.aem), k.clut));
     }
 };
 struct Decoded {
     std::uint32_t offset;
-    std::uint64_t when;  // the write clock when it was queued
+    std::uint64_t when;  // first write serial after decode or successful validation
+    std::uint32_t words;
+    std::uint64_t last_use_serial;
+    // unordered_map keeps node addresses stable across rehashes. Linking
+    // nodes directly avoids a second allocation or hash lookup on each hit.
+    const DecodeKey *key = nullptr;
+    Decoded *older = nullptr, *newer = nullptr;
 };
 std::unordered_map<DecodeKey, Decoded, DecodeKeyHash> g_decoded_cache;
+Decoded *g_decode_oldest = nullptr, *g_decode_newest = nullptr;
+
+void decode_lru_unlink(Decoded &d) {
+    if (d.older) d.older->newer = d.newer;
+    else if (g_decode_oldest == &d) g_decode_oldest = d.newer;
+    if (d.newer) d.newer->older = d.older;
+    else if (g_decode_newest == &d) g_decode_newest = d.older;
+    d.older = d.newer = nullptr;
+}
+
+void decode_lru_touch(Decoded &d) {
+    if (g_decode_newest == &d) return;
+    decode_lru_unlink(d);
+    d.older = g_decode_newest;
+    if (g_decode_newest) g_decode_newest->newer = &d;
+    else g_decode_oldest = &d;
+    g_decode_newest = &d;
+}
+
+void decode_cache_clear() {
+    g_decode_oldest = g_decode_newest = nullptr;
+    g_decoded_cache.clear();
+}
+struct DecodeBlock { std::uint32_t offset, words; std::uint64_t retire_serial; };
+std::multimap<std::uint64_t, DecodeBlock> g_decode_retired;
+std::vector<DecodeBlock> g_decode_free;
+// Highest batch whose slots may be overwritten by a later GPU decode.
+// GL uses submission ordering plus a storage barrier; other backends wait
+// for completion. This value is not a CPU-visible GPU completion signal.
+std::uint64_t g_decode_reusable_serial = 0;
+std::uint64_t g_decode_evictions = 0, g_decode_reclaimed_words = 0, g_decode_tail_words = 0;
+std::uint64_t g_decode_insufficient_space = 0, g_decode_fragmented_space = 0;
+void decode_release_block(const DecodeBlock &block) {
+    auto it = std::lower_bound(g_decode_free.begin(), g_decode_free.end(), block.offset,
+                               [](const DecodeBlock &free, std::uint32_t offset) {
+                                   return free.offset < offset;
+                               });
+    const auto index = static_cast<std::size_t>(it - g_decode_free.begin());
+    if (index && g_decode_free[index - 1].offset + g_decode_free[index - 1].words == block.offset) {
+        g_decode_free[index - 1].words += block.words;
+        if (index < g_decode_free.size() &&
+            g_decode_free[index - 1].offset + g_decode_free[index - 1].words == g_decode_free[index].offset) {
+            g_decode_free[index - 1].words += g_decode_free[index].words;
+            g_decode_free.erase(g_decode_free.begin() + index);
+        }
+    } else if (index < g_decode_free.size() &&
+               block.offset + block.words == g_decode_free[index].offset) {
+        g_decode_free[index].offset = block.offset;
+        g_decode_free[index].words += block.words;
+    } else {
+        g_decode_free.insert(it, block);
+    }
+}
+void decode_retire(const Decoded &d) {
+    const DecodeBlock block{d.offset, d.words, d.last_use_serial};
+    // Reusable victims need no pending-map node or later collection pass.
+    // Current unsubmitted references retain their serial protection.
+    if (d.last_use_serial <= g_decode_reusable_serial) decode_release_block(block);
+    else g_decode_retired.emplace(d.last_use_serial, block);
+}
+void decode_cache_erase(decltype(g_decoded_cache.begin()) it) {
+    decode_retire(it->second);
+    decode_lru_unlink(it->second);
+    g_decoded_cache.erase(it);
+}
+
+void decode_cache_store(const DecodeKey &key, Decoded value) {
+    auto [it, inserted] = g_decoded_cache.try_emplace(key, value);
+    if (!inserted) {
+        decode_retire(it->second);
+        decode_lru_unlink(it->second);
+        it->second = value;
+    }
+    it->second.key = &it->first;
+    decode_lru_touch(it->second);
+}
+
+void decode_collect() {
+    while (!g_decode_retired.empty() &&
+           g_decode_retired.begin()->first <= g_decode_reusable_serial) {
+        const DecodeBlock block = g_decode_retired.begin()->second;
+        g_decode_retired.erase(g_decode_retired.begin());
+        decode_release_block(block);
+    }
+    // A free block at the end of the append arena can be returned to the
+    // cursor outright. Repeated tail retirements can then release more space,
+    // avoiding needless LRU eviction and reducing fragmentation.
+    while (!g_decode_free.empty()) {
+        const DecodeBlock &tail = g_decode_free.back();
+        if (tail.offset + tail.words != g_decoded_used) break;
+        g_decode_tail_words += tail.words;
+        g_decoded_used = tail.offset;
+        g_decode_free.pop_back();
+    }
+}
+bool decode_allocate(std::uint32_t words, std::uint32_t &offset) {
+    // An impossible request must not evict otherwise reusable cache entries.
+    // Normal texture admission already caps requests, but keep this allocator
+    // safe for future callers as well.
+    if (!words || words > kDecodedWords) return false;
+    decode_collect();
+    const auto take_free = [&]() {
+        // Best fit preserves larger contiguous slots for future textures.
+        // Free blocks are ordered by offset, not by size.
+        std::size_t best = g_decode_free.size();
+        for (std::size_t i = 0; i < g_decode_free.size(); ++i) {
+            const auto available = g_decode_free[i].words;
+            if (available < words) continue;
+            if (best == g_decode_free.size() || available < g_decode_free[best].words)
+                best = i;
+            if (available == words) break;
+        }
+        if (best == g_decode_free.size()) return false;
+        auto &block = g_decode_free[best];
+        offset = block.offset;
+        block.offset += words;
+        block.words -= words;
+        if (!block.words) g_decode_free.erase(g_decode_free.begin() + best);
+        g_decode_reclaimed_words += words;
+        return true;
+    };
+    if (take_free()) return true;
+    if (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)) {
+        offset = g_decoded_used;
+        g_decoded_used += words;
+        return true;
+    }
+    // The LRU chain is ordered by monotonically increasing batch serials.
+    // Inspect only its protected suffix; eligible entries need no table scan
+    // or candidate heap rebuild on each allocation miss.
+    static std::vector<DecodeBlock> protected_blocks;
+    protected_blocks.clear();
+    std::uint64_t reclaimable = kDecodedWords;
+    for (auto *d = g_decode_newest; d && d->last_use_serial > g_decode_reusable_serial; d = d->older) {
+        protected_blocks.push_back({d->offset, d->words, d->last_use_serial});
+        reclaimable -= d->words;
+    }
+    for (const auto &[serial, block] : g_decode_retired) {
+        protected_blocks.push_back(block);
+        reclaimable -= block.words;
+    }
+    if (reclaimable < words) {
+        ++g_decode_insufficient_space;
+        return false;
+    }
+    if (!protected_blocks.empty()) {
+        std::sort(protected_blocks.begin(), protected_blocks.end(),
+                  [](const DecodeBlock &a, const DecodeBlock &b) { return a.offset < b.offset; });
+        std::uint32_t end = 0;
+        bool fits = false;
+        for (const auto &block : protected_blocks) {
+            if (block.offset - end >= words) {
+                fits = true;
+                break;
+            }
+            end = block.offset + block.words;
+        }
+        // Include unallocated space at the tail. Adjacent completed blocks
+        // may coalesce with it when their retirements rewind the cursor.
+        if (!fits && kDecodedWords - end < words) {
+            ++g_decode_fragmented_space;
+            return false;
+        }
+    }
+    // Walk useful victims in LRU order. The next pointer is captured before
+    // erasing a map node; no iterator survives an insertion or rehash.
+    for (auto *victim = g_decode_oldest; victim && victim->last_use_serial <= g_decode_reusable_serial;) {
+        auto *next_victim = victim->newer;
+        if (!protected_blocks.empty()) {
+            const auto next = std::upper_bound(protected_blocks.begin(), protected_blocks.end(),
+                                               victim->offset,
+                                               [](std::uint32_t offset, const DecodeBlock &block) {
+                                                   return offset < block.offset;
+                                               });
+            const std::uint32_t hi = next == protected_blocks.end() ? kDecodedWords : next->offset;
+            const std::uint32_t lo = next == protected_blocks.begin() ? 0u
+                : (next - 1)->offset + (next - 1)->words;
+            if (hi - lo < words) {
+                victim = next_victim;
+                continue;  // this isolated region cannot help the request
+            }
+        }
+        decode_cache_erase(g_decoded_cache.find(*victim->key));
+        victim = next_victim;
+        ++g_decode_evictions;
+        decode_collect();
+        if (take_free()) return true;
+        // Collecting a retired tail block can move the append cursor
+        // backwards instead of leaving a reusable free-list block. Check
+        // that space again before evicting another live cache entry.
+        if (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)) {
+            offset = g_decoded_used;
+            g_decoded_used += words;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Admission history is independent of the decoded buffer: a full buffer reset
+// must not erase evidence that a texture is used repeatedly.
+std::unordered_map<DecodeKey, std::uint8_t, DecodeKeyHash> g_decode_seen;
 std::uint64_t g_decode_hits = 0, g_decode_misses = 0, g_decode_words = 0, g_decode_restarts = 0;
+std::uint64_t g_decode_saved_words = 0;  // texels reused instead of decoded again
+std::uint64_t g_decode_invalidated = 0, g_decode_cold = 0, g_decode_small = 0;
+std::uint64_t g_decode_admission_skips = 0, g_decode_admission_texels = 0;
+std::uint64_t g_decode_capacity_bypasses = 0, g_decode_capacity_texels = 0;
+// Optional cache-key churn diagnostics. Disabled in normal gameplay to avoid
+// extra hash lookups on every texture setup.
+std::unordered_map<DecodeKey, std::uint64_t, DecodeKeyHash> g_decode_key_probe;
+std::unordered_set<DecodeKey, DecodeKeyHash> g_decode_key_history;
+std::uint64_t g_decode_clut_churn = 0, g_decode_key_first_seen = 0;
+std::uint64_t g_decode_repeat_absent = 0, g_decode_first_absent = 0;
+bool decode_key_diagnostics_on() {
+    static const bool enabled = std::getenv("PS2_DECODE_KEY_DIAG") &&
+                                std::atoi(std::getenv("PS2_DECODE_KEY_DIAG")) != 0;
+    return enabled;
+}
 
 bool palette_psm(std::uint32_t psm) { return psm == PSMT8 || psm == PSMT4 || psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH; }
 
-bool decode_cache_on() {
-    static const bool on = !std::getenv("PS2_DECODE_CACHE") || std::atoi(std::getenv("PS2_DECODE_CACHE")) != 0;
+bool decode_admission_on() {
+    static const bool on = !std::getenv("PS2_DECODE_ADMISSION") ||
+                           std::atoi(std::getenv("PS2_DECODE_ADMISSION")) != 0;
     return on;
+}
+
+bool decode_cache_on() {
+    // Switch defaults to the uncached path until the GT4 cache regression is resolved.
+    // An explicit PS2_DECODE_CACHE=1 still enables the cache for A/B testing.
+#ifdef PS2_DECODE_CACHE_DEFAULT_OFF
+    constexpr bool default_on = false;
+#else
+    constexpr bool default_on = true;
+#endif
+    // Read args.txt environment overrides on first use, then avoid getenv
+    // on every palette load, batch and submit.
+    static const bool on = [] {
+        const char *env = std::getenv("PS2_DECODE_CACHE");
+        return env ? std::atoi(env) != 0 : default_on;
+    }();
+    return on;
+}
+
+bool decode_queue_reuse_on() {
+#ifdef PS2_GPU_GL
+    // Experimental: Switch feedback reported worse stutter. Require an
+    // explicit opt-in until a controlled device comparison shows a benefit.
+    static const bool on = std::getenv("PS2_DECODE_QUEUE_REUSE") &&
+                            std::atoi(std::getenv("PS2_DECODE_QUEUE_REUSE")) != 0;
+    return on;
+#else
+    return false;
+#endif
 }
 
 void plan_decodes(std::uint32_t prims) {
@@ -557,11 +928,15 @@ void plan_decodes(std::uint32_t prims) {
     if (!g_decode) return;
     const bool cache = decode_cache_on();
     if (!cache) {
-        g_decoded_cache.clear();
+        // The uncached path resets the append cursor after each submit.
+        // Recycled offsets from the persistent cache must never be mixed
+        // with those transient allocations.
+        decode_cache_clear();
+        g_decode_free.clear();
+        g_decode_retired.clear();
         if (prims <= kDecodePrims) return;
     }
     const std::uint32_t setups = static_cast<std::uint32_t>(b.setups.size() / kSetupWords);
-    bool restarted = false;
     for (std::uint32_t i = 0; i < setups; ++i) {
         std::uint32_t *w = b.setups.data() + i * kSetupWords;
         if (!(w[0] & 2u)) continue;
@@ -569,40 +944,115 @@ void plan_decodes(std::uint32_t prims) {
         const std::uint32_t mu = (w[7] >> 24) & 3u, mv = (w[7] >> 26) & 3u;
         const auto inside = [](std::uint32_t mode, std::uint32_t region, std::uint32_t size) { return mode < 2 || ((region & 0x3FFu) < (1u << size) && (region >> 16) < (1u << size)); };
         if (!inside(mu, w[18], tw) || !inside(mv, w[19], th)) continue;
-        const Range texels = pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1);
-        if (g_scale > 1 && rendered(texels)) continue;
-        const bool palette = palette_psm(w[14]);
-        const DecodeKey key{w[12], w[13], w[14], w[15], palette ? w[16] : 0u, palette ? w[17] : 0u, w[20], (w[0] & 32768u) ? 1u : 0u, palette ? g_clut_content[w[22] % kClutSlots] : 0u};
-        const auto found = g_decoded_cache.find(key);
+        if (g_scale > 1 && rendered(pages(w[12], w[13], w[14], 0, 0, (1 << tw) - 1, (1 << th) - 1))) continue;
+        // Avoid building a persistent cache identity for transient decoding.
+        // In particular, the uncached path does not need to inspect CLUT
+        // history, which can change on every palette upload.
+        DecodeKey key{};
+        if (cache) {
+            const bool palette = palette_psm(w[14]);
+            std::uint64_t clut = 0;
+            if (palette) {
+                const auto &identity = g_clut_identity[w[22]];
+                clut = (w[14] == PSMT8 || w[14] == PSMT8H) ? identity.eight
+                                                            : identity.banks[w[17] & 15u];
+            }
+            // The bank index selects the identity, but does not affect
+            // conversion once the palette entries are known.
+            const std::uint32_t color_psm = palette ? w[16] : w[14];
+            const bool expand16 = color_psm == PSMCT16 || color_psm == PSMCT16S ||
+                                  (!palette && (color_psm == PSMZ16 || color_psm == PSMZ16S));
+            // Indexed formats expand any CLUT format other than 32/24-bit.
+            const bool alpha16 = palette ? color_psm != PSMCT32 && color_psm != PSMCT24 : expand16;
+            const bool alpha24 = !palette && (color_psm == PSMCT24 || color_psm == PSMZ24);
+            const auto ta = alpha16 ? w[20] : alpha24 ? w[20] & 0xFFu : 0u;
+            const auto aem = (alpha16 || alpha24) && (w[0] & 32768u) ? 1u : 0u;
+            key = {w[12], w[13], w[14], w[15], palette ? w[16] : 0u, ta, aem, clut};
+        }
+        // The transient (uncached) path cannot hit a persistent entry.
+        // Avoid hashing the key and probing an empty map on every setup.
+        const auto found = cache ? g_decoded_cache.find(key) : g_decoded_cache.end();
         if (found != g_decoded_cache.end()) {
-            if (last_written(texels) < found->second.when) {
-                w[24] = found->second.offset;
+            auto &decoded = found->second;
+            // Multiple setups can read the same texture before another GS
+            // write. Reuse the successful validation until the clock moves.
+            if (decoded.when > g_write_clock ||
+                !texture_written_since(w[12], w[13], w[14], tw, th, decoded.when)) {
+                w[24] = decoded.offset;
+                decoded.when = g_write_clock + 1;
+                decoded.last_use_serial = g_serial;
+                decode_lru_touch(decoded);
                 ++g_decode_hits;
+                g_decode_saved_words += decoded.words;
                 continue;
             }
-            g_decoded_cache.erase(found);
+            ++g_decode_invalidated;
+            decode_cache_erase(found);
+        } else {
+            ++g_decode_cold;
+            if (cache && decode_key_diagnostics_on()) {
+                // A repeated exact key that is no longer resident indicates
+                // capacity churn, admission bypass, or prior invalidation;
+                // it must not be mislabeled as a CLUT identity change.
+                if (g_decode_key_history.size() >= 16384u) g_decode_key_history.clear();
+                if (g_decode_key_history.insert(key).second) ++g_decode_first_absent;
+                else ++g_decode_repeat_absent;
+                // Probe by texture setup with CLUT identity stripped. If this
+                // signature repeats with another CLUT hash, the texture is
+                // missing because the palette identity changed.
+                DecodeKey base = key;
+                base.clut = 0;
+                const auto probe = g_decode_key_probe.find(base);
+                if (probe == g_decode_key_probe.end()) {
+                    ++g_decode_key_first_seen;
+                    if (g_decode_key_probe.size() >= 8192u) g_decode_key_probe.clear();
+                    g_decode_key_probe.emplace(base, key.clut);
+                } else if (probe->second != key.clut) {
+                    ++g_decode_clut_churn;
+                    probe->second = key.clut;
+                }
+            }
         }
         // Decoding costs a dispatch and every texel: for a few primitives reading GS memory directly is cheaper.
-        if (prims <= kDecodePrims) continue;
+        if (prims <= kDecodePrims) {
+            ++g_decode_small;
+            continue;
+        }
         const std::uint32_t words = 1u << (tw + th);
         if (words > kDecodedWords / 4) continue;
-        if (g_decoded_used + words > kDecodedWords) {
-            // Full: start over, and over this batch too, whose textures found so far may be where new ones go.
-            g_decoded_cache.clear();
-            g_decoded_used = 0;
-            ++g_decode_restarts;
-            if (!restarted && i > 0) {
-                restarted = true;
-                g_decodes.clear();
-                for (std::uint32_t k = 0; k < setups; ++k) b.setups[k * kSetupWords + 24] = 0xFFFFFFFFu;
-                i = ~0u;  // the loop's ++ makes it 0
+        // Large, one-off textures consume the decoded buffer and trigger
+        // expensive full-cache resets. Leave their sampling on the direct
+        // GS-memory path until a second encounter establishes reuse.
+        // Small textures stay eager: their decode and footprint are cheap.
+        if (cache && decode_admission_on() && words >= 4096u) {
+            if (g_decode_seen.size() >= 8192u) g_decode_seen.clear();
+            auto [seen, inserted] = g_decode_seen.try_emplace(key, 0u);
+            if (seen->second < 2u) ++seen->second;
+            if (seen->second < 2u) {
+                ++g_decode_admission_skips;
+                g_decode_admission_texels += words;
                 continue;
             }
         }
-        w[24] = g_decoded_used;
-        g_decodes.push_back({i, g_decoded_used, words});
-        g_decoded_cache[key] = {g_decoded_used, g_write_clock + 1};
-        g_decoded_used += words;
+        std::uint32_t decoded_offset = 0;
+        if (!(cache ? decode_allocate(words, decoded_offset)
+                    : (decoded_arena_can_append(g_decoded_used, words, kDecodedWords)
+                        ? (decoded_offset = g_decoded_used, g_decoded_used += words, true)
+                        : false))) {
+            // Never overwrite a slot still protected by the backend reuse
+            // serial, especially one referenced by the current command batch.
+            // Keep existing cached textures alive; this miss uses the direct
+            // GS-memory sampler until safe reclamation is possible.
+            ++g_decode_capacity_bypasses;
+            g_decode_capacity_texels += words;
+            continue;
+        }
+        w[24] = decoded_offset;
+        g_decodes.push_back({i, decoded_offset, words});
+        // Uncached Switch builds must not populate the persistent hash table:
+        // it is discarded at the start of the next batch and can never yield
+        // a cross-batch hit. Avoid per-texture hashing and allocations.
+        if (cache) decode_cache_store(key, {decoded_offset, g_write_clock + 1, words, g_serial});
         ++g_decode_misses;
         g_decode_words += words;
     }
@@ -706,6 +1156,8 @@ struct Surface {
     bool dirty = false;  // the texture is newer than GS memory inside this rectangle
     int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
     int stale0 = 0, stale1 = -1;  // GS memory is newer than the texture in these rows
+    StaleRows stale_rows;
+    std::uint32_t stale_causes = 64; // Diagnostic only: initial allocation, then write-cause bits.
     std::uint64_t used = 0;
 };
 
@@ -744,6 +1196,99 @@ WGPUBindGroupLayout g_native_layout = nullptr, g_target_layout = nullptr;
 WGPUPipelineLayout g_native_pipeline_layout = nullptr, g_store_layout = nullptr, g_feedback_pipeline_layout = nullptr;
 WGPUBindGroupLayout g_backdrop_layout = nullptr;
 std::uint64_t g_feedback_draws = 0, g_feedback_copies = 0;
+std::uint64_t g_feedback_pass_restarts = 0, g_feedback_copies_merged = 0;
+std::uint64_t g_feedback_copy_pixels = 0;
+std::uint64_t g_feedback_group_calls = 0;
+std::uint64_t g_feedback_outline_tests = 0;
+std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
+PathProfile g_path_profile;
+SurfaceTraffic g_surface_traffic;
+std::uint64_t g_sparse_saved_pixels = 0, g_sparse_gap_stores = 0;
+bool sparse_load_on() {
+    static const bool on = std::getenv("PS2_NATIVE_SPARSE_LOAD") && std::strcmp(std::getenv("PS2_NATIVE_SPARSE_LOAD"), "1") == 0;
+    return on;
+}
+bool path_profile_on() {
+    static const bool on = std::getenv("PS2_GS_PATH_STATS") && std::strcmp(std::getenv("PS2_GS_PATH_STATS"), "1") == 0;
+    return on;
+}
+
+// Count work scheduled by flush_batch; this is CPU preparation time, not GPU
+// elapsed time or a claim that the batch caused all future queue stalls.
+struct PathSample {
+    bool enabled = path_profile_on();
+    PathKey key{};
+    PathCost before{};
+    std::chrono::steady_clock::time_point start;
+    explicit PathSample(std::uint32_t prims) {
+        if (!enabled) return;
+        const Batch &b = g_batch;
+        key = path_key(b.setups.data() + b.prims[0] * kSetupWords, b.prims[1]);
+        for (std::uint32_t i = 1; i < prims; ++i) {
+            const auto *p = b.prims.data() + i * kPrimWords;
+            if (path_key(b.setups.data() + p[0] * kSetupWords, p[1]) != key) {
+                key[9] = 1; // First family is only a label for this mixed batch.
+                break;
+            }
+        }
+        before.prims = prims;
+        before.stores = g_stores; before.loads = g_loads;
+        before.copies = g_feedback_copies; before.copy_pixels = g_feedback_copy_pixels;
+        start = std::chrono::steady_clock::now();
+    }
+    void finish(bool native) {
+        if (!enabled) return;
+        PathCost cost;
+        cost.cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        cost.batches = 1; cost.prims = before.prims; cost.native = native; cost.mixed = key[9];
+        cost.stores = g_stores - before.stores; cost.loads = g_loads - before.loads;
+        cost.copies = g_feedback_copies - before.copies; cost.copy_pixels = g_feedback_copy_pixels - before.copy_pixels;
+        g_path_profile.add(key, cost);
+    }
+};
+
+void report_paths() {
+    if (!path_profile_on()) return;
+    static auto since = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - since).count();
+    if (seconds < 5.0) return;
+    const auto print = [](const PathCost &c) {
+        std::fprintf(stderr, " batches=%.0f prims=%.0f native_batches=%.0f mixed_batches=%.0f cpu_prepare_ms=%.3f stores=%.0f loads=%.0f feedback_copies=%.0f feedback_source_pixels=%.0f\n",
+                     double(c.batches), double(c.prims), double(c.native), double(c.mixed), c.cpu_ms,
+                     double(c.stores), double(c.loads), double(c.copies), double(c.copy_pixels));
+    };
+    std::fprintf(stderr, "[gs-path] window_s=%.3f families=%zu total", seconds, g_path_profile.rows.size());
+    print(g_path_profile.total);
+    using Row = decltype(g_path_profile.rows)::value_type;
+    std::vector<const Row *> order;
+    for (const auto &row : g_path_profile.rows) order.push_back(&row);
+    std::sort(order.begin(), order.end(), [](const Row *a, const Row *b) {
+        if (a->second.cpu_ms != b->second.cpu_ms) return a->second.cpu_ms > b->second.cpu_ms;
+        return a->first < b->first;
+    });
+    for (std::size_t i = 0; i < std::min<std::size_t>(8, order.size()); ++i) {
+        std::fprintf(stderr, "[gs-path] family=");
+        for (auto word : order[i]->first) std::fprintf(stderr, "%08X:", word);
+        print(order[i]->second);
+    }
+    std::fprintf(stderr, "[gs-path] overflow");
+    print(g_path_profile.overflow);
+    // Includes transfers outside flush_batch (uploads, display, readback, etc.).
+    const auto transfers = [](const char *direction, const auto &buckets) {
+        for (std::size_t i = 0; i < buckets.size(); ++i) {
+            const auto &v = buckets[i];
+            if (!v.operations) continue;
+            std::fprintf(stderr, "[gs-transfer] %s=%zu operations=%.0f source_pixels=%.0f native_rect_bytes=%.0f\n",
+                         direction, i, double(v.operations), double(v.source_pixels), double(v.native_rect_bytes));
+        }
+    };
+    transfers("store_cause", g_surface_traffic.stores);
+    transfers("load_cause_mask", g_surface_traffic.loads);
+    g_surface_traffic.clear();
+    g_path_profile.clear();
+    since = now;
+}
 bool g_refusal_counted = false;  // flush_native said why it gave a batch up
 WGPUBindGroup g_native_group = nullptr;
 WGPUShaderModule g_native_module = nullptr;
@@ -807,7 +1352,7 @@ bool native_debug() {
 }
 
 // What a target was written back to GS memory for, counted for the [native] line.
-const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", ""};
+const char *const kStoreCause[] = {"copy, readback or display", "texture of a native batch", "target of a compute batch", "texture of a compute batch", "upload or CLUT", "native target alias"};
 std::uint64_t g_store_cause[6] = {};
 std::uint32_t g_sync_cause = 0;
 
@@ -860,18 +1405,31 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     out.premultiply = 0;
     out.alpha_factor = false;
     if ((flags & 8u) && (mask & 7u)) {
-        if ((flags & 1024u) || !(flags & 2048u)) return why(8);  // blending per pixel alpha, or colours that wrap
         const std::uint32_t a = (modes >> 12) & 3u, b = (modes >> 14) & 3u, c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
         // (A - B) * C + D as what multiplies the source and the destination colour: so many times C, plus one or not.
         const int source_c = (a == 0) - (b == 0), dest_c = (a == 1) - (b == 1);
         const int source_1 = d == 0, dest_1 = d == 1;
         std::uint32_t op = 0;
         int sf, df;
-        if (!source_c && !dest_c) {
+        const bool zero_product = (!source_c && !dest_c) || (c >= 2 && w[9] == 0 && !(skip & 1u));
+        // If the blend always returns Cs, PABE's unblended result is the
+        // same. Native shading already wraps the source channels to bytes.
+        if (((flags & 1024u) || !(flags & 2048u)) && !(zero_product && source_1)) return why(8);
+        if (zero_product) {
             sf = source_1;
             df = dest_1;
+        } else if ((c == 1 && fpsm == PSMCT24) || (c >= 2 && !(skip & 1u) && w[9] == 0x80u)) {
+            // PSMCT24 supplies a GS destination alpha of 0x80.
+            // FIX=0x80 also reduces to integer color coefficients.
+            // Unit factors preserve the GS result without blend rounding.
+            const int source = source_1 + source_c;
+            const int dest = dest_1 + dest_c;
+            if (source > 1 || dest > 1 || (source < 0 && dest < 0)) return why(c == 1 ? 9 : 11);
+            sf = std::abs(source);
+            df = std::abs(dest);
+            op = source < 0 ? 2u : dest < 0 ? 1u : 0u;
         } else if (c == 1) {
-            return why(9);  // destination alpha: the texture keeps alpha, not alpha as a factor
+            return why(9);  // 32-bit destination alpha can vary per pixel
         } else if (!dest_c && !source_1) {
             // C only scales the source colour: the shader does it, with the GS's own rounding and for any C.
             out.premultiply = 1u | (c >= 2 ? 2u : 0u) | (source_c < 0 ? 4u : 0u);
@@ -1012,7 +1570,7 @@ bool surface_rows(const Surface &s, const Range &r, int &y0, int &y1) {
     return true;
 }
 
-void store_surface(Surface &s) {
+void store_surface(Surface &s, std::uint32_t profile_cause = ~0u) {
     if (!s.dirty) return;
     s.dirty = false;
     const std::uint32_t w = static_cast<std::uint32_t>(s.dx1 - s.dx0 + 1), h = static_cast<std::uint32_t>(s.dy1 - s.dy0 + 1);
@@ -1022,6 +1580,7 @@ void store_surface(Surface &s) {
     g_commands.push_back(c);
     wrote(pages(s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1));
     ++g_stores;
+    if (path_profile_on()) g_surface_traffic.stores[profile_cause == ~0u ? g_sync_cause : profile_cause].add(w, h, g_scale);
     ++g_store_cause[g_sync_cause];
     TRACE("store %s %X/%u/%02X rect %d,%d-%d,%d for %s", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1, kStoreCause[g_sync_cause]);
     if (g_trace > 0 && g_sync_range) std::fprintf(stderr, " %llX-%llX", static_cast<unsigned long long>(g_sync_range->lo), static_cast<unsigned long long>(g_sync_range->hi));
@@ -1038,25 +1597,31 @@ void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
         if (s.dirty && surface_range(s, s.dy0, s.dy1).overlaps(r.lo, r.hi)) store_surface(s);
         int y0, y1;
         if (write && surface_rows(s, r, y0, y1)) {
-            // One span of stale rows is kept, so it can take in rows nothing wrote to. They are loaded again all the
-            // same: pixels only the texture has in them are written back before that.
+            // The baseline reloads the enclosing interval. The opt-in path retains gaps,
+            // but collapses to an enclosure after four spans. Preserve dirty pixels
+            // before any such conservative expansion can overwrite them.
+            if (sparse_load_on()) s.stale_rows.add(y0, y1);
             if (s.stale1 >= s.stale0) {
                 y0 = std::min(y0, s.stale0);
                 y1 = std::max(y1, s.stale1);
             }
-            if (s.dirty && y0 <= s.dy1 && s.dy0 <= y1) store_surface(s);
+            const bool touches_dirty = sparse_load_on() ? s.stale_rows.overlaps(s.dy0, s.dy1)
+                                                        : y0 <= s.dy1 && s.dy0 <= y1;
+            if (s.dirty && !touches_dirty && y0 <= s.dy1 && s.dy0 <= y1) ++g_sparse_gap_stores;
+            if (s.dirty && touches_dirty) store_surface(s);
             s.stale0 = y0;
             s.stale1 = y1;
+            if (path_profile_on()) s.stale_causes |= 1u << g_sync_cause;
         }
     }
 }
 
 void sync_all() {
-    for (const auto &p : g_surfaces) store_surface(*p);
+    for (const auto &p : g_surfaces) store_surface(*p, 7);
 }
 
 void retire_surface(std::size_t index) {
-    store_surface(*g_surfaces[index]);
+    store_surface(*g_surfaces[index], 6);
     g_retired.push_back(std::move(g_surfaces[index]));  // commands not yet submitted may still name it
     g_surfaces.erase(g_surfaces.begin() + static_cast<std::ptrdiff_t>(index));
 }
@@ -1121,6 +1686,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     s->group = wgpuDeviceCreateBindGroup(g_device, &bd);
     s->stale0 = 0;
     s->stale1 = static_cast<int>(height) - 1;  // nothing of GS memory is in it yet
+    if (sparse_load_on()) s->stale_rows.add(0, s->stale1);
     s->used = ++g_surface_clock;
     g_surfaces.push_back(std::move(s));
     return g_surfaces.back().get();
@@ -1129,14 +1695,28 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
 void load_surface(Surface &s) {
     if (s.stale1 < s.stale0) return;
     NativePass pass{s.depth ? nullptr : &s, s.depth ? &s : nullptr, {}};
-    pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw, s.psm}), 3, 0, static_cast<std::uint32_t>(s.stale0), s.width,
-                          static_cast<std::uint32_t>(s.stale1 - s.stale0 + 1), 0.0f});
+    const auto load = [&](int first, int last) {
+        const auto height = static_cast<std::uint32_t>(last - first + 1);
+        pass.draws.push_back({g_load_pipelines[s.depth ? 1 : 0], push_params({s.bp, s.bw, s.psm}), 3, 0,
+                              static_cast<std::uint32_t>(first), s.width, height, 0.0f});
+        TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, first, last);
+        if (path_profile_on()) g_surface_traffic.loads[s.stale_causes].add(s.width, height, g_scale);
+        ++g_loads;
+    };
+    if (sparse_load_on()) {
+        std::uint64_t rows = 0;
+        for (unsigned i = 0; i < s.stale_rows.count; ++i) {
+            load(s.stale_rows.spans[i].first, s.stale_rows.spans[i].last);
+            rows += s.stale_rows.spans[i].last - s.stale_rows.spans[i].first + 1;
+        }
+        g_sparse_saved_pixels += (std::uint64_t(s.stale1 - s.stale0 + 1) - rows) * s.width;
+    } else load(s.stale0, s.stale1);
     g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
     g_native_passes.push_back(std::move(pass));
-    TRACE("load %s %X/%u/%02X rows %d-%d\n", s.depth ? "depth" : "color", s.bp, s.bw, s.psm, s.stale0, s.stale1);
+    s.stale_causes = 0;
+    s.stale_rows.clear();
     s.stale0 = 0;
     s.stale1 = -1;
-    ++g_loads;
 }
 
 void plan_decodes(std::uint32_t prims);
@@ -1145,6 +1725,7 @@ void plan_decodes(std::uint32_t prims);
 // A primitive's outline, for telling whether two of a feedback draw can cover the same pixel.
 struct Outline {
     float x[4], y[4];
+    float min_x, max_x, min_y, max_y;
     int corners;
 };
 
@@ -1163,14 +1744,33 @@ Outline outline(const std::uint32_t *rec) {
         }
         o.corners = 3;
     }
+    o.min_x = o.max_x = o.x[0];
+    o.min_y = o.max_y = o.y[0];
+    for (int i = 1; i < o.corners; ++i) {
+        o.min_x = std::min(o.min_x, o.x[i]);
+        o.max_x = std::max(o.max_x, o.x[i]);
+        o.min_y = std::min(o.min_y, o.y[i]);
+        o.max_y = std::max(o.max_y, o.y[i]);
+    }
     return o;
 }
 
 // Whether the insides of two convex outlines meet (touching along an edge is not meeting: the fill rule gives a
 // pixel on a shared edge to one of them). A separating axis is along some edge of one of the two.
 bool outlines_meet(const Outline &a, const Outline &b) {
+    // AABB is a conservative broad phase: disjoint boxes cannot share a
+    // pixel, so avoid expensive separating-axis tests for distant primitives.
+    if (a.max_x <= b.min_x || b.max_x <= a.min_x ||
+        a.max_y <= b.min_y || b.max_y <= a.min_y) return false;
+    // Sprites are axis-aligned rectangles: their AABBs are their exact
+    // geometry, so no separating-axis projections are needed for this pair.
+    if (a.corners == 4 && b.corners == 4) return true;
     for (int pass = 0; pass < 2; ++pass) {
         const Outline &p = pass ? b : a;
+        // Sprite edges are axis-aligned; the AABB test above has already
+        // checked their separating axes. Only triangle edge normals need
+        // explicit projections.
+        if (p.corners == 4) continue;
         for (int i = 0; i < p.corners; ++i) {
             const int j = (i + 1) % p.corners;
             const float nx = p.y[j] - p.y[i], ny = p.x[i] - p.x[j];
@@ -1194,14 +1794,43 @@ bool outlines_meet(const Outline &a, const Outline &b) {
 
 // Where the group of a feedback draw's primitives that starts at `from` ends: before the first one, short of `to`,
 // that can cover a pixel one of the group covers.
-std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
-    static std::vector<Outline> group;
-    group.clear();
+std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline *precomputed = nullptr) {
+    // The eligibility prepass already owns contiguous outlines for this run.
+    // Compare them in place instead of copying every outline into a second
+    // vector for each feedback group. The fallback retains its own workspace.
+    static std::vector<Outline> fallback_group;
+    if (!precomputed) fallback_group.clear();
+    float group_min_x = 0, group_max_x = 0, group_min_y = 0, group_max_y = 0;
+    ++g_feedback_group_calls;
     for (std::uint32_t q = from; q < to; ++q) {
-        const Outline o = outline(g_batch.prims.data() + q * kPrimWords);
-        for (const Outline &other : group)
-            if (outlines_meet(o, other)) return q;
-        group.push_back(o);
+        ++g_feedback_group_prims;
+        Outline computed;
+        if (!precomputed) computed = outline(g_batch.prims.data() + q * kPrimWords);
+        const Outline &o = precomputed ? precomputed[q - from] : computed;
+        const bool may_overlap = q != from &&
+            o.max_x > group_min_x && o.min_x < group_max_x &&
+            o.max_y > group_min_y && o.min_y < group_max_y;
+        if (may_overlap) {
+            for (std::uint32_t prev = from; prev < q; ++prev) {
+                const Outline &other = precomputed ? precomputed[prev - from] : fallback_group[prev - from];
+                // Reject disjoint individual bounds before invoking SAT.
+                // The aggregate group bounds are only a coarse filter.
+                if (o.max_x <= other.min_x || other.max_x <= o.min_x ||
+                    o.max_y <= other.min_y || other.max_y <= o.min_y) continue;
+                ++g_feedback_outline_tests;
+                if (outlines_meet(o, other)) return q;
+            }
+        }
+        if (q == from) {
+            group_min_x = o.min_x; group_max_x = o.max_x;
+            group_min_y = o.min_y; group_max_y = o.max_y;
+        } else {
+            group_min_x = std::min(group_min_x, o.min_x);
+            group_max_x = std::max(group_max_x, o.max_x);
+            group_min_y = std::min(group_min_y, o.min_y);
+            group_max_y = std::max(group_max_y, o.max_y);
+        }
+        if (!precomputed) fallback_group.push_back(o);
     }
     return to;
 }
@@ -1209,6 +1838,12 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to) {
 bool flush_native(std::uint32_t prims) {
     const Timed timed(kCpuNative);
     Batch &b = g_batch;
+    // Cache the feedback partition computed during native eligibility checking.
+    // A zero entry means the range was not evaluated in the prepass.
+    static std::vector<std::uint32_t> feedback_ends;
+    feedback_ends.assign(prims, 0);
+    static std::vector<Outline> run_outlines;  // reused across batches and state runs
+    std::uint32_t planned_feedback_groups = 0;
     // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
     // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
     // batch to the compute rasterizer costs.
@@ -1221,7 +1856,28 @@ bool flush_native(std::uint32_t prims) {
             NativeState state;
             if (native_state(b.setups.data() + rec[0] * kSetupWords, b.zte, state) && state.feedback && state.draws) {
                 among += j - i;
-                for (std::uint32_t from = i; from < j; from = feedback_group(from, j)) ++groups;
+                // Build outlines once for the entire state run. The previous
+                // partitioner rebuilt outlines for each new feedback group.
+                run_outlines.clear();
+                run_outlines.reserve(j - i);
+                for (std::uint32_t q = i; q < j; ++q)
+                    run_outlines.push_back(outline(b.prims.data() + q * kPrimWords));
+                for (std::uint32_t from = i; from < j;) {
+                    const std::uint32_t end = feedback_group(from, j, run_outlines.data() + (from - i));
+                    feedback_ends[from] = end;
+                    from = end;
+                    ++groups;
+                    ++planned_feedback_groups;
+                    // Even if every remaining primitive requires feedback,
+                    // the allowed group budget cannot catch up. Fall back
+                    // immediately instead of completing costly SAT grouping.
+                    if (groups > 16u + (among + (prims - j)) / 4u) {
+                        g_why_prims[kWhyCount - 3] += prims;
+                        ++g_why_batches[kWhyCount - 3];
+                        g_refusal_counted = true;
+                        return false;
+                    }
+                }
             }
             i = j;
         }
@@ -1252,12 +1908,26 @@ bool flush_native(std::uint32_t prims) {
     g_sync_cause = 1;
     for (const Range &t : g_batch_reads) sync_memory(t, false);
     g_sync_cause = 0;
+    g_sync_cause = 5;
     sync_memory(fb, true, color);
     if (depth) sync_memory(z, b.zwrite, depth);
+    g_sync_cause = 0;
     // PS2_NATIVE_SYNC=1 reloads the targets before every batch and writes them back after it: slow, and what the
     // picture should be if the tracking of who holds the newer pixels were at fault.
     static const bool paranoid = std::getenv("PS2_NATIVE_SYNC") != nullptr;
     if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 1) {
+        if (path_profile_on()) {
+            color->stale_causes |= 128u;
+            if (depth) depth->stale_causes |= 128u;
+        }
+        if (sparse_load_on()) {
+            // Forced full reload also covers gaps we deliberately retained.
+            // Preserve those newer pixels before expanding the stale coverage.
+            store_surface(*color);
+            if (depth) store_surface(*depth);
+            color->stale_rows.add(0, static_cast<int>(color->height) - 1);
+            if (depth) depth->stale_rows.add(0, static_cast<int>(depth->height) - 1);
+        }
         color->stale0 = 0;
         color->stale1 = static_cast<int>(color->height) - 1;
         if (depth) depth->stale0 = 0, depth->stale1 = static_cast<int>(depth->height) - 1;
@@ -1269,6 +1939,10 @@ bool flush_native(std::uint32_t prims) {
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
     NativePass pass{color, depth, {}};
+    // Feedback groups emit one copy command and one draw each. Reserve
+    // those slots once, with room for at most one non-feedback draw per
+    // primitive, instead of growing the command vector in the hot loop.
+    pass.draws.reserve(static_cast<std::size_t>(prims) + 2ull * planned_feedback_groups);
     if (native_debug()) std::fprintf(stderr, "[batch] %llu: %u prims, fbp %X zbp %X\n", static_cast<unsigned long long>(g_native_batches), prims, b.fbp, b.zbp);
     for (std::uint32_t i = 0; i < prims;) {
         const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
@@ -1282,6 +1956,8 @@ bool flush_native(std::uint32_t prims) {
         if (native_debug()) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
         if (native_debug()) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
         if (state.draws && x0 < x1 && y0 < y1) {
+            // One state run uses the same pipeline for every feedback group.
+            const WGPURenderPipeline pipeline = native_pipeline(state.key);
             std::array<std::uint32_t, kParamStride / 4> record{};
             std::memcpy(record.data(), w, kSetupWords * 4);
             record[0] = state.flags;
@@ -1292,7 +1968,7 @@ bool flush_native(std::uint32_t prims) {
             record[36] = state.premultiply;
             if (!state.feedback) {
                 g_param_records.push_back(record);
-                pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
+                pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
                                       y1 - y0, state.constant});
             } else {
                 // The draw's primitives go in groups of which no two can cover the same pixel: each group reads the
@@ -1316,7 +1992,11 @@ bool flush_native(std::uint32_t prims) {
                 std::uint32_t from = i;
                 while (from < j) {
                     int gx0 = 1 << 30, gy0 = 1 << 30, gx1 = -1, gy1 = -1;
-                    const std::uint32_t to = feedback_group(from, j);
+                    // Reuse the exact partition validated above; preserve the
+                    // original calculation as a fallback for unplanned ranges.
+                    const std::uint32_t cached_end = feedback_ends[from];
+                    const std::uint32_t to = cached_end && cached_end <= j
+                        ? cached_end : feedback_group(from, j);
                     for (std::uint32_t q = from; q < to; ++q) {
                         const std::uint32_t *prim = b.prims.data() + q * kPrimWords;
                         gx0 = std::min(gx0, static_cast<int>(prim[2] & 0xFFFFu));
@@ -1331,9 +2011,11 @@ bool flush_native(std::uint32_t prims) {
                         record[32] = prim_offset + from * kPrimWords;
                         g_param_records.push_back(record);
                         pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
-                        pass.draws.push_back({native_pipeline(state.key), static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
-                                              y1 - y0, 0.0f, true});
-                        ++g_feedback_copies;
+                        // The feedback group's bounding box already encloses every
+                        // primitive in this draw and is clipped to the setup
+                        // scissor. Use it for rasterization as well as copy.
+                        pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
+                                              cy1 - cy0, 0.0f, true});
                         g_feedback_draws += to - from;
                     }
                     from = to;
@@ -1738,6 +2420,8 @@ void flush_batch() {
     // 140 such batches a frame, each read by the next: a tile of the picture, then a palette made from it.
     // PS2_NATIVE_SMALL=<pixels> sets how small (4096 by default, 0 for never).
     static const long small = std::getenv("PS2_NATIVE_SMALL") ? std::atol(std::getenv("PS2_NATIVE_SMALL")) : 4096;
+    PathSample path_sample(prims);
+    bool used_native = false;
     bool native = b.native && g_native_batches < limit;
     if (native && static_cast<long>(b.maxx - b.minx + 1) * (b.maxy - b.miny + 1) <= small) {
         bool in_memory = true;
@@ -1752,6 +2436,7 @@ void flush_batch() {
         }
     }
     if (native && flush_native(prims)) {
+        used_native = true;
         ++g_native_batches;
         g_native_prims += prims;
         census(prims, false);
@@ -1767,6 +2452,7 @@ void flush_batch() {
     if (b.zwrite) mark_rendered(pages(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy));
     // Whatever was drawn over the counting texture of GT4's colour correction, it no longer counts.
     if (g_lut.count_ok && pages(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy).overlaps(g_lut.count_range.lo, g_lut.count_range.hi)) g_lut.count_ok = false;
+    path_sample.finish(used_native);
     clear_batch();
 }
 
@@ -1804,7 +2490,15 @@ void emit_pre(std::size_t upto) {
     }
     if (!g_surfaces.empty()) {
         g_sync_cause = 4;
-        for (const PreOp &op : g_pre) sync_memory(op.range, !op.clut);
+        for (const PreOp &op : g_pre) {
+            UploadSpan span;
+            if (sparse_load_on() && !op.clut &&
+                upload_span32(op.rec[0], op.rec[1], op.rec[2], op.x0, op.y0, op.x1, op.y1, span)) {
+                Range touched;
+                touched.add(span.lo, span.hi);
+                sync_memory(touched, true);
+            } else sync_memory(op.range, !op.clut);
+        }
         g_sync_cause = 0;
     }
     if (g_trace > 0)
@@ -1875,7 +2569,33 @@ void queue_pre(const PreOp &op) {
     // An upload could change the colour correction's table or what it reads: what is collected is done first.
     if (!op.clut) {
         lut_flush();
-        wrote(op.range);
+        // Keep the dependency range conservative, but avoid invalidating
+        // untouched pages between destination rows of a narrow upload.
+        const bool precise = decode_cache_on() &&
+            (op.rec[2] == PSMCT32 || op.rec[2] == PSMCT24) &&
+            wrote_small_upload32(op.rec[0], op.rec[1], op.x0, op.y0, op.x1, op.y1);
+        if (!precise) {
+            if (op.x1 < 2048u && op.y1 < 2048u) {
+                std::uint32_t pw, ph;
+                page_size(op.rec[2], pw, ph);
+                const std::uint32_t stride = std::max(1u, op.rec[1] * 64 / pw);
+                const std::uint32_t first = op.x0 / pw, last = op.x1 / pw;
+                const std::uint32_t span = last - first + 1 + (op.rec[0] % 32 != 0);
+                if (span < stride && op.y0 / ph != op.y1 / ph) {
+                    ++g_write_clock;
+                    const std::uint32_t base = op.rec[0] / 32 + first;
+                    for (std::uint32_t y = op.y0 / ph; y <= op.y1 / ph; ++y)
+                        for (std::uint32_t x = 0; x < span; ++x)
+                            wrote_page(base + y * stride + x);
+                } else {
+                    wrote(pages(op.rec[0], op.rec[1], op.rec[2],
+                                static_cast<int>(op.x0), static_cast<int>(op.y0),
+                                static_cast<int>(op.x1), static_cast<int>(op.y1)));
+                }
+            } else {
+                wrote(op.range);
+            }
+        }
     }
     g_pre.push_back(op);
 }
@@ -2037,6 +2757,24 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
+// A shared snapshot is valid until a draw touches a later group's copy
+// rectangle. Keep the search bounded and avoid copying large gaps.
+bool extend_feedback_copy(NativeDraw &copy, const NativeDraw &next, std::uint64_t &pixels) {
+    const auto right = copy.x + copy.w, bottom = copy.y + copy.h;
+    const auto next_right = next.x + next.w, next_bottom = next.y + next.h;
+    if (copy.x < next_right && next.x < right && copy.y < next_bottom && next.y < bottom) return false;
+    const auto x = std::min(copy.x, next.x), y = std::min(copy.y, next.y);
+    const auto width = std::max(right, next_right) - x, height = std::max(bottom, next_bottom) - y;
+    const auto combined = pixels + static_cast<std::uint64_t>(next.w) * next.h;
+    if (static_cast<std::uint64_t>(width) * height > combined + combined / 4) return false;
+    copy.x = x;
+    copy.y = y;
+    copy.w = width;
+    copy.h = height;
+    pixels = combined;
+    return true;
+}
+
 // The render passes of the native renderer from command i on; successive ones on the same targets share a pass.
 // Returns the last command taken.
 std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
@@ -2057,35 +2795,78 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
         depth.depthStoreOp = WGPUStoreOp_Store;
         rd.depthStencilAttachment = &depth;
     }
-    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+    WGPURenderPassEncoder rp = nullptr;
     WGPURenderPipeline current = nullptr;
     float constant = 0.0f;
+    std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
+    bool backdrop_bound = false;
     for (;;) {
-        for (const NativeDraw &d : g_native_passes[g_commands[i].x].draws) {
+        const auto &draws = g_native_passes[g_commands[i].x].draws;
+        std::size_t snapshot_end = 0;
+        for (std::size_t draw = 0; draw < draws.size(); ++draw) {
+            const auto &d = draws[draw];
             if (!d.pipeline) {
-                // The colour target as it is now, for the feedback draw that follows: a copy cannot be made inside
-                // a pass, so this one ends and another begins.
-                wgpuRenderPassEncoderEnd(rp);
-                wgpuRenderPassEncoderRelease(rp);
+                if (draw < snapshot_end) {
+                    ++g_feedback_copies_merged;
+                    continue;
+                }
+                NativeDraw copy = d;
+                auto pixels = static_cast<std::uint64_t>(copy.w) * copy.h;
+                snapshot_end = draw + 2;
+                // Each copy command is immediately followed by its draw,
+                // which is clipped to exactly the copied rectangle.
+                while (snapshot_end < draws.size() && snapshot_end - draw < 16 &&
+                       !draws[snapshot_end].pipeline && extend_feedback_copy(copy, draws[snapshot_end], pixels)) {
+                    snapshot_end += 2;
+                }
+                ++g_feedback_copies;
+                g_feedback_copy_pixels += static_cast<std::uint64_t>(copy.w) * copy.h;
+#ifdef PS2_GPU_GL
+                // GL copies into a separate texture without rebinding the
+                // framebuffer or resetting state used by the next draw.
+                if (rp && ps2GlCopyFeedbackInPass(enc, first.color->texture, first.color->backdrop,
+                                                  copy.x * g_scale, copy.y * g_scale, copy.w * g_scale, copy.h * g_scale)) continue;
+#endif
+                // WebGPU copies must run between render passes.
+                if (rp) {
+                    wgpuRenderPassEncoderEnd(rp);
+                    wgpuRenderPassEncoderRelease(rp);
+                    rp = nullptr;
+                    ++g_feedback_pass_restarts;
+                }
                 WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
                 from.texture = first.color->texture;
                 to.texture = first.color->backdrop;
-                from.origin = to.origin = WGPUOrigin3D{d.x * g_scale, d.y * g_scale, 0};
-                const WGPUExtent3D size{d.w * g_scale, d.h * g_scale, 1};
+                from.origin = to.origin = WGPUOrigin3D{copy.x * g_scale, copy.y * g_scale, 0};
+                const WGPUExtent3D size{copy.w * g_scale, copy.h * g_scale, 1};
                 wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
+                current = nullptr;
+                constant = 0.0f;
+                backdrop_bound = false;
+                last_x = last_y = last_w = last_h = ~0u;
+                continue;
+            }
+            if (!rp) {
                 rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
                 current = nullptr;
                 constant = 0.0f;
-                continue;
+                backdrop_bound = false;
+                last_x = last_y = last_w = last_h = ~0u;
             }
-            if (d.feedback) wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
+            if (d.feedback && !backdrop_bound) {
+                wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
+                backdrop_bound = true;
+            }
             if (d.pipeline != current) {
                 wgpuRenderPassEncoderSetPipeline(rp, d.pipeline);
                 current = d.pipeline;
             }
             const std::uint32_t offset = d.param * kParamStride;
             wgpuRenderPassEncoderSetBindGroup(rp, 0, g_native_group, 1, &offset);
-            wgpuRenderPassEncoderSetScissorRect(rp, d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale);
+            if (d.x != last_x || d.y != last_y || d.w != last_w || d.h != last_h) {
+                wgpuRenderPassEncoderSetScissorRect(rp, d.x * g_scale, d.y * g_scale, d.w * g_scale, d.h * g_scale);
+                last_x = d.x; last_y = d.y; last_w = d.w; last_h = d.h;
+            }
             if (d.constant != constant) {
                 constant = d.constant;
                 const WGPUColor c{constant, constant, constant, constant};
@@ -2098,8 +2879,10 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
         if (next.color != first.color || next.depth != first.depth) break;
         ++i;
     }
-    wgpuRenderPassEncoderEnd(rp);
-    wgpuRenderPassEncoderRelease(rp);
+    if (rp) {
+        wgpuRenderPassEncoderEnd(rp);
+        wgpuRenderPassEncoderRelease(rp);
+    }
     return i;
 }
 
@@ -2114,6 +2897,7 @@ void submitted() {
     g_native_passes.clear();
     release_retired();
     if (g_trace > 0) std::fprintf(stderr, "[trace] ---- submitted, %d to go\n", --g_trace);
+    report_paths();
     // PS2_GL_STATS (the Switch build's --stats) or PS2_NATIVE_STATS: once a second, how much each rasterizer drew
     // and how often a target went to GS memory and back. What stays with the compute rasterizer is what costs.
     static const bool report = g_native && (std::getenv("PS2_GL_STATS") || std::getenv("PS2_NATIVE_STATS"));
@@ -2160,21 +2944,124 @@ void submitted() {
         std::fprintf(stderr, "[native] GS thread ms a second in the renderer:%s\n", text);
         std::fill(g_cpu.ms, g_cpu.ms + kCpuParts, 0.0);
     }
-    static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0;
-    if (g_decode_hits + g_decode_misses != last_hits + last_misses)
+    static std::uint64_t last_hits = 0, last_misses = 0, last_words = 0, last_restarts = 0, last_saved_words = 0;
+    static std::uint64_t last_invalidated = 0, last_cold = 0, last_small = 0;
+    static std::uint64_t last_admission_skips = 0, last_admission_texels = 0;
+    static std::uint64_t last_capacity_bypasses = 0, last_capacity_texels = 0;
+    static std::uint64_t last_decode_evictions = 0, last_decode_reclaimed = 0, last_decode_tail = 0;
+    const std::uint64_t hits = g_decode_hits - last_hits, misses = g_decode_misses - last_misses;
+    // Every eligible lookup either hits, finds a stale entry, or is absent.
+    // Admission and capacity bypasses remain misses even without a decode.
+    const auto invalidated = g_decode_invalidated - last_invalidated;
+    const auto absent = g_decode_cold - last_cold;
+    const auto lookups = hits + invalidated + absent;
+    if (lookups) {
+        const double hit_rate = 100.0 * static_cast<double>(hits) / static_cast<double>(lookups);
         std::fprintf(stderr, "[native] decoded textures a second: %.0f found, %.0f decoded (%.0f texels), %.0f times the buffer full\n",
-                     static_cast<double>(g_decode_hits - last_hits) / seconds, static_cast<double>(g_decode_misses - last_misses) / seconds,
+                     static_cast<double>(hits) / seconds, static_cast<double>(misses) / seconds,
                      static_cast<double>(g_decode_words - last_words) / seconds, static_cast<double>(g_decode_restarts - last_restarts) / seconds);
+        std::fprintf(stderr, "[native] decode cache: %.1f%% hits, %.0f texels/s reused, %zu entries, %.1f/%.1f MiB used\n",
+                     hit_rate, static_cast<double>(g_decode_saved_words - last_saved_words) / seconds,
+                     g_decoded_cache.size(), static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
+                     static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+        std::fprintf(stderr, "[native] decode lookups: %.0f/s, %.0f hits/s, %.0f misses/s (cache %s)\n",
+                     static_cast<double>(lookups) / seconds, static_cast<double>(hits) / seconds,
+                     static_cast<double>(invalidated + absent) / seconds, decode_cache_on() ? "on" : "off");
+        std::fprintf(stderr, "[native] decode cache misses: %.0f invalidated/s, %.0f absent/s, %.0f small-batch skips/s\n",
+                     static_cast<double>(g_decode_invalidated - last_invalidated) / seconds,
+                     static_cast<double>(g_decode_cold - last_cold) / seconds,
+                     static_cast<double>(g_decode_small - last_small) / seconds);
+    }
+    if (decode_key_diagnostics_on()) {
+        static std::uint64_t last_churn = 0, last_first_seen = 0;
+        static std::uint64_t last_repeat = 0, last_first = 0;
+        std::fprintf(stderr, "[native] decode absent diagnostics: %.0f recurring exact keys/s, %.0f first-seen exact keys/s\n",
+                     static_cast<double>(g_decode_repeat_absent - last_repeat) / seconds,
+                     static_cast<double>(g_decode_first_absent - last_first) / seconds);
+        last_repeat = g_decode_repeat_absent;
+        last_first = g_decode_first_absent;
+        std::fprintf(stderr, "[native] decode key diagnostics: %.0f CLUT-key changes/s, %.0f new texture signatures/s, %zu tracked signatures\n",
+                     static_cast<double>(g_decode_clut_churn - last_churn) / seconds,
+                     static_cast<double>(g_decode_key_first_seen - last_first_seen) / seconds,
+                     g_decode_key_probe.size());
+        last_churn = g_decode_clut_churn;
+        last_first_seen = g_decode_key_first_seen;
+    }
+    last_invalidated = g_decode_invalidated;
+    last_cold = g_decode_cold;
+    last_small = g_decode_small;
+    std::fprintf(stderr, "[native] decode admission: %.0f cold large textures/s bypassed, %.0f texels/s not predecoded\n",
+                 static_cast<double>(g_decode_admission_skips - last_admission_skips) / seconds,
+                 static_cast<double>(g_decode_admission_texels - last_admission_texels) / seconds);
+    std::fprintf(stderr, "[native] decode capacity: %.0f bypasses/s, %.0f texels/s direct, %.1f/%.1f MiB occupied\n",
+                 static_cast<double>(g_decode_capacity_bypasses - last_capacity_bypasses) / seconds,
+                 static_cast<double>(g_decode_capacity_texels - last_capacity_texels) / seconds,
+                 static_cast<double>(g_decoded_used) * 4.0 / (1024.0 * 1024.0),
+                 static_cast<double>(kDecodedWords) * 4.0 / (1024.0 * 1024.0));
+    std::fprintf(stderr, "[native] decode reclaim: %.0f evictions/s, %.0f texels/s recycled, %.0f texels/s returned to tail, %zu pending blocks, %zu free spans\n",
+                 static_cast<double>(g_decode_evictions - last_decode_evictions) / seconds,
+                 static_cast<double>(g_decode_reclaimed_words - last_decode_reclaimed) / seconds,
+                 static_cast<double>(g_decode_tail_words - last_decode_tail) / seconds,
+                 g_decode_retired.size(), g_decode_free.size());
+    std::fprintf(stderr, "[native] decode reuse: %s\n", !decode_cache_on() ? "disabled" : decode_queue_reuse_on() ? "queue-ordered" : "completion-fenced");
+    static std::uint64_t last_precise_uploads = 0;
+    std::fprintf(stderr, "[native] CLUT tracking: %.0f small uploads/s tracked by block\n",
+                 static_cast<double>(g_clut_precise_uploads - last_precise_uploads) / seconds);
+    last_precise_uploads = g_clut_precise_uploads;
+    static std::uint64_t last_insufficient_space = 0, last_fragmented_space = 0;
+    std::fprintf(stderr, "[native] decode preserved: %.0f insufficient-space skips/s, %.0f fragmented-space skips/s\n",
+                 static_cast<double>(g_decode_insufficient_space - last_insufficient_space) / seconds,
+                 static_cast<double>(g_decode_fragmented_space - last_fragmented_space) / seconds);
+    last_insufficient_space = g_decode_insufficient_space;
+    last_fragmented_space = g_decode_fragmented_space;
+    last_decode_evictions = g_decode_evictions;
+    last_decode_reclaimed = g_decode_reclaimed_words;
+    last_decode_tail = g_decode_tail_words;
+    last_capacity_bypasses = g_decode_capacity_bypasses;
+    last_capacity_texels = g_decode_capacity_texels;
+    last_admission_skips = g_decode_admission_skips;
+    last_admission_texels = g_decode_admission_texels;
     last_hits = g_decode_hits;
     last_misses = g_decode_misses;
     last_words = g_decode_words;
     last_restarts = g_decode_restarts;
-    static std::uint64_t last_feedback = 0, last_copies = 0;
+    last_saved_words = g_decode_saved_words;
+    static std::uint64_t last_feedback = 0, last_copies = 0, last_copy_pixels = 0, last_pass_restarts = 0;
+    static std::uint64_t last_merged = 0;
+    const std::uint64_t feedback_copies = g_feedback_copies - last_copies;
+    const std::uint64_t feedback_pixels = g_feedback_copy_pixels - last_copy_pixels;
     if (g_feedback_draws != last_feedback)
-        std::fprintf(stderr, "[native] reading the target: %.0f prims a second in %.0f groups, each a copy\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
-                     static_cast<double>(g_feedback_copies - last_copies) / seconds);
+        std::fprintf(stderr, "[native] reading the target: %.0f prims a second across %.0f copies\n", static_cast<double>(g_feedback_draws - last_feedback) / seconds,
+                     static_cast<double>(feedback_copies) / seconds);
+    if (feedback_copies)
+        std::fprintf(stderr, "[native] feedback copies: %.0f/s, %.0f source pixels/s, %.0f pixels/copy, %.0f render pass restarts/s, %.0f copies merged/s (scale %u)\n",
+                     static_cast<double>(feedback_copies) / seconds,
+                     static_cast<double>(feedback_pixels) / seconds,
+                     static_cast<double>(feedback_pixels) / static_cast<double>(feedback_copies),
+                     static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds,
+                     static_cast<double>(g_feedback_copies_merged - last_merged) / seconds, g_scale);
+    last_merged = g_feedback_copies_merged;
+    last_pass_restarts = g_feedback_pass_restarts;
     last_feedback = g_feedback_draws;
     last_copies = g_feedback_copies;
+    last_copy_pixels = g_feedback_copy_pixels;
+    static std::uint64_t last_group_calls = 0;
+    static std::uint64_t last_outline_tests = 0;
+    static std::uint64_t last_group_prims = 0;
+    const auto group_calls = g_feedback_group_calls - last_group_calls;
+    const auto outline_tests = g_feedback_outline_tests - last_outline_tests;
+    const auto group_prims = g_feedback_group_prims - last_group_prims;
+    if (group_calls)
+        std::fprintf(stderr,
+            "[native] feedback grouping: %.0f calls/s, %.0f prim visits/s, "
+            "%.0f overlap tests/s, %.1f tests/call\n",
+            static_cast<double>(group_calls) / seconds,
+            static_cast<double>(group_prims) / seconds,
+            static_cast<double>(outline_tests) / seconds,
+            static_cast<double>(outline_tests) / static_cast<double>(group_calls));
+    last_group_calls = g_feedback_group_calls;
+    last_outline_tests = g_feedback_outline_tests;
+    last_group_prims = g_feedback_group_prims;
     static std::uint64_t last_tiles = 0, last_passes = 0;
     if (g_lut_tiles != last_tiles)
         std::fprintf(stderr, "[native] colour correction: %.0f tiles a second in %.0f passes\n", static_cast<double>(g_lut_tiles - last_tiles) / seconds, static_cast<double>(g_lut_passes - last_passes) / seconds);
@@ -2195,6 +3082,31 @@ void submitted() {
     since = std::chrono::steady_clock::now();
 }
 
+void track_decode_submission(std::uint64_t serial) {
+    if (!g_decode || !decode_cache_on()) return;
+    if (decode_queue_reuse_on()) {
+        // The GL backend begins every submission with a shader-storage
+        // barrier. g_decoded is written only by GPU decode dispatches, so
+        // those later writes wait for all earlier shader reads. No host
+        // completion callback is needed to recycle a submitted batch's slots.
+        g_decode_reusable_serial = std::max(g_decode_reusable_serial, serial);
+        return;
+    }
+    // One outstanding marker is enough: the next one covers every submit
+    // queued before it. Keep the serial fixed while its callback is pending.
+    static std::uint64_t pending_serial = 0;
+    if (pending_serial) return;
+    pending_serial = serial;
+    WGPUQueueWorkDoneCallbackInfo decode_done = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    decode_done.mode = WGPUCallbackMode_AllowProcessEvents;
+    decode_done.callback = [](WGPUQueueWorkDoneStatus status, WGPUStringView, void *, void *) {
+        if (status == WGPUQueueWorkDoneStatus_Success)
+            g_decode_reusable_serial = std::max(g_decode_reusable_serial, pending_serial);
+        pending_serial = 0;
+    };
+    wgpuQueueOnSubmittedWorkDone(g_queue, decode_done);
+}
+
 void profile_submit() {
     constexpr std::uint32_t kMax = 2048;
     if (!g_profile_queries) {
@@ -2206,10 +3118,15 @@ void profile_submit() {
         g_profile_read = make_buffer(kMax * 16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // Native-only / present-only submissions can have no compute payload.
+    // Avoid queue writes and backend validation for empty upload ranges.
+    if (!g_arena.empty())
+        wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (!g_param_records.empty())
+        wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    const std::uint32_t n = static_cast<std::uint32_t>(std::min<std::size_t>(g_commands.size(), kMax));
+    std::vector<std::uint32_t> measured_commands;
+    measured_commands.reserve(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
         if (c.pipeline == kNative) {
@@ -2218,10 +3135,15 @@ void profile_submit() {
         }
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
         writes.querySet = g_profile_queries;
-        writes.beginningOfPassWriteIndex = i * 2;
-        writes.endOfPassWriteIndex = i * 2 + 1;
+        const bool measure_command = measured_commands.size() < kMax;
+        if (measure_command) {
+            const auto query = static_cast<std::uint32_t>(measured_commands.size());
+            writes.beginningOfPassWriteIndex = query * 2;
+            writes.endOfPassWriteIndex = query * 2 + 1;
+            measured_commands.push_back(i);
+        }
         WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-        if (i < n) cd.timestampWrites = &writes;
+        if (measure_command) cd.timestampWrites = &writes;
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
         wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
         const std::uint32_t offset = c.param * kParamStride;
@@ -2231,34 +3153,47 @@ void profile_submit() {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
+    const auto n = static_cast<std::uint32_t>(measured_commands.size());
     if (n) {
         wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_profile_resolve, 0, g_profile_read, 0, n * 16);
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
+    track_decode_submission(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     if (n) {
-        bool done = false;
+        struct MapResult {
+            bool done = false;
+            bool success = false;
+        } mapped;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
-        cb.callback = [](WGPUMapAsyncStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
-        cb.userdata1 = &done;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *userdata, void *) {
+            auto &result = *static_cast<MapResult *>(userdata);
+            result.success = status == WGPUMapAsyncStatus_Success;
+            result.done = true;
+        };
+        cb.userdata1 = &mapped;
         wgpuBufferMapAsync(g_profile_read, WGPUMapMode_Read, 0, n * 16, cb);
-        wait_until(done);
-        const auto *t = static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16));
+        wait_until(mapped.done);
+        const auto *t = mapped.success
+            ? static_cast<const std::uint64_t *>(wgpuBufferGetConstMappedRange(g_profile_read, 0, n * 16))
+            : nullptr;
         std::size_t info = 0;
-        for (std::uint32_t i = 0; t && i < n; ++i) {
+        for (std::uint32_t query = 0; t && query < n; ++query) {
+            const std::uint32_t i = measured_commands[query];
             while (info < g_command_info.size() && g_command_info[info].index < i) ++info;
             std::fprintf(g_profile_out, "%llu %u %s %llu %u %u", static_cast<unsigned long long>(frame_count()), i,
-                         g_commands[i].pipeline == kNative ? "native" : kEntryPoints[g_commands[i].pipeline],
-                         static_cast<unsigned long long>(t[i * 2 + 1] > t[i * 2] ? t[i * 2 + 1] - t[i * 2] : 0), g_commands[i].x, g_commands[i].y);
+                         kEntryPoints[g_commands[i].pipeline],
+                         static_cast<unsigned long long>(t[query * 2 + 1] > t[query * 2] ? t[query * 2 + 1] - t[query * 2] : 0), g_commands[i].x, g_commands[i].y);
             if (info < g_command_info.size() && g_command_info[info].index == i)
                 for (std::uint32_t v : g_command_info[info].values) std::fprintf(g_profile_out, " %u", v);
             std::fprintf(g_profile_out, "\n");
         }
-        wgpuBufferUnmap(g_profile_read);
+        if (mapped.success) wgpuBufferUnmap(g_profile_read);
+        else std::fprintf(stderr, "[gpu] profiling timestamp buffer mapping failed\n");
     }
     submitted();
 }
@@ -2272,8 +3207,12 @@ void submit(WGPUTextureView present_view = nullptr) {
         return;
     }
     ensure_capacity();
-    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    // Native-only / present-only submissions can have no compute payload.
+    // Avoid queue writes and backend validation for empty upload ranges.
+    if (!g_arena.empty())
+        wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    if (!g_param_records.empty())
+        wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
@@ -2295,9 +3234,12 @@ void submit(WGPUTextureView present_view = nullptr) {
     writes.endOfPassWriteIndex = 1;
     WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
     if (measure) cd.timestampWrites = &writes;
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
-    cd.timestampWrites = nullptr;  // a submit with native passes in it has several compute passes: the first is the one timed
+    // Native-only submissions should not create an empty compute pass.
+    // Timestamp queries are attached to the first actual compute pass.
+    WGPUComputePassEncoder pass = nullptr;
+    bool first_compute_pass = true;
     Pipeline current = kPipelines;
+    Surface *bound_target = nullptr;
     ++g_submits;
     ++g_total_passes;
     for (std::size_t i = 0; i < g_commands.size(); ++i) {
@@ -2313,7 +3255,12 @@ void submit(WGPUTextureView present_view = nullptr) {
         }
         if (!pass) {
             pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
+            if (first_compute_pass) {
+                cd.timestampWrites = nullptr;
+                first_compute_pass = false;
+            }
             current = kPipelines;
+            bound_target = nullptr;
         }
         ++g_dispatches[c.pipeline];
         if (c.pipeline != current) {
@@ -2322,14 +3269,17 @@ void submit(WGPUTextureView present_view = nullptr) {
         }
         const std::uint32_t offset = c.param * kParamStride;
         wgpuComputePassEncoderSetBindGroup(pass, 0, g_group, 1, &offset);
-        if (c.target) wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
+        if (c.target && c.target != bound_target) {
+            wgpuComputePassEncoderSetBindGroup(pass, 1, c.target->group, 0, nullptr);
+            bound_target = c.target;
+        }
         wgpuComputePassEncoderDispatchWorkgroups(pass, c.x, c.y, 1);
     }
     if (pass) {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    if (measure) {
+    if (measure && !first_compute_pass) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
     }
@@ -2355,9 +3305,13 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
+    // Authorize reuse only for the batch just submitted. The current batch
+    // serial advances in submitted(); it remains protected during recording.
+    // GL orders reuse on the GPU; the fallback uses completion callbacks.
+    track_decode_submission(g_serial);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
-    if (measure) {
+    if (measure && !first_compute_pass) {
         g_query_pending = true;
         WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         cb.mode = WGPUCallbackMode_AllowProcessEvents;
@@ -2636,9 +3590,17 @@ bool init(Mode m) {
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_decoded = make_buffer(static_cast<std::uint64_t>(kDecodedWords) * 4, WGPUBufferUsage_Storage);
-    g_decoded_cache.clear();
+    decode_cache_clear();
+    g_decode_free.clear();
+    g_decode_retired.clear();
     g_decoded_used = 0;
+    std::fill(std::begin(g_clut_identity), std::end(g_clut_identity), ClutIdentity{});
     if (const char *decode = std::getenv("PS2_DECODE")) g_decode = std::atoi(decode) != 0;
+#ifdef PS2_GPU_GL
+    // Use the same decision for allocator eligibility and the GL barrier.
+    // Disabling the experiment must restore both parts of the old path.
+    ps2GlSetDecodeQueueReuse(g_decode && decode_cache_on() && decode_queue_reuse_on());
+#endif
     g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
@@ -3071,9 +4033,46 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
     op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
                    : region(cbp, 1, cpsm, 0, 0, 15, 15);
     queue_pre(op);
-    std::uint64_t content = g_clut_content[g_clut_slot];
-    for (int k = 2; k < 10; ++k) content = mix(content, rec[k]);
-    g_clut_content[next] = mix(content, last_written(op.range));
+    if (decode_cache_on()) {
+        auto &identity = g_clut_identity[next];
+        identity = g_clut_identity[g_clut_slot];
+        const std::uint32_t banks = rec[6] ? 16u : 1u;
+        const std::uint32_t first = csm ? rec[5] : (rec[6] ? 0u : rec[5] & 15u);
+        const std::uint64_t source = mix(mix(cbp, cpsm), csm);
+        const bool csm1_32 = !csm && (cpsm == PSMCT32 || cpsm == PSMCT24);
+        const bool csm1_16 = !csm && (cpsm == PSMCT16 || cpsm == PSMCT16S);
+        // Recognized CSM1 formats use the physical blocks of each bank.
+        // Unknown formats retain the conservative dependency range.
+        const std::uint64_t csm1_written = (csm || csm1_32 || csm1_16) ? 0u : last_written(op.range);
+        for (std::uint32_t k = 0; k < banks; ++k) {
+            const std::uint32_t dst = (first + k) & 31u;
+            if (dst >= identity.banks.size()) continue;  // the sampler cannot select these entries
+            // CSM2 reads a linear span. CSM1 four-bit loads always read
+            // the same 8x2 rectangle, regardless of the destination bank.
+            const int x = static_cast<int>((cou + k) * 16);
+            const int y = static_cast<int>(cov);
+            const std::uint32_t source_bank = rec[6] ? k : 0u;
+            auto written = csm1_32 ? clut_csm1_bank_written32(cbp, source_bank)
+                : csm1_16 ? clut_csm1_bank_written16(cbp, source_bank) : csm1_written;
+            if (csm) {
+                if (cpsm == PSMCT32 || cpsm == PSMCT24) {
+                    // COU aligns the 16 entries to two 8-pixel GS blocks.
+                    // Block epochs exclude small uploads elsewhere in the
+                    // same page, including with an unaligned CBP or wrap.
+                    const auto first_block = address32(cbp, cbw, x, y) >> 8;
+                    const auto second_block = address32(cbp, cbw, x + 8, y) >> 8;
+                    written = std::max(clut_block_written(first_block), clut_block_written(second_block));
+                } else {
+                    written = last_written(pages(cbp, cbw, cpsm, x, y, x + 15, y));
+                }
+            }
+            // Bank zero reads the same ordered colors in both 16-entry
+            // and 256-entry CSM1 loads, so the load size is not part of its key.
+            const auto layout = csm ? mix(mix(cbw, cou + k), cov) : (rec[6] ? k : 0u);
+            identity.banks[dst] = mix(mix(source, layout), written);
+        }
+        identity.refresh_eight();
+    }
     g_clut_source[next] = {cbp, cpsm == PSMCT32 && !csm && rec[6] != 0};
     g_clut_slot = next;
     ++g_clut_loads;
@@ -3201,9 +4200,13 @@ void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, co
     const std::uint32_t from = scale * scale, to = g_scale * g_scale;
     std::fill(std::begin(g_rendered), std::end(g_rendered), from == to && to > 1);
     wrote(Range{0, kMemorySize});
-    g_decoded_cache.clear();
+    decode_cache_clear();
+    g_decode_free.clear();
+    g_decode_retired.clear();
     g_decoded_used = 0;
-    g_clut_content[g_clut_slot] = mix(g_clut_content[g_clut_slot], g_write_clock);
+    auto &identity = g_clut_identity[g_clut_slot];
+    identity.banks.fill(g_write_clock);
+    identity.refresh_eight();
     if (from == to && vram.size() == words * to) {
         wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
     } else {
@@ -3220,6 +4223,8 @@ std::uint64_t corrected_tiles() { return g_lut_tiles; }
 
 void stats() {
     if (g_mode == Mode::off) return;
+    if (sparse_load_on()) std::fprintf(stderr, "[gpu] sparse loads: %.0f source pixels skipped, %.0f gap store decisions deferred\n",
+                                     double(g_sparse_saved_pixels), double(g_sparse_gap_stores));
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
