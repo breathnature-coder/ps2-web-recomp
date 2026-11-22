@@ -1204,10 +1204,16 @@ std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for 
 PathProfile g_path_profile;
 SurfaceTraffic g_surface_traffic;
 std::uint64_t g_sparse_saved_pixels = 0, g_sparse_gap_stores = 0;
-bool sparse_load_on() {
-    static const bool on = std::getenv("PS2_NATIVE_SPARSE_LOAD") && std::strcmp(std::getenv("PS2_NATIVE_SPARSE_LOAD"), "1") == 0;
-    return on;
+int sparse_load_mode() {
+    static const int mode = [] {
+        const char *value = std::getenv("PS2_NATIVE_SPARSE_LOAD");
+        if (value && std::strcmp(value, "1") == 0) return 1;
+        if (value && std::strcmp(value, "2") == 0) return 2;
+        return 0;
+    }();
+    return mode;
 }
+bool sparse_load_on() { return sparse_load_mode() != 0; }
 bool path_profile_on() {
     static const bool on = std::getenv("PS2_GS_PATH_STATS") && std::strcmp(std::getenv("PS2_GS_PATH_STATS"), "1") == 0;
     return on;
@@ -1598,9 +1604,10 @@ void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
         int y0, y1;
         if (write && surface_rows(s, r, y0, y1)) {
             // The baseline reloads the enclosing interval. The opt-in path retains gaps,
-            // but collapses to an enclosure after four spans. Preserve dirty pixels
+            // but limits fragmentation to four spans (mode 1 encloses all, mode 2
+            // merges the smallest gap). Preserve dirty pixels
             // before any such conservative expansion can overwrite them.
-            if (sparse_load_on()) s.stale_rows.add(y0, y1);
+            if (sparse_load_on()) s.stale_rows.add(y0, y1, sparse_load_mode() == 2);
             if (s.stale1 >= s.stale0) {
                 y0 = std::min(y0, s.stale0);
                 y1 = std::max(y1, s.stale1);

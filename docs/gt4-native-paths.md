@@ -92,15 +92,25 @@ read the retained representation or have a correctly ordered fallback.
 
 ### Experimental sparse surface reloads
 
-`@env PS2_NATIVE_SPARSE_LOAD=1` enables an opt-in resource-retention prototype.
-The default (unset or `0`) keeps the previous bounding-interval reload policy.
+`PS2_NATIVE_SPARSE_LOAD` selects an opt-in resource-retention prototype:
+
+| args.txt setting | Policy |
+| --- | --- |
+| Unset or `@env PS2_NATIVE_SPARSE_LOAD=0` | Original bounding-interval reload |
+| `@env PS2_NATIVE_SPARSE_LOAD=1` | Four spans, collapse to one enclosure on overflow |
+| `@env PS2_NATIVE_SPARSE_LOAD=2` | Four spans, merge the smallest gap on overflow |
+
+Mode 1 retains its previous behavior. Mode 2 is a separate experiment; fewer
+converted pixels do not establish better frame time when more draws are emitted.
 This is an optimization of resource ownership in the existing renderer, not a
 deko3d backend or a GT4 semantic draw replacement.
 
 Each native surface retains up to four disjoint stale row spans. Reloads draw
 only those spans, inside one native pass; untouched gaps keep their newer native
-pixels. A fifth disjoint span collapses the list to its enclosing interval and
-preserves any dirty native pixels before that expanded reload. Initial surfaces
+pixels. With a fifth disjoint span, mode 1 uses its enclosing interval. Mode 2
+merges only the pair with the smallest intervening row gap (ties choose the first
+pair), retaining the other gaps. Both preserve dirty pixels in any newly included
+rows before the expanded reload. Initial surfaces
 and PS2_NATIVE_SYNC forced reloads still initialize the complete target.
 Before a forced full reload, the opt-in path writes back retained dirty pixels
 in the gaps; otherwise that diagnostic would destroy data the sparse path kept.
@@ -126,14 +136,18 @@ Local Mesa llvmpipe validation:
   Both modes match the software GS reference, including CT24's retained alpha.
   The prototype skips 573,440 source pixels; stores decrease from 24 to 20, while
   reload rectangles increase from 9 to 13. These expanded synthetic workload
-  counts are not directly comparable with the earlier two-phase fixture, and
-  are not measured GT4 frame-rate improvements.
+  counts describe mode 1 and are not directly comparable with the earlier
+  two-phase fixture. Mode 2 skips 819,200 pixels in the same eight-phase fixture,
+  keeps 20 stores, and emits 25 reload rectangles. Relative to mode 1 it avoids
+  245,760 additional pixels but adds 12 rectangles. Neither result establishes
+  GT4 frame-rate improvements.
 - Forty deterministic synthetic race scenes have byte-identical GS memory and
   display outputs between enabled and disabled modes (zero tolerance).
 - The targeted fixture also passes at 2x resolution and with forced full reloads
   (`PS2_NATIVE_SYNC=1`); the latter includes the dirty-gap writeback regression.
 - The bounded interval test runs 100,000 insertion steps with coverage checks,
-  plus gap retention, collapse and boundary cases under ASan/UBSan.
+  plus gap retention, minimum-gap merging and boundary cases under ASan/UBSan.
+  A per-row reference checks both coverage and the exact minimum expansion.
 - Upload-range tests use the existing GS swizzle implementation to verify every
   addressed pixel of accepted rectangles from 10,000 generated candidates, plus
   explicit rejection cases and the 4 MiB boundary. ASan/UBSan checks pass.

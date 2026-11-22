@@ -10,7 +10,7 @@ struct StaleRows {
     std::array<Span, 5> spans{};
     unsigned count = 0;
     void clear() { count = 0; }
-    void add(int first, int last) {
+    void add(int first, int last, bool smallest_gap = true) {
         if (first > last) return;
         spans[count++] = {first, last};
         std::sort(spans.begin(), spans.begin() + count,
@@ -22,7 +22,21 @@ struct StaleRows {
             else spans[n++] = spans[i];
         }
         count = n;
-        if (count > 4) { spans[0].last = spans[count - 1].last; count = 1; }
+        if (count > 4 && !smallest_gap) {
+            spans[0].last = spans[count - 1].last;
+            count = 1;
+        }
+        if (count > 4) {
+            // A surface has one width: the smallest row gap adds the fewest
+            // reload texels. Ties prefer the first gap for deterministic output.
+            unsigned closest = 0;
+            for (unsigned i = 1; i + 1 < count; ++i)
+                if (spans[i + 1].first - spans[i].last < spans[closest + 1].first - spans[closest].last)
+                    closest = i;
+            spans[closest].last = spans[closest + 1].last;
+            for (unsigned i = closest + 1; i + 1 < count; ++i) spans[i] = spans[i + 1];
+            --count;
+        }
     }
     bool overlaps(int first, int last) const {
         for (unsigned i = 0; i < count; ++i)
