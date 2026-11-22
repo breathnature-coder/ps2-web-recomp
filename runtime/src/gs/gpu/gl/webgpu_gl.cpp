@@ -127,6 +127,10 @@ using Op = std::function<void()>;
 
 struct WGPUCommandEncoderImpl {
     std::vector<Op> ops;
+    // The compute and native draw groups share the same static buffer bindings;
+    // after a group's first full bind, repeated dynamic-offset binds only need
+    // to change its parameter range.
+    std::vector<const WGPUBindGroupImpl *> dynamic_groups;
     bool ops_after_pass = false;  // the open render pass is into textures and ends with an op
 };
 struct WGPUCommandBufferImpl {
@@ -534,24 +538,28 @@ const char *find_shader(const std::string &entry, std::uint32_t scale, std::uint
 
 std::map<std::pair<std::string, std::uint32_t>, GLuint> g_programs;
 
+void bind_entry(const WGPUBindGroupImpl::Entry &e, std::uint64_t offset) {
+    if (e.texture) {
+        bind_texture(e.binding, e.texture);
+        return;
+    }
+    Bound &b = (e.uniform ? g_bound_uniform : g_bound_storage)[e.binding & 15u];
+    if (b.buffer == e.buffer && b.offset == offset && b.size == e.size) {
+        ++g_stats.binds_skipped;
+        return;
+    }
+    b = Bound{e.buffer, offset, e.size};
+    ++g_stats.binds;
+    glBindBufferRange(e.uniform ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER, e.binding, e.buffer, static_cast<GLintptr>(offset),
+                      static_cast<GLsizeiptr>(e.size));
+}
+
 void bind(const std::vector<WGPUBindGroupImpl::Entry> &entries, std::span<const std::uint32_t> dynamic) {
     std::size_t next = 0;
     for (const auto &e : entries) {
         std::uint64_t offset = e.offset;
-        if (e.texture) {
-            bind_texture(e.binding, e.texture);
-            continue;
-        }
         if (e.dynamic && next < dynamic.size()) offset += dynamic[next++];
-        Bound &b = (e.uniform ? g_bound_uniform : g_bound_storage)[e.binding & 15u];
-        if (b.buffer == e.buffer && b.offset == offset && b.size == e.size) {
-            ++g_stats.binds_skipped;
-            continue;
-        }
-        b = Bound{e.buffer, offset, e.size};
-        ++g_stats.binds;
-        glBindBufferRange(e.uniform ? GL_UNIFORM_BUFFER : GL_SHADER_STORAGE_BUFFER, e.binding, e.buffer, static_cast<GLintptr>(offset),
-                          static_cast<GLsizeiptr>(e.size));
+        bind_entry(e, offset);
     }
 }
 
@@ -559,6 +567,15 @@ void record_bind(WGPUCommandEncoder encoder, WGPUBindGroup group, std::span<cons
     if (offsets.empty()) {
         encoder->ops.emplace_back([entries = group->entries] { bind(*entries, {}); });
     } else if (offsets.size() == 1) {
+        const auto dynamic_entry = std::find_if(group->entries->begin(), group->entries->end(), [](const auto &e) { return e.dynamic; });
+        const bool seen = std::find(encoder->dynamic_groups.begin(), encoder->dynamic_groups.end(), group) != encoder->dynamic_groups.end();
+        if (seen && dynamic_entry != group->entries->end()) {
+            const auto entry = *dynamic_entry;
+            const std::uint64_t offset = static_cast<std::uint64_t>(offsets.front()) + entry.offset;
+            encoder->ops.emplace_back([entry, offset] { bind_entry(entry, offset); });
+            return;
+        }
+        if (dynamic_entry != group->entries->end()) encoder->dynamic_groups.push_back(group);
         encoder->ops.emplace_back([entries = group->entries, offset = offsets.front()] {
             bind(*entries, {&offset, 1});
         });

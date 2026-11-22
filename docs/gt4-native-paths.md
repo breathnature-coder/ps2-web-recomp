@@ -12,6 +12,10 @@ established for a new native path or deko3d backend.
   program coverage and ARM64 output still need auditing with game captures.
 - `gpu.cpp` already has native rasterization and compute fallback. Native
   surfaces are stored to GS memory on conflicts and reloaded when needed.
+- The GL compatibility backend now records only the changing dynamic parameter
+  range on repeated binds of the same group within one command encoder; its
+  static buffer ranges are bound on first use. This trims host-side binding
+  bookkeeping, while the per-dispatch/per-draw parameter range change remains.
 - `lut_try()` recognizes colour-correction sequences. Keep this existing
   specialization; do not count its work as ordinary geometry batches.
 
