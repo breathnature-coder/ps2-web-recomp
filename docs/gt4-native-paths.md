@@ -136,6 +136,17 @@ second, and deferred gap-store decisions per second. This is available before
 orderly shutdown, so short Switch test sessions can capture it in their runtime
 log. It confirms policy activity and work counts, not a frame-time improvement.
 
+### Experimental CT32 destination-alpha blending
+
+`@env PS2_NATIVE_DST_ALPHA=1` lets the native fixed-function path handle the
+restricted CT32 blend equations whose C term is destination alpha, using the
+GPU's `DstAlpha` blend factors. It is disabled by default. Existing eligibility
+guards still exclude destination-alpha tests, partial channel masks, and other
+states that need the feedback shader. Hardware blend rounding may differ from
+the GS, so compare the image and `[native] feedback copies` on Switch before
+using this setting outside a diagnostic run. A lower copy count alone does not
+prove correct pixels or better frame time.
+
 Local Mesa llvmpipe validation:
 
 - Eight targeted phases exercise CT32/CT24 uploads, shifted-base/destination-Y

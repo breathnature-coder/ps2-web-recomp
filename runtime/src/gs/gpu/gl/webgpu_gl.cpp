@@ -822,6 +822,8 @@ WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice, WGPURenderPipeline
             const auto factor = [](WGPUBlendFactor f) -> GLenum {
                 switch (f) {
                 case WGPUBlendFactor_Zero: return GL_ZERO;
+                case WGPUBlendFactor_DstAlpha: return GL_DST_ALPHA;
+                case WGPUBlendFactor_OneMinusDstAlpha: return GL_ONE_MINUS_DST_ALPHA;
                 case WGPUBlendFactor_Constant: return GL_CONSTANT_COLOR;
                 case WGPUBlendFactor_OneMinusConstant: return GL_ONE_MINUS_CONSTANT_COLOR;
                 case WGPUBlendFactor_Src1Alpha: return GL_SRC1_ALPHA;

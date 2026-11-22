@@ -1201,6 +1201,7 @@ std::uint64_t g_feedback_copy_pixels = 0;
 std::uint64_t g_feedback_group_calls = 0;
 std::uint64_t g_feedback_outline_tests = 0;
 std::uint64_t g_feedback_group_prims = 0;  // unscaled source pixels copied for feedback
+std::uint64_t g_dst_alpha_fixed_prims = 0;
 PathProfile g_path_profile;
 SurfaceTraffic g_surface_traffic;
 std::uint64_t g_sparse_saved_pixels = 0, g_sparse_gap_stores = 0;
@@ -1369,6 +1370,14 @@ const char *const kWhy[] = {"",                "PS2_NATIVE_SKIP",        "16-bit
 constexpr std::size_t kWhyCount = sizeof kWhy / sizeof kWhy[0];
 std::uint64_t g_why_prims[kWhyCount] = {}, g_why_batches[kWhyCount] = {};
 
+bool native_dst_alpha_on() {
+    static const bool on = [] {
+        const char *value = std::getenv("PS2_NATIVE_DST_ALPHA");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+}
+
 bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     const std::uint32_t flags = w[0], fpsm = w[3], modes = w[7];
     const std::uint32_t skip = native_skip();
@@ -1410,6 +1419,7 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     out.constant = 0.0f;
     out.premultiply = 0;
     out.alpha_factor = false;
+    bool dst_alpha_factor = false;
     if ((flags & 8u) && (mask & 7u)) {
         const std::uint32_t a = (modes >> 12) & 3u, b = (modes >> 14) & 3u, c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
         // (A - B) * C + D as what multiplies the source and the destination colour: so many times C, plus one or not.
@@ -1418,6 +1428,16 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
         std::uint32_t op = 0;
         int sf, df;
         const bool zero_product = (!source_c && !dest_c) || (c >= 2 && w[9] == 0 && !(skip & 1u));
+        const auto factor = [](int times, int one, bool &minus) {
+            if (!times) return one;
+            if (times == 1 && !one) return 2;
+            if (times == -1 && one) return 3;
+            if (times == -1) {
+                minus = true;
+                return 2;
+            }
+            return -1;  // 1 + C
+        };
         // If the blend always returns Cs, PABE's unblended result is the
         // same. Native shading already wraps the source channels to bytes.
         if (((flags & 1024u) || !(flags & 2048u)) && !(zero_product && source_1)) return why(8);
@@ -1435,7 +1455,15 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
             df = std::abs(dest);
             op = source < 0 ? 2u : dest < 0 ? 1u : 0u;
         } else if (c == 1) {
-            return why(9);  // 32-bit destination alpha can vary per pixel
+            // Experimental: WebGPU's DstAlpha blend factors can represent
+            // these CT32 equations without taking a backdrop copy per group.
+            if (fpsm != PSMCT32 || !native_dst_alpha_on()) return why(9);
+            bool source_minus = false, dest_minus = false;
+            sf = factor(source_c, source_1, source_minus);
+            df = factor(dest_c, dest_1, dest_minus);
+            if (sf < 0 || df < 0 || (source_minus && dest_minus)) return why(9);
+            op = source_minus ? 2u : dest_minus ? 1u : 0u;
+            dst_alpha_factor = true;
         } else if (!dest_c && !source_1) {
             // C only scales the source colour: the shader does it, with the GS's own rounding and for any C.
             out.premultiply = 1u | (c >= 2 ? 2u : 0u) | (source_c < 0 ? 4u : 0u);
@@ -1445,16 +1473,6 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
         } else {
             if ((c >= 2 && w[9] > 0x80u) || (skip & 1u)) return why(10);  // a factor above one
             bool source_minus = false, dest_minus = false;
-            const auto factor = [](int times, int one, bool &minus) {
-                if (!times) return one;
-                if (times == 1 && !one) return 2;
-                if (times == -1 && one) return 3;
-                if (times == -1) {
-                    minus = true;
-                    return 2;
-                }
-                return -1;  // 1 + C
-            };
             sf = factor(source_c, source_1, source_minus);
             df = factor(dest_c, dest_1, dest_minus);
             if (sf < 0 || df < 0 || (source_minus && dest_minus)) return why(11);
@@ -1473,7 +1491,8 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     // PS2_NATIVE_Z=fast leaves depth to the rasterizer's interpolation: quicker where much is hidden, and a step off
     // the compute rasterizer's depth here and there, which shows where both draw surfaces lying on each other.
     static const bool exact = !std::getenv("PS2_NATIVE_Z") || std::strcmp(std::getenv("PS2_NATIVE_Z"), "fast") != 0;
-    out.key = (has_depth ? 1u : 0u) | ((zte ? ztst : 1u) << 1) | (write_z ? 8u : 0u) | (mask << 4) | (blend << 8) | (has_depth && zte && exact ? 1u << 16 : 0u);
+    out.key = (has_depth ? 1u : 0u) | ((zte ? ztst : 1u) << 1) | (write_z ? 8u : 0u) | (mask << 4) | (blend << 8) | (has_depth && zte && exact ? 1u << 16 : 0u) |
+              ((dst_alpha_factor && (blend & 1u)) ? 1u << 18 : 0u);
     return true;
 }
 
@@ -1521,8 +1540,10 @@ WGPURenderPipeline native_pipeline(std::uint32_t key) {
     constant.key = view("SCALE");
     constant.value = static_cast<double>(g_scale);
     const bool from_fix = (key >> 15) & 1u;
-    const WGPUBlendFactor factors[4] = {WGPUBlendFactor_Zero, WGPUBlendFactor_One, from_fix ? WGPUBlendFactor_Constant : WGPUBlendFactor_Src1Alpha,
-                                        from_fix ? WGPUBlendFactor_OneMinusConstant : WGPUBlendFactor_OneMinusSrc1Alpha};
+    const bool from_dst_alpha = (key >> 18) & 1u;
+    const WGPUBlendFactor factors[4] = {WGPUBlendFactor_Zero, WGPUBlendFactor_One,
+                                        from_dst_alpha ? WGPUBlendFactor_DstAlpha : from_fix ? WGPUBlendFactor_Constant : WGPUBlendFactor_Src1Alpha,
+                                        from_dst_alpha ? WGPUBlendFactor_OneMinusDstAlpha : from_fix ? WGPUBlendFactor_OneMinusConstant : WGPUBlendFactor_OneMinusSrc1Alpha};
     const WGPUBlendOperation ops[3] = {WGPUBlendOperation_Add, WGPUBlendOperation_Subtract, WGPUBlendOperation_ReverseSubtract};
     WGPUBlendState blend = WGPU_BLEND_STATE_INIT;
     blend.color.operation = ops[std::min((key >> 9) & 3u, 2u)];
@@ -1958,6 +1979,7 @@ bool flush_native(std::uint32_t prims) {
         const std::uint32_t *w = b.setups.data() + rec[0] * kSetupWords;
         NativeState state;
         native_state(w, depth != nullptr, state);
+        if (state.draws && (state.key & (1u << 18))) g_dst_alpha_fixed_prims += j - i;
         const std::uint32_t x0 = std::min(w[10] & 0xFFFFu, color->width), x1 = std::min((w[10] >> 16) + 1, color->width);
         const std::uint32_t y0 = std::min(w[11] & 0xFFFFu, color->height), y1 = std::min((w[11] >> 16) + 1, color->height);
         if (native_debug()) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
@@ -2930,6 +2952,12 @@ void submitted() {
                      double(g_sparse_gap_stores - last_gap_stores) / seconds);
         last_sparse_pixels = g_sparse_saved_pixels;
         last_gap_stores = g_sparse_gap_stores;
+    }
+    if (native_dst_alpha_on()) {
+        static std::uint64_t last_dst_alpha_prims = 0;
+        std::fprintf(stderr, "[native] destination-alpha fixed: %.0f prims/s\n",
+                     double(g_dst_alpha_fixed_prims - last_dst_alpha_prims) / seconds);
+        last_dst_alpha_prims = g_dst_alpha_fixed_prims;
     }
     // Twenty busy seconds in a row are a race: trace a few frames of it, twice, half a minute apart.
     static const bool tracing = std::getenv("PS2_NATIVE_TRACE") && std::atoi(std::getenv("PS2_NATIVE_TRACE")) != 0;
