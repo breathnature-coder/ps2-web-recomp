@@ -2919,6 +2919,18 @@ void submitted() {
                  static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(g_native_draws - last_draws) / seconds,
                  static_cast<double>(now[2] - last[2]) / seconds, static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds,
                  static_cast<double>(now[5] - last[5]) / seconds);
+    // Emit the sparse policy while the game is running. The final [gpu] summary
+    // is only printed on orderly shutdown, which is inconvenient for Switch A/B
+    // sessions that are terminated after a short race window.
+    if (sparse_load_on()) {
+        static std::uint64_t last_sparse_pixels = 0, last_gap_stores = 0;
+        std::fprintf(stderr, "[native] sparse reload: mode %d, %.0f source pixels skipped/s, %.0f surface reload rectangles/s, %.0f deferred gap-store decisions/s\n",
+                     sparse_load_mode(), double(g_sparse_saved_pixels - last_sparse_pixels) / seconds,
+                     double(g_loads - last[5]) / seconds,
+                     double(g_sparse_gap_stores - last_gap_stores) / seconds);
+        last_sparse_pixels = g_sparse_saved_pixels;
+        last_gap_stores = g_sparse_gap_stores;
+    }
     // Twenty busy seconds in a row are a race: trace a few frames of it, twice, half a minute apart.
     static const bool tracing = std::getenv("PS2_NATIVE_TRACE") && std::atoi(std::getenv("PS2_NATIVE_TRACE")) != 0;
     static int busy = 0, traces = 0;

@@ -129,6 +129,13 @@ several decisions can concern the same dirty surface, which may later need a
 writeback. Compare actual store totals and frame time separately. `loads` now
 counts reload rectangles, not passes, when this option is enabled.
 
+When `PS2_GL_STATS=1` or `PS2_NATIVE_STATS=1` is active, the running renderer
+also prints `[native] sparse reload` once per stats interval. It reports the
+selected mode, skipped source pixels per second, surface reload rectangles per
+second, and deferred gap-store decisions per second. This is available before
+orderly shutdown, so short Switch test sessions can capture it in their runtime
+log. It confirms policy activity and work counts, not a frame-time improvement.
+
 Local Mesa llvmpipe validation:
 
 - Eight targeted phases exercise CT32/CT24 uploads, shifted-base/destination-Y
