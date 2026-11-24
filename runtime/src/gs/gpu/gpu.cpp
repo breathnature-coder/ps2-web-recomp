@@ -1058,6 +1058,37 @@ void plan_decodes(std::uint32_t prims) {
     }
 }
 
+// Decode jobs write disjoint ranges of `decoded` and only read GS memory, so
+// all jobs in a batch can share one 2D dispatch. A prefix-indexed task table
+// maps each workgroup to its texture without padding jobs to a common size.
+void dispatch_decodes(std::uint32_t setup_offset) {
+    if (g_decodes.empty()) return;
+    static std::vector<std::uint32_t> task_words;
+    task_words.clear();
+    task_words.reserve(g_decodes.size() * 4u);
+    std::uint32_t total_groups = 0;
+    for (const Decode &job : g_decodes) {
+        task_words.push_back(total_groups);
+        task_words.push_back(setup_offset + job.setup * kSetupWords);
+        task_words.push_back(job.offset);
+        task_words.push_back(job.words);
+        total_groups += (job.words + 63u) / 64u;
+    }
+    const std::uint32_t task_offset = arena_append(task_words.data(), task_words.size() * sizeof(std::uint32_t));
+
+    // Dispatch limits are at least 1024 x 65535 workgroups. Split only for
+    // unusually large task lists; each chunk still maps through the same table.
+    constexpr std::uint32_t max_workgroups = 1024u * 65535u;
+    for (std::uint32_t first_group = 0; first_group < total_groups;) {
+        const std::uint32_t count = std::min(max_workgroups, total_groups - first_group);
+        const std::uint32_t param = push_params({task_offset, static_cast<std::uint32_t>(g_decodes.size()), first_group, count});
+        const std::uint32_t groups_x = std::min(count, 1024u);
+        const std::uint32_t groups_y = (count + groups_x - 1u) / groups_x;
+        g_commands.push_back({kDecode, groups_x, groups_y, param});
+        first_group += count;
+    }
+}
+
 std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32_t &hi, std::uint32_t &stride, std::uint32_t &run) {
     Batch &b = g_batch;
     lo = hi = stride = run = 0;
@@ -1944,7 +1975,7 @@ bool flush_native(std::uint32_t prims) {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
+    dispatch_decodes(setup_offset);
     NativePass pass{color, depth, {}};
     // Feedback groups emit one copy command and one draw each. Reserve
     // those slots once, with room for at most one non-feedback draw per
@@ -2176,7 +2207,7 @@ void raster_batch(std::uint32_t prims) {
     plan_decodes(prims);
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
-    for (const Decode &d : g_decodes) dispatch_linear(kDecode, d.words, push_params({setup_offset + d.setup * kSetupWords, d.offset, d.words}));
+    dispatch_decodes(setup_offset);
     std::uint32_t total = 0;
     for (std::uint32_t t : g_touched) total += g_tile_count[t];
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());

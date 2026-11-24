@@ -12,6 +12,11 @@ established for a new native path or deko3d backend.
   program coverage and ARM64 output still need auditing with game captures.
 - `gpu.cpp` already has native rasterization and compute fallback. Native
   surfaces are stored to GS memory on conflicts and reloaded when needed.
+- Texture decode jobs in a batch share one 2D dispatch. A prefix-indexed task
+  table supplies each job's setup, destination and size; each workgroup resolves
+  its task once. This removes per-texture dispatch and parameter-record overhead
+  while retaining the same texel conversion work. It has not been measured on
+  Switch hardware.
 - The GL compatibility backend now records only the changing dynamic parameter
   range on repeated binds of the same group within one command encoder; its
   static buffer ranges are bound on first use. This trims host-side binding

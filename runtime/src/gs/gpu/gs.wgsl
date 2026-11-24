@@ -1116,16 +1116,51 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     plot(s, x, y, k, at);
 }
 
+var<workgroup> decode_task_group: u32;
+var<workgroup> decode_setup_offset: u32;
+var<workgroup> decode_output_offset: u32;
+var<workgroup> decode_texel_count: u32;
+
 @compute @workgroup_size(64)
-fn decode(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * 64u * 1024u;
-    if (i >= prm(2u)) {
+fn decode(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    // One batch dispatch covers every decode job. Each task table record is
+    // (first workgroup, setup offset, destination offset, texel count).
+    let local_group = wid.y * 1024u + wid.x;
+    if (lane == 0u) {
+        if (local_group >= prm(3u)) {
+            decode_texel_count = 0u;
+        } else {
+            let group = prm(2u) + local_group;
+            var lo = 0u;
+            var hi = prm(1u);
+            while (lo + 1u < hi) {
+                let mid = (lo + hi) / 2u;
+                if (data[prm(0u) + mid * 4u] <= group) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let task_at = prm(0u) + lo * 4u;
+            decode_task_group = data[task_at];
+            decode_setup_offset = data[task_at + 1u];
+            decode_output_offset = data[task_at + 2u];
+            decode_texel_count = data[task_at + 3u];
+        }
+    }
+    workgroupBarrier();
+    if (decode_texel_count == 0u) {
         return;
     }
-    let s = load_setup(prm(0u));
+    let group = prm(2u) + local_group;
+    let i = (group - decode_task_group) * 64u + lane;
+    if (i >= decode_texel_count) {
+        return;
+    }
+    let s = load_setup(decode_setup_offset);
     let x = i & ((1u << s.tw) - 1u);
     let y = i >> s.tw;
-    decoded[prm(1u) + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
+    decoded[decode_output_offset + i] = convert(s, load_at(addr(s.tf, x, y), 0u));
 }
 
 @compute @workgroup_size(64)
