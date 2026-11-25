@@ -176,6 +176,10 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         # bytes per scene), so this only checks that it runs; compare two GPU
         # renderers with each other through scripts/compare_gpu_backends.sh.
         add_test(NAME gs_gpu_compare COMMAND gs_gpu_compare_test 40)
+        add_test(NAME gs_sprite_copy COMMAND gs_gpu_compare_test --sprite-copy)
+        add_test(NAME gs_sprite_copy_forced COMMAND gs_gpu_compare_test --sprite-copy)
+        set_tests_properties(gs_sprite_copy_forced PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_NATIVE_SYNC=1")
+        set_tests_properties(gs_sprite_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
         # GT4's colour correction as it draws it, against the table lookup it is.
         add_executable(gs_gt4_lut_test tests/gs_gt4_lut_test.cpp)
         target_include_directories(gs_gt4_lut_test PRIVATE runtime/src)

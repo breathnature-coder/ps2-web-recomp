@@ -48,7 +48,7 @@ namespace ps2::gs::gpu {
 namespace {
 
 // kNative is not a compute pipeline: such a command is a render pass of the native renderer (g_native_passes).
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kLutFrame, kLutScratch, kStoreColor, kStoreDepth, kPipelines, kNative = kPipelines };
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kDecode, kLutFrame, kLutScratch, kStoreColor, kStoreDepth, kPipelines, kNative = kPipelines, kSurfaceCopy };
 const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot", "decode", "lut_frame", "lut_scratch", "store_color", "store_depth"};
 
 constexpr std::uint32_t kParamStride = 256;
@@ -1240,6 +1240,14 @@ struct NativePass {
     std::vector<NativeDraw> draws;
 };
 
+struct SurfaceCopy {
+    Surface *source, *destination;
+    WGPUOrigin3D from, to;
+    WGPUExtent3D size;
+};
+std::vector<SurfaceCopy> g_surface_copies;
+std::uint64_t g_sprite_copies = 0;
+
 struct NativeState {
     std::uint32_t key = 0, flags = 0;
     std::uint32_t premultiply = 0;  // the shader multiplies the colour by C itself: 1, with 2 C is FIX, with 4 rounding up
@@ -1777,6 +1785,7 @@ Surface *surface_for(std::uint32_t bp, std::uint32_t bw, bool depth, std::uint32
     s->height = height;
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+    if (!depth) td.usage |= WGPUTextureUsage_CopyDst;
     td.size = WGPUExtent3D{s->width * g_scale, s->height * g_scale, 1};
     td.format = depth ? WGPUTextureFormat_Depth32Float : WGPUTextureFormat_RGBA8Unorm;
     s->texture = wgpuDeviceCreateTexture(g_device, &td);
@@ -1940,6 +1949,76 @@ std::uint32_t feedback_group(std::uint32_t from, std::uint32_t to, const Outline
     return to;
 }
 
+void mark_surface_dirty(Surface &s, const Batch &b) {
+    const int x1 = std::min(b.maxx, static_cast<int>(s.width) - 1);
+    s.dx0 = s.dirty ? std::min(s.dx0, b.minx) : b.minx;
+    s.dy0 = s.dirty ? std::min(s.dy0, b.miny) : b.miny;
+    s.dx1 = s.dirty ? std::max(s.dx1, x1) : x1;
+    s.dy1 = s.dirty ? std::max(s.dy1, b.maxy) : b.maxy;
+    s.dirty = true;
+}
+
+// Return the first sampled texel of an unclamped 1:1 sprite axis. Integer
+// UVs on texel boundaries require an exact division in sprite_at. A
+// half-texel offset leaves room for its interpolation rounding.
+bool copy_axis(float origin, float span, float uv0, float uv1, int first, int last, int limit, int &texel) {
+    if (span <= 0 || origin != std::floor(origin) || span != std::floor(span) || uv1 - uv0 != 16 * span)
+        return false;
+    const int phase = static_cast<int>(uv0) % 16;
+    const int length = static_cast<int>(span);
+    if (phase != 8 && !(phase == 0 && (length & (length - 1)) == 0)) return false;
+    texel = static_cast<int>(uv0) / 16 + first - static_cast<int>(origin);
+    return texel >= 0 && texel + last - first < limit;
+}
+
+// A point-sampled CT32 decal (or neutral modulation) can move the source
+// samples verbatim between native textures. Only take it when the source is
+// newer than GS memory and no writes through an alias have made it stale.
+bool copy_native_sprite(Surface &dest, const Range &dest_rows) {
+    const Batch &b = g_batch;
+    const auto *p = b.prims.data(), *w = b.setups.data();
+    if (b.prims.size() != kPrimWords || p[1] != 1 || w[3] != PSMCT32 ||
+        w[14] != PSMCT32 || w[4] != 0 || w[13] == 0) return false;
+    constexpr unsigned required = 2u | 16u | 8192u; // TME, FST, TCC
+    constexpr unsigned effects = 4u | 8u | 64u | 128u | 4096u | 16384u; // fog, blend, tests, FBA, filtering
+    if ((w[0] & (required | effects)) != required || ((w[7] >> 24) & 0xAu) || (w[7] >> 29)) return false;
+    const unsigned tfx = (w[7] >> 20) & 3u;
+    if (tfx != 1 && !(tfx == 0 && p[13] == 0x80808080u)) return false;
+    int u, v;
+    if (!copy_axis(u2f(p[4]), u2f(p[6]), u2f(p[15]), u2f(p[18]), b.minx, b.maxx, 1 << (w[15] & 255), u) ||
+        !copy_axis(u2f(p[5]), u2f(p[7]), u2f(p[16]), u2f(p[19]), b.miny, b.maxy, 1 << (w[15] >> 8), v)) return false;
+    const int width = b.maxx - b.minx + 1, height = b.maxy - b.miny + 1;
+    for (const auto &ptr : g_surfaces) {
+        Surface &src = *ptr;
+        if (&src == &dest || src.depth || !src.dirty || src.stale1 >= src.stale0 || w[13] != src.bw ||
+            w[12] < src.bp || (w[12] - src.bp) % 32) continue;
+        // TEX0 may start on a page inside the source. Reject horizontal
+        // carry into the next page row and any overlap of source and target.
+        const unsigned page = (w[12] - src.bp) / 32;
+        const int x = (page % src.bw) * 64 + u, y = (page / src.bw) * 32 + v;
+        if (x + width > static_cast<int>(src.width) || y + height > static_cast<int>(src.height) ||
+            x < src.dx0 || x + width - 1 > src.dx1 || y < src.dy0 || y + height - 1 > src.dy1 ||
+            surface_range(src, 0, src.height - 1).overlaps(dest_rows.lo, dest_rows.hi)) continue;
+        const Range sampled = pages(src.bp, src.bw, PSMCT32, x, y, x + width - 1, y + height - 1);
+        for (const auto &other : g_surfaces) {
+            if (other.get() != &src && other->dirty &&
+                surface_range(*other, other->dy0, other->dy1).overlaps(sampled.lo, sampled.hi)) return false;
+        }
+        g_sync_cause = 5;
+        sync_memory(dest_rows, true, &dest);
+        g_sync_cause = 0;
+        load_surface(dest);
+        const auto scale = g_scale;
+        g_commands.push_back({kSurfaceCopy, static_cast<std::uint32_t>(g_surface_copies.size()), 0, 0});
+        g_surface_copies.push_back({&src, &dest, {x * scale, y * scale, 0}, {b.minx * scale, b.miny * scale, 0},
+                                    {width * scale, height * scale, 1}});
+        mark_surface_dirty(dest, b);
+        ++g_sprite_copies;
+        return true;
+    }
+    return false;
+}
+
 bool flush_native(std::uint32_t prims) {
     const Timed timed(kCpuNative);
     Batch &b = g_batch;
@@ -2008,6 +2087,8 @@ bool flush_native(std::uint32_t prims) {
     const Range fb = surface_range(*color, b.miny, b.maxy);
     const Range z = depth ? surface_range(*depth, b.miny, b.maxy) : Range{};
     if (depth && fb.overlaps(z.lo, z.hi)) return false;
+    static const int forced_sync = std::getenv("PS2_NATIVE_SYNC") ? std::atoi(std::getenv("PS2_NATIVE_SYNC")) : 0;
+    if (!(forced_sync & 3) && !depth && copy_native_sprite(*color, fb)) return true;
     // The textures are read from GS memory as it is before the batch: whichever target holds them newer writes them
     // back, the batch's own included (a draw reading the frame it draws to).
     g_sync_cause = 1;
@@ -2019,17 +2100,15 @@ bool flush_native(std::uint32_t prims) {
     g_sync_cause = 0;
     // PS2_NATIVE_SYNC=1 reloads the targets before every batch and writes them back after it: slow, and what the
     // picture should be if the tracking of who holds the newer pixels were at fault.
-    static const bool paranoid = std::getenv("PS2_NATIVE_SYNC") != nullptr;
-    if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 1) {
+    if (forced_sync & 1) {
         if (path_profile_on()) {
             color->stale_causes |= 128u;
             if (depth) depth->stale_causes |= 128u;
         }
+        // A forced reload covers dirty pixels even with dense row tracking.
+        store_surface(*color);
+        if (depth) store_surface(*depth);
         if (sparse_load_on()) {
-            // Forced full reload also covers gaps we deliberately retained.
-            // Preserve those newer pixels before expanding the stale coverage.
-            store_surface(*color);
-            if (depth) store_surface(*depth);
             color->stale_rows.add(0, static_cast<int>(color->height) - 1);
             if (depth) depth->stale_rows.add(0, static_cast<int>(depth->height) - 1);
         }
@@ -2136,17 +2215,9 @@ bool flush_native(std::uint32_t prims) {
         g_commands.push_back({kNative, static_cast<std::uint32_t>(g_native_passes.size()), 0, 0});
         g_native_passes.push_back(std::move(pass));
     }
-    const auto touched = [&](Surface &s) {
-        const int x1 = std::min(b.maxx, static_cast<int>(s.width) - 1);
-        s.dx0 = s.dirty ? std::min(s.dx0, b.minx) : b.minx;
-        s.dy0 = s.dirty ? std::min(s.dy0, b.miny) : b.miny;
-        s.dx1 = s.dirty ? std::max(s.dx1, x1) : x1;
-        s.dy1 = s.dirty ? std::max(s.dy1, b.maxy) : b.maxy;
-        s.dirty = true;
-    };
-    touched(*color);
-    if (depth && b.zwrite) touched(*depth);
-    if (paranoid && std::atoi(std::getenv("PS2_NATIVE_SYNC")) & 2) sync_all();
+    mark_surface_dirty(*color, b);
+    if (depth && b.zwrite) mark_surface_dirty(*depth, b);
+    if (forced_sync & 2) sync_all();
     return true;
 }
 
@@ -3012,6 +3083,15 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     return i;
 }
 
+void encode_surface_copy(WGPUCommandEncoder enc, const SurfaceCopy &copy) {
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    src.texture = copy.source->texture;
+    src.origin = copy.from;
+    dst.texture = copy.destination->texture;
+    dst.origin = copy.to;
+    wgpuCommandEncoderCopyTextureToTexture(enc, &src, &dst, &copy.size);
+}
+
 void submitted() {
     g_commands.clear();
     g_command_info.clear();
@@ -3023,6 +3103,7 @@ void submitted() {
     if (!decode_cache_on()) g_decoded_used = 0;  // kept across submits when cached
     g_clut_loads = 0;
     g_native_passes.clear();
+    g_surface_copies.clear();
     release_retired();
     if (g_trace > 0) std::fprintf(stderr, "[trace] ---- submitted, %d to go\n", --g_trace);
     report_paths();
@@ -3040,6 +3121,10 @@ void submitted() {
                  static_cast<double>(now[0] - last[0]) / seconds, static_cast<double>(now[1] - last[1]) / seconds, static_cast<double>(g_native_draws - last_draws) / seconds,
                  static_cast<double>(now[2] - last[2]) / seconds, static_cast<double>(now[3] - last[3]) / seconds, static_cast<double>(now[4] - last[4]) / seconds,
                  static_cast<double>(now[5] - last[5]) / seconds);
+    static std::uint64_t last_sprite_copies = 0;
+    if (g_sprite_copies != last_sprite_copies)
+        std::fprintf(stderr, "[native] direct sprite copies: %.0f/s\n", double(g_sprite_copies - last_sprite_copies) / seconds);
+    last_sprite_copies = g_sprite_copies;
     // Emit the sparse policy while the game is running. The final [gpu] summary
     // is only printed on orderly shutdown, which is inconvenient for Switch A/B
     // sessions that are terminated after a short race window.
@@ -3281,6 +3366,10 @@ void profile_submit() {
     measured_commands.reserve(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        if (c.pipeline == kSurfaceCopy) {
+            encode_surface_copy(enc, g_surface_copies[c.x]);
+            continue;
+        }
         if (c.pipeline == kNative) {
             encode_native(enc, i, false);  // not timed
             continue;
@@ -3396,13 +3485,14 @@ void submit(WGPUTextureView present_view = nullptr) {
     ++g_total_passes;
     for (std::size_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
-        if (c.pipeline == kNative) {
+        if (c.pipeline == kNative || c.pipeline == kSurfaceCopy) {
             if (pass) {
                 wgpuComputePassEncoderEnd(pass);
                 wgpuComputePassEncoderRelease(pass);
                 pass = nullptr;
             }
-            i = encode_native(enc, i, true);
+            if (c.pipeline == kSurfaceCopy) encode_surface_copy(enc, g_surface_copies[c.x]);
+            else i = encode_native(enc, i, true);
             continue;
         }
         if (!pass) {
@@ -4385,6 +4475,7 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_sprite_copies) std::fprintf(stderr, "[gpu] direct sprite copies: %llu\n", static_cast<unsigned long long>(g_sprite_copies));
     if (g_lut_tiles) std::fprintf(stderr, "[gpu] colour correction: %llu tiles as table lookups in %llu passes\n", static_cast<unsigned long long>(g_lut_tiles), static_cast<unsigned long long>(g_lut_passes));
 }
 

@@ -279,14 +279,65 @@ int differences(const std::uint8_t *a, const std::uint8_t *b, std::size_t n, std
     return count;
 }
 
+// Copy from a page inside a freshly rendered target, with scissoring, then
+// verify that an intervening upload is visible to the next reader.
+int sprite_copy_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(ZBUF_1, bits(1, 32));
+    write(TEST_1, 0);
+    write(COLCLAMP, 1);
+    const auto sprite = [](int x, int y, int width, int height, int u, int v, int phase) {
+        write(UV, bits(u * 16 + phase, 0) | bits(v * 16 + phase, 16));
+        write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16));
+        write(UV, bits((u + width) * 16 + phase, 0) | bits((v + height) * 16 + phase, 16));
+        write(XYZ2, bits((x + width) * 16, 0) | bits((y + height) * 16, 16));
+    };
+    const auto texture = [](unsigned bp, unsigned function) {
+        write(TEX0_1, bp | bits(4, 14) | bits(8, 26) | bits(7, 30) | bits(1, 34) | bits(function, 35));
+    };
+    constexpr unsigned source_page = 5 * 32; // (64,32) with a pitch of four pages.
+    upload(0x2000, 4, PSMCT32, 0, 0, 128, 64);
+    write(PRIM, 6 | 0x110); // sprite with fixed texture coordinates
+    for (unsigned i = 0; i < 8; ++i) {
+        write(SCISSOR_1, bits(255, 16) | bits(127, 48));
+        write(FRAME_1, bits(4, 16));
+        texture(0x2000, 0);
+        write(RGBAQ, 0x80808080 - i * 0x010203);
+        sprite(64, 32, 64, 32, 0, 0, 0);
+        write(FRAME_1, bits(0x1000 / 32, 0) | bits(4, 16));
+        texture(source_page, i % 2);
+        write(RGBAQ, 0x80808080);
+        write(SCISSOR_1, bits(3, 0) | bits(210, 16) | bits(5, 32) | bits(90, 48));
+        sprite(2 + i * 17, 2, i % 2 ? 41 : 32, 16, 3, 7, i % 2 ? 8 : 0);
+    }
+    upload(source_page, 4, PSMCT32, 0, 0, 64, 16);
+    texture(source_page, 1);
+    sprite(33, 25, 32, 16, 0, 0, 0);
+    write(TEX1_1, bits(1, 5));
+    sprite(48, 32, 32, 16, 0, 0, 8);
+    write(TEX1_1, 0);
+    write(FRAME_1, bits(0x1000 / 32, 0) | bits(4, 16) | bits(0xff00, 32));
+    sprite(78, 44, 32, 16, 3, 2, 0);
+    std::vector<std::uint8_t> result(kMemorySize);
+    gpu::download(result.data());
+    std::size_t first = 0;
+    const int diff = differences(memory(), result.data(), kMemorySize, first);
+    if (diff) std::fprintf(stderr, "sprite copy: %d bytes differ, first at 0x%06zX\n", diff, first);
+    gpu::stats();
+    return diff != 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
+    bool sprite_copy = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--sprite-copy") == 0) sprite_copy = true;
         else if (std::strcmp(argv[i], "--race") == 0) g_race = true;
         else if (std::strcmp(argv[i], "--against") == 0 && i + 1 < argc) against = argv[++i];
         else if (std::strcmp(argv[i], "--tolerance") == 0 && i + 1 < argc) tolerance = std::atoi(argv[++i]);
@@ -299,6 +350,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no GPU renderer available\n");
         return 77;
     }
+    if (sprite_copy) return sprite_copy_scene();
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;
