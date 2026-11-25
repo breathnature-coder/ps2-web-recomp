@@ -414,15 +414,58 @@ int feedback_snapshot_scene() {
     return 0;
 }
 
+// Switch between target reads and a backdrop in one native pass, with
+// depth writes enabled. The first two disjoint triangles share a draw.
+int mixed_feedback_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(FRAME_1, bits(1, 16) | bits(0x0f, 32));
+    write(ZBUF_1, bits(0x1000 / 32, 0) | bits(1, 24));
+    write(TEST_1, bits(1, 16) | bits(2, 17));
+    write(COLCLAMP, 1);
+    write(ALPHA_1, 0x68u | bits(0x80, 32));
+    write(SCISSOR_1, bits(63, 16) | bits(31, 48));
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    const auto vertex = [](unsigned x, unsigned y, unsigned z) {
+        write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16) | bits(z, 32));
+    };
+    write(PRIM, 6 | 0x40);
+    write(RGBAQ, 0x80030507);
+    vertex(0, 0, 1); vertex(32, 16, 1);
+    write(PRIM, 3 | 0x40);
+    write(RGBAQ, 0x80171301);
+    const auto triangle = [&](unsigned x, unsigned z) {
+        vertex(x, 0, z); vertex(x + 8, 0, z); vertex(x, 8, z);
+    };
+    triangle(0, 2);
+    triangle(16, 2);
+    triangle(0, 3);
+    write(PRIM, 6 | 0x40);
+    write(RGBAQ, 0x80220513);
+    vertex(0, 0, 4); vertex(8, 8, 4);
+    vertex(16, 0, 4); vertex(24, 8, 4);
+    std::vector<std::uint8_t> actual(kMemorySize);
+    gpu::download(actual.data());
+    std::size_t first = 0;
+    const int diff = differences(memory(), actual.data(), kMemorySize, first);
+    if (diff) {
+        std::fprintf(stderr, "mixed feedback: %d bytes differ, first at 0x%06zX\n", diff, first);
+        return 1;
+    }
+    gpu::stats();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
-    bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false;
+    bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--mixed-feedback") == 0) mixed_feedback = true;
         else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
         else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
         else if (std::strcmp(argv[i], "--sprite-copy") == 0) sprite_copy = true;
@@ -441,6 +484,7 @@ int main(int argc, char **argv) {
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
     if (feedback_snapshot) return feedback_snapshot_scene();
+    if (mixed_feedback) return mixed_feedback_scene();
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;

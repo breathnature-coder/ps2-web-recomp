@@ -35,6 +35,8 @@ extern const char kNativeShader[];
 // may hand out new storage instead of waiting for the GPU to be done with the old.
 extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
 extern "C" void ps2GlSetDecodeQueueReuse(bool enabled);
+extern "C" bool ps2GlEnableFeedbackBarrier();
+extern "C" void ps2GlFeedbackBarrier(WGPUCommandEncoder encoder);
 extern "C" bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder encoder, WGPUTexture source, WGPUTexture backdrop,
                                         std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
 #endif
@@ -1232,7 +1234,7 @@ struct NativeDraw {
     WGPURenderPipeline pipeline;
     std::uint32_t param, vertices, x, y, w, h;
     float constant;
-    bool feedback = false;
+    bool feedback = false, in_place = false;
 };
 
 struct NativePass {
@@ -1260,7 +1262,8 @@ struct NativeState {
 
 constexpr std::size_t kMaxSurfaces = 24;
 
-bool g_native = false;
+bool g_native = false, g_in_place_feedback = false;
+std::uint64_t g_in_place_draws = 0, g_texture_barriers = 0;
 std::vector<std::unique_ptr<Surface>> g_surfaces, g_retired;
 std::vector<NativePass> g_native_passes;
 std::uint64_t g_surface_clock = 0;
@@ -2028,6 +2031,24 @@ bool copy_native_sprite(Surface &dest, const Range &dest_rows) {
     return false;
 }
 
+void ensure_backdrop(Surface &color) {
+    if (color.backdrop) return;
+    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    td.size = WGPUExtent3D{color.width * g_scale, color.height * g_scale, 1};
+    td.format = WGPUTextureFormat_RGBA8Unorm;
+    color.backdrop = wgpuDeviceCreateTexture(g_device, &td);
+    color.backdrop_view = wgpuTextureCreateView(color.backdrop, nullptr);
+    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = 0;
+    entry.textureView = color.backdrop_view;
+    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bd.layout = g_backdrop_layout;
+    bd.entryCount = 1;
+    bd.entries = &entry;
+    color.backdrop_group = wgpuDeviceCreateBindGroup(g_device, &bd);
+}
+
 bool flush_native(std::uint32_t prims) {
     const Timed timed(kCpuNative);
     Batch &b = g_batch;
@@ -2166,22 +2187,6 @@ bool flush_native(std::uint32_t prims) {
             } else {
                 // The draw's primitives go in groups of which no two can cover the same pixel: each group reads the
                 // target as the groups before it left it, copied to the backdrop over the group's box.
-                if (!color->backdrop) {
-                    WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
-                    td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-                    td.size = WGPUExtent3D{color->width * g_scale, color->height * g_scale, 1};
-                    td.format = WGPUTextureFormat_RGBA8Unorm;
-                    color->backdrop = wgpuDeviceCreateTexture(g_device, &td);
-                    color->backdrop_view = wgpuTextureCreateView(color->backdrop, nullptr);
-                    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
-                    entry.binding = 0;
-                    entry.textureView = color->backdrop_view;
-                    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-                    bd.layout = g_backdrop_layout;
-                    bd.entryCount = 1;
-                    bd.entries = &entry;
-                    color->backdrop_group = wgpuDeviceCreateBindGroup(g_device, &bd);
-                }
                 std::uint32_t from = i;
                 while (from < j) {
                     int gx0 = 1 << 30, gy0 = 1 << 30, gx1 = -1, gy1 = -1;
@@ -2203,12 +2208,19 @@ bool flush_native(std::uint32_t prims) {
                     if (gx1 >= 0 && cx0 < cx1 && cy0 < cy1) {
                         record[32] = prim_offset + from * kPrimWords;
                         g_param_records.push_back(record);
-                        pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
+                        // A single triangle or a group of disjoint axis-aligned sprites
+                        // shades a sample at most once. Keep the snapshot for groups
+                        // of triangles whose edges use floating-point coverage tests.
+                        const bool in_place = g_in_place_feedback && (to == from + 1 || rec[1] == 1);
+                        if (!in_place) {
+                            ensure_backdrop(*color);
+                            pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
+                        }
                         // The feedback group's bounding box already encloses every
                         // primitive in this draw and is clipped to the setup
                         // scissor. Use it for rasterization as well as copy.
                         pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
-                                              cy1 - cy0, 0.0f, true});
+                                              cy1 - cy0, 0.0f, true, in_place});
                         g_feedback_draws += to - from;
                     }
                     from = to;
@@ -3047,13 +3059,19 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     WGPURenderPipeline current = nullptr;
     float constant = 0.0f;
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
-    bool backdrop_bound = false;
+    WGPUBindGroup feedback_group_bound = nullptr;
+#ifdef PS2_GPU_GL
+    bool after_direct_draw = false;
+#endif
     unsigned covered_copies = 0;
     for (;;) {
         const auto &draws = g_native_passes[g_commands[i].x].draws;
         for (std::size_t draw = 0; draw < draws.size(); ++draw) {
             const auto &d = draws[draw];
             if (!d.pipeline) {
+#ifdef PS2_GPU_GL
+                after_direct_draw = false;
+#endif
                 if (covered_copies) {
                     --covered_copies;
                     ++g_feedback_copies_merged;
@@ -3084,7 +3102,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 wgpuCommandEncoderCopyTextureToTexture(enc, &from, &to, &size);
                 current = nullptr;
                 constant = 0.0f;
-                backdrop_bound = false;
+                feedback_group_bound = nullptr;
                 last_x = last_y = last_w = last_h = ~0u;
                 continue;
             }
@@ -3092,12 +3110,17 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
                 current = nullptr;
                 constant = 0.0f;
-                backdrop_bound = false;
+                feedback_group_bound = nullptr;
                 last_x = last_y = last_w = last_h = ~0u;
             }
-            if (d.feedback && !backdrop_bound) {
-                wgpuRenderPassEncoderSetBindGroup(rp, 1, first.color->backdrop_group, 0, nullptr);
-                backdrop_bound = true;
+            if (d.feedback) {
+                // In the GL shim both groups bind a texture to unit zero.
+                // WebGPU always binds a separate backdrop with its fragment layout.
+                const auto group = d.in_place ? first.color->group : first.color->backdrop_group;
+                if (group != feedback_group_bound) {
+                    wgpuRenderPassEncoderSetBindGroup(rp, 1, group, 0, nullptr);
+                    feedback_group_bound = group;
+                }
             }
             if (d.pipeline != current) {
                 wgpuRenderPassEncoderSetPipeline(rp, d.pipeline);
@@ -3114,7 +3137,23 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 const WGPUColor c{constant, constant, constant, constant};
                 wgpuRenderPassEncoderSetBlendConstant(rp, &c);
             }
+#ifdef PS2_GPU_GL
+            // Bracket a run of in-place draws. Adjacent draws share the barrier
+            // between them; subsequent ordinary draws or copies see the final write.
+            if (d.in_place && !after_direct_draw) {
+                ps2GlFeedbackBarrier(enc);
+                ++g_texture_barriers;
+            }
+#endif
             wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
+#ifdef PS2_GPU_GL
+            after_direct_draw = d.in_place;
+            if (d.in_place) {
+                ps2GlFeedbackBarrier(enc);
+                ++g_texture_barriers;
+                ++g_in_place_draws;
+            }
+#endif
         }
         if (!merge || !next_native_pass(i, first)) break;
         ++i;
@@ -3324,6 +3363,13 @@ void submitted() {
                      static_cast<double>(feedback_pixels) / static_cast<double>(feedback_copies),
                      static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds,
                      static_cast<double>(g_feedback_copies_merged - last_merged) / seconds, g_scale);
+    static std::uint64_t last_direct = 0, last_barriers = 0;
+    if (g_in_place_feedback) {
+        std::fprintf(stderr, "[native] in-place feedback: %.0f draws/s, %.0f texture barriers/s\n",
+                     double(g_in_place_draws - last_direct) / seconds, double(g_texture_barriers - last_barriers) / seconds);
+        last_direct = g_in_place_draws;
+        last_barriers = g_texture_barriers;
+    }
     last_merged = g_feedback_copies_merged;
     last_pass_restarts = g_feedback_pass_restarts;
     last_feedback = g_feedback_draws;
@@ -3829,6 +3875,13 @@ bool init(Mode m) {
     const bool want_native = native_spec && std::atoi(native_spec) != 0;
 #endif
     g_native = want_native && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+#ifdef PS2_GPU_GL
+    const char *barrier = std::getenv("PS2_GL_FEEDBACK_BARRIER");
+    if (g_native && barrier && std::atoi(barrier) == 1) {
+        g_in_place_feedback = ps2GlEnableFeedbackBarrier();
+        std::fprintf(stderr, "[gl] feedback texture barrier: %s\n", g_in_place_feedback ? "enabled" : "unavailable, using snapshots");
+    }
+#endif
     if (want_native && !g_native) std::fprintf(stderr, "[gpu] no dual source blending: everything goes through the compute rasterizer\n");
     WGPUFeatureName features[2];
     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
@@ -4529,6 +4582,10 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_in_place_feedback)
+        std::fprintf(stderr, "[gpu] in-place feedback: %llu draws, %llu barriers, %llu snapshot copies\n",
+                     static_cast<unsigned long long>(g_in_place_draws), static_cast<unsigned long long>(g_texture_barriers),
+                     static_cast<unsigned long long>(g_feedback_copies));
     if (g_feedback_copies)
         std::fprintf(stderr, "[gpu] feedback snapshots: %llu copies, %llu merged\n",
                      static_cast<unsigned long long>(g_feedback_copies), static_cast<unsigned long long>(g_feedback_copies_merged));

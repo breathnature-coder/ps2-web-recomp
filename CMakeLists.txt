@@ -180,6 +180,23 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         set_tests_properties(gs_feedback_snapshot PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
         if(PS2_GPU_RESOLVED STREQUAL "gl")
             set_tests_properties(gs_feedback_snapshot PROPERTIES PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
+            foreach(scale IN ITEMS 1 2 3)
+                add_test(NAME gs_feedback_barrier_${scale} COMMAND gs_gpu_compare_test --feedback-snapshot)
+                set_tests_properties(gs_feedback_barrier_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 6 draws, [0-9]+ barriers, 0 snapshot copies")
+            endforeach()
+            add_test(NAME gs_feedback_barrier_mixed COMMAND gs_gpu_compare_test --mixed-feedback)
+            set_tests_properties(gs_feedback_barrier_mixed PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                PASS_REGULAR_EXPRESSION "in-place feedback: 3 draws, [0-9]+ barriers, 1 snapshot copies")
+            add_test(NAME gs_feedback_barrier_fallback COMMAND gs_gpu_compare_test --feedback-snapshot)
+            set_tests_properties(gs_feedback_barrier_fallback PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;MESA_GL_VERSION_OVERRIDE=4.3;MESA_EXTENSION_OVERRIDE=-GL_ARB_texture_barrier"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: enabled"
+                PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
         endif()
         add_test(NAME gs_preserve_rgb COMMAND gs_gpu_compare_test --preserve-rgb)
         set_tests_properties(gs_preserve_rgb PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")

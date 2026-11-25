@@ -158,6 +158,7 @@ struct Context {
     EGLSurface draw = nullptr;  // the window surface once presenting, else a pbuffer or none
     std::string renderer, version;
     GLint max_storage = 0;
+    void (*texture_barrier)() = nullptr;
     bool native = false;  // what the native renderer needs is there
     // Mesa's software rasterizer keeps draws back and can run a later compute dispatch ahead of them, so a draw whose
     // fragment shader reads a storage buffer sees what the dispatch wrote. There the draws are finished first.
@@ -625,6 +626,33 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *, W
 }
 
 WGPUQueue wgpuDeviceGetQueue(WGPUDevice) { return &g_queue; }
+
+// Only called on explicit opt-in, with the renderer's context current. Some
+// EGL implementations return a procedure even when the extension is absent.
+bool ps2GlEnableFeedbackBarrier() {
+    constexpr GLenum major_version = 0x821B, minor_version = 0x821C;
+    constexpr GLenum num_extensions = 0x821D, extensions = 0x1F03;
+    GLint major = 0, minor = 0;
+    glGetIntegerv(major_version, &major);
+    glGetIntegerv(minor_version, &minor);
+    bool supported = major > 4 || (major == 4 && minor >= 5);
+    if (!supported) {
+        using GetStringi = const unsigned char *(*)(GLenum, GLuint);
+        const auto get_string = reinterpret_cast<GetStringi>(eglGetProcAddress("glGetStringi"));
+        GLint count = 0;
+        glGetIntegerv(num_extensions, &count);
+        for (GLint i = 0; get_string && i < count && !supported; ++i) {
+            const auto *name = reinterpret_cast<const char *>(get_string(extensions, static_cast<GLuint>(i)));
+            supported = name && std::strcmp(name, "GL_ARB_texture_barrier") == 0;
+        }
+    }
+    g.texture_barrier = supported ? eglGetProcAddress("glTextureBarrier") : nullptr;
+    return g.texture_barrier != nullptr;
+}
+
+void ps2GlFeedbackBarrier(WGPUCommandEncoder enc) {
+    enc->ops.emplace_back(g.texture_barrier);
+}
 
 void ps2GlSetDecodeQueueReuse(bool enabled) { g_decode_queue_reuse = enabled; }
 
