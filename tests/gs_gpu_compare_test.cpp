@@ -372,15 +372,58 @@ int preserve_rgb_scene() {
     return 0;
 }
 
+// Alternate unused Z bases to form separate native batches on the same colour
+// attachment. The partial mask forces feedback and makes stale snapshots visible.
+int feedback_snapshot_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(TEST_1, 0);
+    write(COLCLAMP, 1);
+    write(ALPHA_1, 0x68u | bits(0x80, 32)); // Cs + Cd
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    unsigned sequence = 0;
+    const auto sprite = [&](unsigned x, bool feedback) {
+        ++sequence;
+        write(ZBUF_1, bits((sequence & 1u) ? 32 : 64, 0) | bits(1, 32));
+        write(FRAME_1, bits(1, 16) | bits(feedback ? 0x0fu : 0u, 32));
+        write(SCISSOR_1, bits(x, 0) | bits(x + 7, 16) | bits(7, 48));
+        write(PRIM, feedback ? 6u | 0x40u : 6u);
+        write(RGBAQ, 0x80030201u + sequence * 0x010101u);
+        write(XYZ2, bits(x * 16, 0));
+        write(XYZ2, bits((x + 8) * 16, 0) | bits(8 * 16, 16));
+    };
+    std::vector<std::uint8_t> result(kMemorySize);
+    const auto matches = [&] {
+        gpu::download(result.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), result.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "feedback snapshot after sprite %u: %d bytes differ, first at 0x%06zX\n", sequence, diff, first);
+        return diff == 0;
+    };
+    sprite(0, true);
+    sprite(24, false); // clear of the next read: the first two snapshots can share a copy
+    sprite(8, true);
+    sprite(8, true);   // reads the just-written pixels: requires a fresh snapshot
+    sprite(16, true);
+    if (!matches()) return 1;
+    sprite(0, true);
+    sprite(8, false);  // writes the next read: the copy must stay after this draw
+    sprite(8, true);
+    if (!matches()) return 1;
+    gpu::stats();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
-    bool sprite_copy = false, preserve_rgb = false;
+    bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
         else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
         else if (std::strcmp(argv[i], "--sprite-copy") == 0) sprite_copy = true;
         else if (std::strcmp(argv[i], "--race") == 0) g_race = true;
@@ -397,6 +440,7 @@ int main(int argc, char **argv) {
     }
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
+    if (feedback_snapshot) return feedback_snapshot_scene();
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;

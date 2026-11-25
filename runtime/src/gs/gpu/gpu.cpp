@@ -2963,12 +2963,15 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
-// A shared snapshot is valid until a draw touches a later group's copy
-// rectangle. Keep the search bounded and avoid copying large gaps.
+bool draw_rects_overlap(const NativeDraw &a, const NativeDraw &b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+// Keep the copied area close to the sum of the requested rectangles.
 bool extend_feedback_copy(NativeDraw &copy, const NativeDraw &next, std::uint64_t &pixels) {
     const auto right = copy.x + copy.w, bottom = copy.y + copy.h;
     const auto next_right = next.x + next.w, next_bottom = next.y + next.h;
-    if (copy.x < next_right && next.x < right && copy.y < next_bottom && next.y < bottom) return false;
+    if (draw_rects_overlap(copy, next)) return false;
     const auto x = std::min(copy.x, next.x), y = std::min(copy.y, next.y);
     const auto width = std::max(right, next_right) - x, height = std::max(bottom, next_bottom) - y;
     const auto combined = pixels + static_cast<std::uint64_t>(next.w) * next.h;
@@ -2979,6 +2982,45 @@ bool extend_feedback_copy(NativeDraw &copy, const NativeDraw &next, std::uint64_
     copy.h = height;
     pixels = combined;
     return true;
+}
+
+const NativePass *next_native_pass(std::size_t command, const NativePass &first) {
+    if (command + 1 >= g_commands.size() || g_commands[command + 1].pipeline != kNative) return nullptr;
+    const NativePass &next = g_native_passes[g_commands[command + 1].x];
+    return next.color == first.color && next.depth == first.depth ? &next : nullptr;
+}
+
+// Look through at most eight feedback groups and one ordinary draw. A copy
+// marker and its scissored feedback draw are always in the same NativePass.
+// Moving a later read earlier is valid only if every intervening colour write
+// misses its rectangle. The encoder still emits all draws in their original order.
+unsigned plan_feedback_snapshot(NativeDraw &copy, std::size_t command, std::size_t draw, bool merge) {
+    const NativePass &first = g_native_passes[g_commands[command].x];
+    const NativePass *pass = &first;
+    const NativeDraw *ordinary = nullptr;
+    std::uint64_t pixels = static_cast<std::uint64_t>(copy.w) * copy.h;
+    unsigned covered = 0;
+    draw += 2;
+    while (covered < 7) {
+        if (draw == pass->draws.size()) {
+            if (!merge) break;
+            pass = next_native_pass(command, first);
+            if (!pass || pass->draws.empty()) break;
+            ++command;
+            draw = 0;
+        }
+        const NativeDraw &next = pass->draws[draw];
+        if (next.pipeline) {
+            if (ordinary || next.feedback || (next.w == first.color->width && next.h == first.color->height)) break;
+            ordinary = &next;
+            ++draw;
+            continue;
+        }
+        if ((ordinary && draw_rects_overlap(*ordinary, next)) || !extend_feedback_copy(copy, next, pixels)) break;
+        ++covered;
+        draw += 2;
+    }
+    return covered;
 }
 
 // The render passes of the native renderer from command i on; successive ones on the same targets share a pass.
@@ -3006,25 +3048,19 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     float constant = 0.0f;
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
     bool backdrop_bound = false;
+    unsigned covered_copies = 0;
     for (;;) {
         const auto &draws = g_native_passes[g_commands[i].x].draws;
-        std::size_t snapshot_end = 0;
         for (std::size_t draw = 0; draw < draws.size(); ++draw) {
             const auto &d = draws[draw];
             if (!d.pipeline) {
-                if (draw < snapshot_end) {
+                if (covered_copies) {
+                    --covered_copies;
                     ++g_feedback_copies_merged;
                     continue;
                 }
                 NativeDraw copy = d;
-                auto pixels = static_cast<std::uint64_t>(copy.w) * copy.h;
-                snapshot_end = draw + 2;
-                // Each copy command is immediately followed by its draw,
-                // which is clipped to exactly the copied rectangle.
-                while (snapshot_end < draws.size() && snapshot_end - draw < 16 &&
-                       !draws[snapshot_end].pipeline && extend_feedback_copy(copy, draws[snapshot_end], pixels)) {
-                    snapshot_end += 2;
-                }
+                covered_copies = plan_feedback_snapshot(copy, i, draw, merge);
                 ++g_feedback_copies;
                 g_feedback_copy_pixels += static_cast<std::uint64_t>(copy.w) * copy.h;
 #ifdef PS2_GPU_GL
@@ -3080,9 +3116,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
             }
             wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
         }
-        if (!merge || i + 1 >= g_commands.size() || g_commands[i + 1].pipeline != kNative) break;
-        const NativePass &next = g_native_passes[g_commands[i + 1].x];
-        if (next.color != first.color || next.depth != first.depth) break;
+        if (!merge || !next_native_pass(i, first)) break;
         ++i;
     }
     if (rp) {
@@ -4495,6 +4529,9 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_feedback_copies)
+        std::fprintf(stderr, "[gpu] feedback snapshots: %llu copies, %llu merged\n",
+                     static_cast<unsigned long long>(g_feedback_copies), static_cast<unsigned long long>(g_feedback_copies_merged));
     if (g_no_write_prims) std::fprintf(stderr, "[gpu] no-write prims skipped: %llu\n", static_cast<unsigned long long>(g_no_write_prims));
     if (g_sprite_copies) std::fprintf(stderr, "[gpu] direct sprite copies: %llu\n", static_cast<unsigned long long>(g_sprite_copies));
     if (g_lut_tiles) std::fprintf(stderr, "[gpu] colour correction: %llu tiles as table lookups in %llu passes\n", static_cast<unsigned long long>(g_lut_tiles), static_cast<unsigned long long>(g_lut_passes));

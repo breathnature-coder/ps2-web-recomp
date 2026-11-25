@@ -176,6 +176,11 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         # bytes per scene), so this only checks that it runs; compare two GPU
         # renderers with each other through scripts/compare_gpu_backends.sh.
         add_test(NAME gs_gpu_compare COMMAND gs_gpu_compare_test 40)
+        add_test(NAME gs_feedback_snapshot COMMAND gs_gpu_compare_test --feedback-snapshot)
+        set_tests_properties(gs_feedback_snapshot PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
+        if(PS2_GPU_RESOLVED STREQUAL "gl")
+            set_tests_properties(gs_feedback_snapshot PROPERTIES PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
+        endif()
         add_test(NAME gs_preserve_rgb COMMAND gs_gpu_compare_test --preserve-rgb)
         set_tests_properties(gs_preserve_rgb PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
         add_test(NAME gs_sprite_copy COMMAND gs_gpu_compare_test --sprite-copy)
