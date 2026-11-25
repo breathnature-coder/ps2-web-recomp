@@ -138,6 +138,13 @@ struct Arena {
     std::uint32_t *data() { return words.get(); }
     std::uint32_t &operator[](std::size_t i) { return words[i]; }
 } g_arena;
+struct ArenaUpload {
+    std::uint64_t key;
+    std::uint32_t offset;
+    std::size_t bytes;
+};
+std::vector<ArenaUpload> g_arena_uploads;
+std::unordered_multimap<std::uint64_t, std::size_t> g_arena_upload_index;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0, g_texflushes = 0;
 // What each CLUT slot was loaded from: block pointer, and whether as the 256 entries of a 32-bit CSM1 CLUT.
 struct ClutSource {
@@ -291,6 +298,7 @@ std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
 std::uint32_t g_cache_head = 0;
 std::uint64_t g_serial = 1;
 std::uint64_t g_cache_pressure_fallbacks = 0, g_cache_pressure_bytes = 0;
+std::uint64_t g_cache_pressure_spill_hits = 0, g_cache_pressure_bytes_saved = 0;
 
 std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     std::uint64_t h = static_cast<std::uint64_t>(n) * 0x9E3779B97F4A7C15ull;
@@ -308,6 +316,23 @@ std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     std::memcpy(&v, p + n - std::min<std::size_t>(n, 8), std::min<std::size_t>(n, 8));
     mix(v);
     return h;
+}
+
+bool arena_upload_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
+    const auto [first, last] = g_arena_upload_index.equal_range(key);
+    for (auto it = first; it != last; ++it) {
+        const ArenaUpload &entry = g_arena_uploads[it->second];
+        if (entry.bytes != n || std::memcmp(g_arena.data() + entry.offset, bytes, n) != 0) continue;
+        offset = entry.offset;
+        return true;
+    }
+    return false;
+}
+
+void arena_upload_remember(std::uint64_t key, std::uint32_t offset, std::size_t n) {
+    const std::size_t entry = g_arena_uploads.size();
+    g_arena_uploads.push_back({key, offset, n});
+    g_arena_upload_index.emplace(key, entry);
 }
 
 bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
@@ -2666,8 +2691,10 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     PreOp op;
     const auto n = static_cast<std::size_t>((used + 7) / 8);
     std::uint32_t offset = 0, source = 0;
+    std::uint64_t key = 0;
+    bool cache_pressure = false;
     if (n >= kCacheMinBytes) {
-        const std::uint64_t key = content_key(bytes, n);
+        key = content_key(bytes, n);
         bool cached = cache_find(key, bytes, n, offset);
         if (!cached && ++g_cache_seen[key] >= 2) {
             bool blocked_by_current_serial = false;
@@ -2678,13 +2705,24 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
             // normal per-submit arena below, preserving upload order and data.
             if (!cached && blocked_by_current_serial) {
                 ++g_cache_pressure_fallbacks;
-                g_cache_pressure_bytes += n;
+                cache_pressure = true;
             }
         }
         if (cached) source = 0x80000000u;
         if (g_cache_seen.size() > 65536) g_cache_seen.clear();
     }
-    if (!source) offset = arena_append(bytes, n);
+    if (!source) {
+        if (cache_pressure && arena_upload_find(key, bytes, n, offset)) {
+            ++g_cache_pressure_spill_hits;
+            g_cache_pressure_bytes_saved += n;
+        } else {
+            offset = arena_append(bytes, n);
+            if (cache_pressure) {
+                g_cache_pressure_bytes += n;
+                arena_upload_remember(key, offset, n);
+            }
+        }
+    }
     const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
     std::memcpy(op.rec, rec, sizeof rec);
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
@@ -2947,6 +2985,8 @@ void submitted() {
     ++g_serial;
     g_param_records.clear();
     g_arena.clear();
+    g_arena_uploads.clear();
+    g_arena_upload_index.clear();
     if (!decode_cache_on()) g_decoded_used = 0;  // kept across submits when cached
     g_clut_loads = 0;
     g_native_passes.clear();
@@ -3076,12 +3116,17 @@ void submitted() {
                  static_cast<double>(g_clut_precise_uploads - last_precise_uploads) / seconds);
     last_precise_uploads = g_clut_precise_uploads;
     static std::uint64_t last_cache_pressure_fallbacks = 0, last_cache_pressure_bytes = 0;
-    std::fprintf(stderr, "[gpu] upload cache pressure: %.0f fallbacks/s, %.2f MiB/s copied to submit arena, %.0f forced submits avoided/s\n",
+    static std::uint64_t last_cache_pressure_spill_hits = 0, last_cache_pressure_bytes_saved = 0;
+    std::fprintf(stderr, "[gpu] upload cache pressure: %.0f fallbacks/s, %.2f MiB/s copied to submit arena, %.0f forced submits avoided/s; spill reuse %.0f/s, %.2f MiB/s saved\n",
                  static_cast<double>(g_cache_pressure_fallbacks - last_cache_pressure_fallbacks) / seconds,
                  static_cast<double>(g_cache_pressure_bytes - last_cache_pressure_bytes) / seconds / (1024.0 * 1024.0),
-                 static_cast<double>(g_cache_pressure_fallbacks - last_cache_pressure_fallbacks) / seconds);
+                 static_cast<double>(g_cache_pressure_fallbacks - last_cache_pressure_fallbacks) / seconds,
+                 static_cast<double>(g_cache_pressure_spill_hits - last_cache_pressure_spill_hits) / seconds,
+                 static_cast<double>(g_cache_pressure_bytes_saved - last_cache_pressure_bytes_saved) / seconds / (1024.0 * 1024.0));
     last_cache_pressure_fallbacks = g_cache_pressure_fallbacks;
     last_cache_pressure_bytes = g_cache_pressure_bytes;
+    last_cache_pressure_spill_hits = g_cache_pressure_spill_hits;
+    last_cache_pressure_bytes_saved = g_cache_pressure_bytes_saved;
     static std::uint64_t last_insufficient_space = 0, last_fragmented_space = 0;
     std::fprintf(stderr, "[native] decode preserved: %.0f insufficient-space skips/s, %.0f fragmented-space skips/s\n",
                  static_cast<double>(g_decode_insufficient_space - last_insufficient_space) / seconds,

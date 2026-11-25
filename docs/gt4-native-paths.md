@@ -29,6 +29,11 @@ established for a new native path or deko3d backend.
   fallback uploads and bytes, including the number of forced submits avoided.
   A larger arena write may trade against the removed submits, so Switch timing
   still needs measurement.
+- Within a single submit, identical cache-pressure fallbacks now share one copy
+  in that arena. The temporary content index is cleared when the submit is queued;
+  the upload commands still execute in their original order. The same report
+  line includes spill reuse hits and bytes saved. This reduces repeated host to
+  GPU data writes without extending cached-data lifetime across submissions.
 - The GL compatibility backend now records only the changing dynamic parameter
   range on repeated binds of the same group within one command encoder; its
   static buffer ranges are bound on first use. This trims host-side binding
