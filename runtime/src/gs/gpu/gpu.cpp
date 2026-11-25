@@ -290,6 +290,7 @@ std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
 std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
 std::uint32_t g_cache_head = 0;
 std::uint64_t g_serial = 1;
+std::uint64_t g_cache_pressure_fallbacks = 0, g_cache_pressure_bytes = 0;
 
 std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     std::uint64_t h = static_cast<std::uint64_t>(n) * 0x9E3779B97F4A7C15ull;
@@ -321,7 +322,9 @@ bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std
     return false;
 }
 
-bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
+bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset,
+                  bool *blocked_by_current_serial = nullptr) {
+    if (blocked_by_current_serial) *blocked_by_current_serial = false;
     const auto words = static_cast<std::uint32_t>((n + 3) / 4 + 1);
     if (words > kCacheWords / 4) return false;
     const auto evict_front = [] {
@@ -338,11 +341,17 @@ bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, s
     };
     if (g_cache_head + words > kCacheWords) {
         while (!g_cache_ring.empty() && g_cache_ring.front().offset >= g_cache_head)
-            if (!evict_front()) return false;
+            if (!evict_front()) {
+                if (blocked_by_current_serial) *blocked_by_current_serial = true;
+                return false;
+            }
         g_cache_head = 0;
     }
     while (!g_cache_ring.empty() && g_cache_ring.front().offset < g_cache_head + words)
-        if (!evict_front()) return false;
+        if (!evict_front()) {
+            if (blocked_by_current_serial) *blocked_by_current_serial = true;
+            return false;
+        }
     offset = g_cache_head;
     std::uint32_t *to = g_cache_copy.data() + offset;
     to[words - 1] = 0;
@@ -2571,16 +2580,23 @@ void emit_pre(std::size_t upto) {
         const std::uint32_t count = static_cast<std::uint32_t>(j - i);
         std::uint32_t *records = g_arena.grow(count * 12u);
         const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
-        std::uint32_t total = 0;
+        std::uint32_t total_groups = 0;
         for (std::size_t k = i; k < j; ++k) {
             std::memcpy(records + (k - i) * 12, g_pre[k].rec, sizeof g_pre[k].rec);
             if (!clut) {
-                records[(k - i) * 12 + 11] = total;
-                total += g_pre[k].rec[7];
+                // Keep each IMAGE transfer inside its own workgroups. The upload
+                // shader can then resolve the record once per workgroup, rather
+                // than binary-searching the record table once per pixel.
+                records[(k - i) * 12 + 11] = total_groups;
+                total_groups += (g_pre[k].rec[7] + 63u) / 64u;
             }
         }
         if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
-        else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        else {
+            const std::uint32_t x_groups = std::min(total_groups, 1024u);
+            const std::uint32_t param = push_params({offset, count, total_groups, x_groups});
+            dispatch_linear(kUpload, total_groups * 64u, param);
+        }
         i = j;
     }
     g_pre = std::move(later);
@@ -2654,14 +2670,15 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
         const std::uint64_t key = content_key(bytes, n);
         bool cached = cache_find(key, bytes, n, offset);
         if (!cached && ++g_cache_seen[key] >= 2) {
-            cached = cache_insert(key, bytes, n, offset);
-            // The ring cannot evict its oldest entry while the pending submit reads it. A texture drawn every frame
-            // is read again before the next insert, so without a submit here the cache would take nothing new
-            // once it wraps, and every upload from then on goes through the per-submit buffer.
-            if (!cached && !g_cache_ring.empty() && g_cache_ring.front().used == g_serial) {
-                emit_everything();
-                submit(nullptr);
-                cached = cache_insert(key, bytes, n, offset);
+            bool blocked_by_current_serial = false;
+            cached = cache_insert(key, bytes, n, offset, &blocked_by_current_serial);
+            // A cache entry touched by this serial cannot be evicted until its
+            // commands are submitted. Do not force a submission just to retain
+            // this optional copy: queue_upload will append the bytes to the
+            // normal per-submit arena below, preserving upload order and data.
+            if (!cached && blocked_by_current_serial) {
+                ++g_cache_pressure_fallbacks;
+                g_cache_pressure_bytes += n;
             }
         }
         if (cached) source = 0x80000000u;
@@ -3058,6 +3075,13 @@ void submitted() {
     std::fprintf(stderr, "[native] CLUT tracking: %.0f small uploads/s tracked by block\n",
                  static_cast<double>(g_clut_precise_uploads - last_precise_uploads) / seconds);
     last_precise_uploads = g_clut_precise_uploads;
+    static std::uint64_t last_cache_pressure_fallbacks = 0, last_cache_pressure_bytes = 0;
+    std::fprintf(stderr, "[gpu] upload cache pressure: %.0f fallbacks/s, %.2f MiB/s copied to submit arena, %.0f forced submits avoided/s\n",
+                 static_cast<double>(g_cache_pressure_fallbacks - last_cache_pressure_fallbacks) / seconds,
+                 static_cast<double>(g_cache_pressure_bytes - last_cache_pressure_bytes) / seconds / (1024.0 * 1024.0),
+                 static_cast<double>(g_cache_pressure_fallbacks - last_cache_pressure_fallbacks) / seconds);
+    last_cache_pressure_fallbacks = g_cache_pressure_fallbacks;
+    last_cache_pressure_bytes = g_cache_pressure_bytes;
     static std::uint64_t last_insufficient_space = 0, last_fragmented_space = 0;
     std::fprintf(stderr, "[native] decode preserved: %.0f insufficient-space skips/s, %.0f fragmented-space skips/s\n",
                  static_cast<double>(g_decode_insufficient_space - last_insufficient_space) / seconds,

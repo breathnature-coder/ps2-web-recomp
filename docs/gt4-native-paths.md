@@ -17,6 +17,18 @@ established for a new native path or deko3d backend.
   its task once. This removes per-texture dispatch and parameter-record overhead
   while retaining the same texel conversion work. It has not been measured on
   Switch hardware.
+- IMAGE uploads now align each source record to a 64-pixel workgroup. The upload
+  shader resolves its source record once per workgroup instead of once per pixel;
+  trailing lanes in a partial group are idle. This leaves source order and the
+  pixel conversion path intact. The new path has not yet been built for Switch
+  or measured on hardware.
+- If the optional upload-content cache cannot evict an entry used by the current
+  GPU serial, the upload now falls back to the normal per-submit data arena
+  instead of forcing an immediate submit just to make cache space. The copied
+  payload and GS write order are unchanged. `[gpu] upload cache pressure` reports
+  fallback uploads and bytes, including the number of forced submits avoided.
+  A larger arena write may trade against the removed submits, so Switch timing
+  still needs measurement.
 - The GL compatibility backend now records only the changing dynamic parameter
   range on repeated binds of the same group within one command encoder; its
   static buffer ranges are bound on first use. This trims host-side binding

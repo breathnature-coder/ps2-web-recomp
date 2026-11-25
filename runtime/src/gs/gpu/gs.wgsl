@@ -283,25 +283,43 @@ fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 }
 
 
+var<workgroup> upload_record: u32;
+var<workgroup> upload_group_start: u32;
+var<workgroup> upload_pixel_count: u32;
+
 @compute @workgroup_size(64)
-fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * 64u * 1024u;
-    if (i >= prm(2u)) {
-        return;
-    }
-    let records = prm(0u);
-    var lo = 0u;
-    var hi = prm(1u);
-    while (hi - lo > 1u) {
-        let mid = (lo + hi) / 2u;
-        if (data[records + mid * 12u + 11u] <= i) {
-            lo = mid;
+fn upload(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
+    let group = wid.x + wid.y * prm(3u);
+    if (lane == 0u) {
+        if (group >= prm(2u)) {
+            upload_pixel_count = 0u;
         } else {
-            hi = mid;
+            let records = prm(0u);
+            var lo = 0u;
+            var hi = prm(1u);
+            while (lo + 1u < hi) {
+                let mid = (lo + hi) / 2u;
+                if (data[records + mid * 12u + 11u] <= group) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let r = records + lo * 12u;
+            upload_record = r;
+            upload_group_start = data[r + 11u];
+            upload_pixel_count = data[r + 7u];
         }
     }
-    let r = records + lo * 12u;
-    let k = i - data[r + 11u];
+    workgroupBarrier();
+    if (upload_pixel_count == 0u) {
+        return;
+    }
+    let r = upload_record;
+    let k = (group - upload_group_start) * 64u + lane;
+    if (k >= upload_pixel_count) {
+        return;
+    }
     let rrw = data[r + 5u];
     let p = data[r + 6u] + k;
     let x = (data[r + 3u] + p % rrw) & 0x7FFu;
