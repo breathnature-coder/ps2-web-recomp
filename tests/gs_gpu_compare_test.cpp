@@ -374,7 +374,7 @@ int preserve_rgb_scene() {
 
 // Alternate unused Z bases to form separate native batches on the same colour
 // attachment. The partial mask forces feedback and makes stale snapshots visible.
-int feedback_snapshot_scene() {
+int feedback_snapshot_scene(bool long_run = false) {
     write(PRMODECONT, 1);
     write(XYOFFSET_1, 0);
     write(TEST_1, 0);
@@ -382,15 +382,15 @@ int feedback_snapshot_scene() {
     write(ALPHA_1, 0x68u | bits(0x80, 32)); // Cs + Cd
     upload(0, 1, PSMCT32, 0, 0, 64, 32);
     unsigned sequence = 0;
-    const auto sprite = [&](unsigned x, bool feedback) {
+    const auto sprite = [&](unsigned x, bool feedback, unsigned width = 8) {
         ++sequence;
         write(ZBUF_1, bits((sequence & 1u) ? 32 : 64, 0) | bits(1, 32));
         write(FRAME_1, bits(1, 16) | bits(feedback ? 0x0fu : 0u, 32));
-        write(SCISSOR_1, bits(x, 0) | bits(x + 7, 16) | bits(7, 48));
+        write(SCISSOR_1, bits(x, 0) | bits(x + width - 1, 16) | bits(7, 48));
         write(PRIM, feedback ? 6u | 0x40u : 6u);
         write(RGBAQ, 0x80030201u + sequence * 0x010101u);
         write(XYZ2, bits(x * 16, 0));
-        write(XYZ2, bits((x + 8) * 16, 0) | bits(8 * 16, 16));
+        write(XYZ2, bits((x + width) * 16, 0) | bits(8 * 16, 16));
     };
     std::vector<std::uint8_t> result(kMemorySize);
     const auto matches = [&] {
@@ -400,6 +400,15 @@ int feedback_snapshot_scene() {
         if (diff) std::fprintf(stderr, "feedback snapshot after sprite %u: %d bytes differ, first at 0x%06zX\n", sequence, diff, first);
         return diff == 0;
     };
+    if (long_run) {
+        // More disjoint draws than the encoder retains in one barrier interval.
+        for (unsigned x = 0; x < 48; x += 2) sprite(x, true, 2);
+        sprite(46, false, 2); // write over the last in-place read
+        sprite(46, true, 2);  // now read the ordinary draw's result
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
     sprite(0, true);
     sprite(24, false); // clear of the next read: the first two snapshots can share a copy
     sprite(8, true);
@@ -461,10 +470,12 @@ int mixed_feedback_scene() {
 int main(int argc, char **argv) {
     int scenes = 40;
     bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
+    bool long_feedback = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
         else if (std::strcmp(argv[i], "--mixed-feedback") == 0) mixed_feedback = true;
         else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
         else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
@@ -483,7 +494,7 @@ int main(int argc, char **argv) {
     }
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
-    if (feedback_snapshot) return feedback_snapshot_scene();
+    if (feedback_snapshot || long_feedback) return feedback_snapshot_scene(long_feedback);
     if (mixed_feedback) return mixed_feedback_scene();
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;

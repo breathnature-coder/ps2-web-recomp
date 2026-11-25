@@ -9,7 +9,10 @@ established for a new native path or deko3d backend.
 `@env PS2_GL_FEEDBACK_BARRIER=1` enables same-pixel target reads for single
 triangles and groups of disjoint sprites when the GL context supports OpenGL
 4.5 or ARB_texture_barrier. The default value is 0. Groups of multiple
-triangles use snapshots. The startup log reports capability selection and
+triangles use snapshots. Up to eight draws with disjoint feedback accesses can
+share one barrier interval. Overlapping accesses involving a target read, a
+snapshot copy, or leaving the sequence of compatible passes close the interval.
+The startup log reports capability selection and
 `--stats` reports in-place draws and barriers per second alongside snapshot
 copies. Compare render time and frame times at the same scene and clocks to
 measure the cost of the barriers on the Switch driver.

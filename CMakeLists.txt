@@ -185,8 +185,13 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
                 set_tests_properties(gs_feedback_barrier_${scale} PROPERTIES SKIP_RETURN_CODE 77
                     ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
                     SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
-                    PASS_REGULAR_EXPRESSION "in-place feedback: 6 draws, [0-9]+ barriers, 0 snapshot copies")
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 6 draws, 6 barriers, 0 snapshot copies")
             endforeach()
+            add_test(NAME gs_feedback_barrier_long COMMAND gs_gpu_compare_test --long-feedback)
+            set_tests_properties(gs_feedback_barrier_long PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                PASS_REGULAR_EXPRESSION "in-place feedback: 25 draws, 6 barriers, 0 snapshot copies")
             add_test(NAME gs_feedback_barrier_mixed COMMAND gs_gpu_compare_test --mixed-feedback)
             set_tests_properties(gs_feedback_barrier_mixed PROPERTIES SKIP_RETURN_CODE 77
                 ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1"

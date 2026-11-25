@@ -3061,7 +3061,16 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
     WGPUBindGroup feedback_group_bound = nullptr;
 #ifdef PS2_GPU_GL
-    bool after_direct_draw = false;
+    // Between barriers remember each scissor conservatively, including ordinary
+    // colour writes that a later in-place draw could read. References live for
+    // this encode call; the recorded command buffer never retains them.
+    std::array<const NativeDraw *, 8> pending;
+    std::size_t pending_count = 0;
+    const auto feedback_barrier = [&] {
+        ps2GlFeedbackBarrier(enc);
+        ++g_texture_barriers;
+        pending_count = 0;
+    };
 #endif
     unsigned covered_copies = 0;
     for (;;) {
@@ -3070,7 +3079,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
             const auto &d = draws[draw];
             if (!d.pipeline) {
 #ifdef PS2_GPU_GL
-                after_direct_draw = false;
+                if (pending_count) feedback_barrier();
 #endif
                 if (covered_copies) {
                     --covered_copies;
@@ -3138,26 +3147,28 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 wgpuRenderPassEncoderSetBlendConstant(rp, &c);
             }
 #ifdef PS2_GPU_GL
-            // Bracket a run of in-place draws. Adjacent draws share the barrier
-            // between them; subsequent ordinary draws or copies see the final write.
-            if (d.in_place && !after_direct_draw) {
-                ps2GlFeedbackBarrier(enc);
-                ++g_texture_barriers;
+            if (pending_count || d.in_place) {
+                // A fresh interval starts with a barrier for writes from earlier
+                // commands. Two ordinary writes can overlap; any overlap with
+                // an in-place read/write requires a new interval.
+                const auto conflict = [&](const NativeDraw *prior) {
+                    return (d.in_place || prior->in_place) && draw_rects_overlap(d, *prior);
+                };
+                if (!pending_count || pending_count == pending.size() ||
+                    std::any_of(pending.begin(), pending.begin() + pending_count, conflict))
+                    feedback_barrier();
+                if (pending_count || d.in_place) pending[pending_count++] = &d;
+                if (d.in_place) ++g_in_place_draws;
             }
 #endif
             wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
-#ifdef PS2_GPU_GL
-            after_direct_draw = d.in_place;
-            if (d.in_place) {
-                ps2GlFeedbackBarrier(enc);
-                ++g_texture_barriers;
-                ++g_in_place_draws;
-            }
-#endif
         }
         if (!merge || !next_native_pass(i, first)) break;
         ++i;
     }
+#ifdef PS2_GPU_GL
+    if (pending_count) feedback_barrier();
+#endif
     if (rp) {
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
