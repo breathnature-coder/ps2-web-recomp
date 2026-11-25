@@ -1652,6 +1652,27 @@ bool surface_rows(const Surface &s, const Range &r, int &y0, int &y1) {
     return true;
 }
 
+// The caller has already found an overlap with the dirty rows. A CT32 colour
+// surface only writes pages under its dirty rectangle, including for CT24
+// draws (the surface stores RGBA words). A texture in another column can
+// therefore read GS memory without materializing the surface.
+bool texture_read_needs_store(const Surface &s, const Range &read) {
+    if (s.depth || s.psm != PSMCT32 || s.bp % 32 || read.hi > kMemorySize ||
+        s.dx0 < 0 || s.dx1 < s.dx0 || s.dx1 >= static_cast<int>(s.width)) return true;
+    const unsigned left = static_cast<unsigned>(s.dx0) / 64, right = static_cast<unsigned>(s.dx1) / 64;
+    if (left == 0 && right + 1 == s.bw) return true;
+    const Range box = pages(s.bp, s.bw, s.psm, s.dx0, s.dy0, s.dx1, s.dy1);
+    const auto lo = std::max(read.lo, box.lo), hi = std::min(read.hi, box.hi);
+    if (lo >= hi) return false;
+    const unsigned base = s.bp / 32;
+    const unsigned first = static_cast<unsigned>(lo / 8192) - base;
+    const unsigned last = static_cast<unsigned>((hi - 1) / 8192) - base;
+    const unsigned col = first % s.bw;
+    if (col >= left && col <= right) return true;
+    const unsigned distance = col < left ? left - col : s.bw - col + left;
+    return distance <= last - first;
+}
+
 void store_surface(Surface &s, std::uint32_t profile_cause = ~0u) {
     if (!s.dirty) return;
     s.dirty = false;
@@ -1676,7 +1697,8 @@ void sync_memory(const Range &r, bool write, const Surface *self = nullptr) {
     for (const auto &p : g_surfaces) {
         Surface &s = *p;
         if (&s == self) continue;
-        if (s.dirty && surface_range(s, s.dy0, s.dy1).overlaps(r.lo, r.hi)) store_surface(s);
+        if (s.dirty && surface_range(s, s.dy0, s.dy1).overlaps(r.lo, r.hi) &&
+            (write || g_sync_cause != 1 || texture_read_needs_store(s, r))) store_surface(s);
         int y0, y1;
         if (write && surface_rows(s, r, y0, y1)) {
             // The baseline reloads the enclosing interval. The opt-in path retains gaps,
