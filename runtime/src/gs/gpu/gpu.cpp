@@ -2994,6 +2994,38 @@ bool draw_rects_overlap(const NativeDraw &a, const NativeDraw &b) {
     return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
+#ifdef PS2_GPU_GL
+// Keep separated scissors separate so a draw in a gap does not trigger a
+// barrier. On overflow, enlarge the last entry: false overlaps remain safe.
+struct DrawRegions {
+    struct Rect { std::uint32_t left, top, right, bottom; };
+    std::array<Rect, 8> regions;
+    unsigned count = 0;
+
+    bool overlaps(const NativeDraw &draw) const {
+        for (unsigned i = 0; i < count; ++i) {
+            const Rect &r = regions[i];
+            if (draw.x < r.right && r.left < draw.x + draw.w &&
+                draw.y < r.bottom && r.top < draw.y + draw.h) return true;
+        }
+        return false;
+    }
+
+    void add(const NativeDraw &draw) {
+        const Rect next{draw.x, draw.y, draw.x + draw.w, draw.y + draw.h};
+        if (count < regions.size()) {
+            regions[count++] = next;
+            return;
+        }
+        Rect &r = regions.back();
+        r.left = std::min(r.left, next.left);
+        r.top = std::min(r.top, next.top);
+        r.right = std::max(r.right, next.right);
+        r.bottom = std::max(r.bottom, next.bottom);
+    }
+};
+#endif
+
 // Keep the copied area close to the sum of the requested rectangles.
 bool extend_feedback_copy(NativeDraw &copy, const NativeDraw &next, std::uint64_t &pixels) {
     const auto right = copy.x + copy.w, bottom = copy.y + copy.h;
@@ -3076,15 +3108,17 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
     WGPUBindGroup feedback_group_bound = nullptr;
 #ifdef PS2_GPU_GL
-    // Between barriers remember each scissor conservatively, including ordinary
-    // colour writes that a later in-place draw could read. References live for
-    // this encode call; the recorded command buffer never retains them.
-    std::array<const NativeDraw *, 8> pending;
-    std::size_t pending_count = 0;
-    const auto feedback_barrier = [&] {
+    // EXT framebuffer fetch synchronizes earlier writes with subsequently
+    // fetched samples. ARB texture feedback also protects an earlier read
+    // against another write to the same texel within one interval.
+    const bool direct_reads = g_in_place_feedback || (g_framebuffer_fetch && !g_coherent_fetch);
+    bool unknown_writes = true;
+    DrawRegions writes, reads;
+    const auto barrier = [&] {
         ps2GlFeedbackBarrier(enc);
         ++g_texture_barriers;
-        pending_count = 0;
+        unknown_writes = false;
+        writes.count = reads.count = 0;
     };
 #endif
     unsigned covered_copies = 0;
@@ -3094,7 +3128,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
             const auto &d = draws[draw];
             if (!d.pipeline) {
 #ifdef PS2_GPU_GL
-                if (pending_count) feedback_barrier();
+                if (reads.count) barrier();
 #endif
                 if (covered_copies) {
                     --covered_copies;
@@ -3162,18 +3196,15 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 wgpuRenderPassEncoderSetBlendConstant(rp, &c);
             }
 #ifdef PS2_GPU_GL
-            if (pending_count || d.in_place) {
-                // A fresh interval starts with a barrier for writes from earlier
-                // commands. Two ordinary writes can overlap; any overlap with
-                // an in-place read/write requires a new interval.
-                const auto conflict = [&](const NativeDraw *prior) {
-                    return (d.in_place || prior->in_place) && draw_rects_overlap(d, *prior);
-                };
-                if (!pending_count || pending_count == pending.size() ||
-                    std::any_of(pending.begin(), pending.begin() + pending_count, conflict))
-                    feedback_barrier();
-                if (pending_count || d.in_place) pending[pending_count++] = &d;
-                if (d.in_place) ++g_in_place_draws;
+            if (direct_reads) {
+                if ((d.in_place && (unknown_writes || writes.overlaps(d))) ||
+                    reads.overlaps(d))
+                    barrier();
+                if (!unknown_writes) writes.add(d);
+                if (d.in_place && g_in_place_feedback) {
+                    reads.add(d);
+                    ++g_in_place_draws;
+                }
             }
 #endif
             wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
@@ -3182,7 +3213,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
         ++i;
     }
 #ifdef PS2_GPU_GL
-    if (pending_count) feedback_barrier();
+    if (reads.count) barrier();
 #endif
     if (rp) {
         wgpuRenderPassEncoderEnd(rp);
@@ -3955,12 +3986,14 @@ bool init(Mode m) {
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
 #ifdef PS2_GPU_GL
     const char *fetch = std::getenv("PS2_GL_FRAMEBUFFER_FETCH");
-    if (g_native && fetch && std::atoi(fetch) == 1) {
+    const bool want_fetch = fetch && std::atoi(fetch) == 1;
+    if (g_native && want_fetch) {
         g_framebuffer_fetch = ps2GlEnableFramebufferFetch(g_scale, &g_coherent_fetch);
         std::fprintf(stderr, "[gl] framebuffer fetch: %s\n", !g_framebuffer_fetch ? "unavailable" : g_coherent_fetch ? "coherent" : "noncoherent");
     }
     const char *barrier = std::getenv("PS2_GL_FEEDBACK_BARRIER");
-    if (g_native && !g_framebuffer_fetch && barrier && std::atoi(barrier) == 1) {
+    const bool want_barrier = barrier ? std::atoi(barrier) == 1 : want_fetch;
+    if (g_native && !g_framebuffer_fetch && want_barrier) {
         g_in_place_feedback = ps2GlEnableFeedbackBarrier();
         std::fprintf(stderr, "[gl] feedback texture barrier: %s\n", g_in_place_feedback ? "enabled" : "unavailable, using snapshots");
     }

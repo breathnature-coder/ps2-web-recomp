@@ -9,9 +9,10 @@ established for a new native path or deko3d backend.
 `@env PS2_GL_FEEDBACK_BARRIER=1` enables same-pixel target reads for single
 triangles and groups of disjoint sprites when the GL context supports OpenGL
 4.5 or ARB_texture_barrier. The default value is 0. Groups of multiple
-triangles use snapshots. Up to eight draws with disjoint feedback accesses can
-share one barrier interval. Overlapping accesses involving a target read, a
-snapshot copy, or leaving the sequence of compatible passes close the interval.
+triangles use snapshots. Draws with disjoint feedback accesses can share one
+barrier interval. The encoder tracks written and sampled rectangles separately.
+When its rectangle list fills, it combines bounds conservatively. Overlap with an in-place read,
+a snapshot copy, or leaving the compatible passes can close the interval.
 The startup log reports capability selection and
 `--stats` reports in-place draws and barriers per second alongside snapshot
 copies. Compare render time and frame times at the same scene and clocks to
@@ -20,11 +21,13 @@ measure the cost of the barriers on the Switch driver.
 `@env PS2_GL_FRAMEBUFFER_FETCH=1` asks the GL renderer to read the destination
 pixel through the framebuffer-fetch shader input. The default value is 0.
 With coherent fetch, one draw can handle overlapping primitives in submission
-order. With only noncoherent fetch, single triangles and disjoint sprites use
-framebuffer fetch barriers. Groups of multiple triangles keep their snapshot.
+order. With only noncoherent fetch, single triangles and disjoint sprites
+synchronize before fetching a region that may have been written since the
+previous barrier. Groups of multiple triangles keep their snapshot.
 Startup reports the selected mode after linking both the colour and depth
-shaders. If fetch is unavailable, the renderer follows the existing barrier
-setting and snapshot path. The per-second `[native] framebuffer fetch` line
+shaders. If fetch is unavailable, this opt-in tries the GL texture barrier
+path, then snapshots. An explicit `@env PS2_GL_FEEDBACK_BARRIER=0`
+skips the texture barrier fallback. The per-second `[native] framebuffer fetch` line
 reports draws, barriers and remaining copies.
 
 ## Current foundation
