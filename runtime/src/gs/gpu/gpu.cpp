@@ -186,7 +186,7 @@ struct Batch {
 } g_batch;
 
 struct SetupCache {
-    std::uint32_t generation = ~0u, clut = ~0u;
+    std::uint32_t generation = ~0u, clut = ~0u, atst = 0;
     std::uint64_t attr = ~0ull;
     std::uint32_t setup[kSetupWords] = {};
     std::uint32_t flags = 0;
@@ -3697,7 +3697,20 @@ void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t 
     wgpuBufferUnmap(g_readback);
 }
 
-std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) {
+// GS ATST encoded as NEVER (0) or ALWAYS (1) for a known fragment alpha.
+unsigned constant_alpha_test(unsigned atst, unsigned alpha, unsigned ref) {
+    switch (atst) {
+    case 2: return alpha < ref;
+    case 3: return alpha <= ref;
+    case 4: return alpha == ref;
+    case 5: return alpha >= ref;
+    case 6: return alpha > ref;
+    case 7: return alpha != ref;
+    default: return atst;
+    }
+}
+
+std::uint32_t make_setup(const State &st, std::uint64_t attr, unsigned atst, std::uint32_t *w) {
     const Context &c = st.ctx[(attr >> 9) & 1u];
     std::uint32_t flags = 0;
     if (attr & 0x8u) flags |= 1u;
@@ -3727,7 +3740,7 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     w[4] = static_cast<std::uint32_t>(c.frame >> 32);
     w[5] = (static_cast<std::uint32_t>(c.zbuf) & 0x1FFu) * 32u;
     w[6] = zpsm;
-    w[7] = (static_cast<std::uint32_t>(c.test >> 1) & 7u) | ((static_cast<std::uint32_t>(c.test >> 12) & 3u) << 4) |
+    w[7] = atst | ((static_cast<std::uint32_t>(c.test >> 12) & 3u) << 4) |
            ((static_cast<std::uint32_t>(c.test >> 17) & 3u) << 8) | ((static_cast<std::uint32_t>(c.alpha) & 0xFFu) << 12) |
            ((static_cast<std::uint32_t>(c.tex0 >> 35) & 3u) << 20) | ((static_cast<std::uint32_t>(c.clamp) & 0xFu) << 24) |
            ((static_cast<std::uint32_t>(st.scanmsk) & 3u) << 28);
@@ -4104,13 +4117,26 @@ void draw(const State &st, const Vertex *v, int count) {
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
+    unsigned atst = (c.test >> 1) & 7u;
+    // A sprite uses its second vertex's alpha everywhere unless TCC takes
+    // alpha from the texture. FBA modifies stored alpha after these tests.
+    if (prim == 6 && count >= 2 && g_native && ((c.frame >> 24) & 0x3fu) <= PSMCT24 &&
+        ((st.pabe & 1u) || (c.test & 1u)) &&
+        (!(attr & 0x10u) || !(c.tex0 & (1ull << 34))) && !native_skip()) {
+        const unsigned alpha = v[1].a;
+        if ((st.pabe & 1u) && alpha < 0x80u) attr &= ~0x40ull;
+        // Keep blended draws on their original rounding path.
+        if ((c.test & 1u) && !(attr & 0x40u))
+            atst = constant_alpha_test(atst, alpha, (c.test >> 4) & 0xffu);
+    }
     SetupCache &cache = g_setup_cache;
-    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
+    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot || cache.atst != atst) {
+        cache.atst = atst;
         cache.generation = g_setup_generation;
         cache.attr = attr;
         cache.clut = g_clut_slot;
         const std::uint32_t *w = cache.setup;
-        cache.flags = make_setup(st, attr, cache.setup);
+        cache.flags = make_setup(st, attr, atst, cache.setup);
         cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
                     (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
         if (cache.flags & 2u) {

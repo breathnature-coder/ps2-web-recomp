@@ -465,16 +465,81 @@ int mixed_feedback_scene() {
     return 0;
 }
 
+// Both sprite vertices can have different RGBAQ values. The second supplies
+// the colour, unless the texture function contributes the fragment alpha.
+int sprite_alpha_scene(bool checkpoints) {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(SCISSOR_1, bits(191, 16) | bits(127, 48));
+    write(COLCLAMP, 1);
+    write(FRAME_1, bits(3, 16));
+    write(ZBUF_1, bits(0x1000 / 32, 0) | bits(1, 24));
+    write(ALPHA_1, 0x68u | bits(0x80, 32)); // Cs + Cd when blending is enabled
+    upload(0, 3, PSMCT32, 0, 0, 192, 128);
+    upload(0x2000, 1, PSMCT32, 0, 0, 32, 16);
+    unsigned serial = 0;
+    const auto sprite = [&](unsigned x, unsigned alpha) {
+        ++serial;
+        write(RGBAQ, bits(alpha ^ 0xffu, 24));
+        write(UV, 0);
+        write(XYZ2, bits(x * 16, 0) | bits(serial, 32));
+        write(RGBAQ, (0x130501u + serial * 0x010203u) | bits(alpha, 24));
+        write(UV, bits(64 * 16, 0) | bits(128 * 16, 16));
+        write(XYZ2, bits((x + 64) * 16, 0) | bits(128 * 16, 16) | bits(serial, 32));
+    };
+    std::vector<std::uint8_t> actual(kMemorySize);
+    const auto matches = [&] {
+        gpu::download(actual.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), actual.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "sprite alpha after %u: %d bytes differ, first at 0x%06zX\n", serial, diff, first);
+        return diff == 0;
+    };
+    constexpr unsigned ztest = (1u << 16) | (2u << 17);
+    write(PABE, 1);
+    write(TEST_1, ztest);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        write(PRIM, 6 | 0x40 | (mode ? 0x110 : 0));
+        write(TEX0_1, 0x2000u | bits(1, 14) | bits(5, 26) | bits(4, 30) | bits(mode == 2, 34) | bits(1, 35));
+        write(FBA_1, mode == 1);
+        // Same GS setup throughout this group, including threshold crossings.
+        for (unsigned alpha : {0x7fu, 0x80u, 0u, 0xffu}) {
+            sprite(0, alpha);
+            if (checkpoints && !matches()) return 1;
+        }
+    }
+    write(PABE, 0);
+    write(PRIM, 6);
+    for (unsigned test = 0; test < 8; ++test) {
+        for (unsigned fail = 0; fail < 4; ++fail) {
+            write(TEST_1, ztest | 1u | (test << 1) | (0x80u << 4) | (fail << 12));
+            sprite(0, 0x7f);
+            sprite(64, 0x80);
+            sprite(128, 0x81);
+            if (checkpoints && !matches()) return 1;
+        }
+    }
+    // Texture alpha varies within this sprite, across the reference value.
+    write(PRIM, 6 | 0x110);
+    write(TEST_1, ztest | 1u | (6u << 1) | (0x80u << 4) | (3u << 12));
+    sprite(0, 0xff);
+    if (!matches()) return 1;
+    gpu::stats();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
     bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
-    bool long_feedback = false;
+    bool long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--sprite-alpha") == 0) sprite_alpha = true;
+        else if (std::strcmp(argv[i], "--sprite-alpha-checkpoints") == 0) sprite_alpha = alpha_checkpoints = true;
         else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
         else if (std::strcmp(argv[i], "--mixed-feedback") == 0) mixed_feedback = true;
         else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
@@ -492,6 +557,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no GPU renderer available\n");
         return 77;
     }
+    if (sprite_alpha) return sprite_alpha_scene(alpha_checkpoints);
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
     if (feedback_snapshot || long_feedback) return feedback_snapshot_scene(long_feedback);

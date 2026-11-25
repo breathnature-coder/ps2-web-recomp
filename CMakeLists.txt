@@ -181,6 +181,9 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         if(PS2_GPU_RESOLVED STREQUAL "gl")
             set_tests_properties(gs_feedback_snapshot PROPERTIES PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
             foreach(scale IN ITEMS 1 2 3)
+                add_test(NAME gs_sprite_alpha_${scale} COMMAND gs_gpu_compare_test --sprite-alpha)
+                set_tests_properties(gs_sprite_alpha_${scale} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_SCALE=${scale}"
+                    PASS_REGULAR_EXPRESSION "feedback snapshots: 8 copies, 0 merged")
                 add_test(NAME gs_feedback_barrier_${scale} COMMAND gs_gpu_compare_test --feedback-snapshot)
                 set_tests_properties(gs_feedback_barrier_${scale} PROPERTIES SKIP_RETURN_CODE 77
                     ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
@@ -203,6 +206,8 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
                 SKIP_REGULAR_EXPRESSION "feedback texture barrier: enabled"
                 PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
         endif()
+        add_test(NAME gs_sprite_alpha_checkpoints COMMAND gs_gpu_compare_test --sprite-alpha-checkpoints)
+        set_tests_properties(gs_sprite_alpha_checkpoints PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME gs_preserve_rgb COMMAND gs_gpu_compare_test --preserve-rgb)
         set_tests_properties(gs_preserve_rgb PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
         add_test(NAME gs_sprite_copy COMMAND gs_gpu_compare_test --sprite-copy)

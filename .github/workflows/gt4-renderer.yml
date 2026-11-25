@@ -46,7 +46,7 @@ jobs:
         env:
           EGL_PLATFORM: surfaceless
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: ctest --test-dir build-gl -R '^gs_(sparse_load_|sprite_copy|preserve_rgb|feedback_snapshot|feedback_barrier_)' --output-on-failure
+        run: ctest --test-dir build-gl -R '^gs_(sparse_load_|sprite_copy|sprite_alpha_|preserve_rgb|feedback_snapshot|feedback_barrier_)' --output-on-failure
       - name: Check decode reuse barrier gate
         run: |
           clang++ -std=c++20 -O1 -Iruntime/include -Iruntime/src -Ithird_party/wgpu-native/include tests/gs_gl_queue_reuse_gate_test.cpp runtime/src/gs/gpu/gl/glapi.cpp runtime/src/gs/gpu/gl/shaders.cpp -lEGL -o build-gl/gs-gl-reuse-gate
