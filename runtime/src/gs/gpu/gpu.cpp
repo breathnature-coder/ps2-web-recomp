@@ -1467,7 +1467,18 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
             else write_z = false;
             if (afail == 3) mask &= 7u;
         } else if (afail != 0) {
-            return why(7);  // a failed test writes some of the pixel: needs the test per pixel and two write masks
+            // For unblended draws only, reduce AFAIL using the *writable*
+            // channels. CT24, for example, cannot write alpha even on a pass.
+            // A mixed write mask still needs per-pixel feedback.
+            if (flags & 8u) return why(7);
+            const auto fail_mask = afail == 2 ? 0u : afail == 3 ? mask & 7u : mask;
+            const bool fail_z = afail == 2 && write_z;
+            if (fail_mask == mask && fail_z == write_z) {
+                out.flags &= ~64u;  // both outcomes write exactly the same channels
+            } else if (fail_mask || fail_z) {
+                return why(7);
+            }
+            // A failure with no writable output is the native shader's discard.
         }
     }
     const std::uint32_t ztst = (modes >> 8) & 3u;
