@@ -41,12 +41,12 @@ jobs:
       - name: Configure OpenGL renderer
         run: cmake -S . -B build-gl -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DPS2_GPU_BACKEND=gl -DPS2_BUILD_TESTS=ON
       - name: Compile OpenGL renderer and runtime
-        run: cmake --build build-gl --target ps2runtime gs_sparse_load_test -j 2
-      - name: Check sparse surface reloads
+        run: cmake --build build-gl --target ps2runtime gs_sparse_load_test gs_gpu_compare_test -j 2
+      - name: Check surface reloads, native copies and blend writes
         env:
           EGL_PLATFORM: surfaceless
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: ctest --test-dir build-gl -R '^gs_sparse_load_' --output-on-failure
+        run: ctest --test-dir build-gl -R '^gs_(sparse_load_|sprite_copy|preserve_rgb)' --output-on-failure
       - name: Check decode reuse barrier gate
         run: |
           clang++ -std=c++20 -O1 -Iruntime/include -Iruntime/src -Ithird_party/wgpu-native/include tests/gs_gl_queue_reuse_gate_test.cpp runtime/src/gs/gpu/gl/glapi.cpp runtime/src/gs/gpu/gl/shaders.cpp -lEGL -o build-gl/gs-gl-reuse-gate

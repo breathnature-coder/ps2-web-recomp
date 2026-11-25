@@ -190,7 +190,7 @@ struct SetupCache {
     std::uint32_t flags = 0;
     std::uint64_t key = 0;
     Range tex;
-    bool native = false, alpha_factor = false;
+    bool native = false, alpha_factor = false, no_writes = false;
     std::uint32_t why = 0;
 } g_setup_cache;
 
@@ -1246,7 +1246,7 @@ struct SurfaceCopy {
     WGPUExtent3D size;
 };
 std::vector<SurfaceCopy> g_surface_copies;
-std::uint64_t g_sprite_copies = 0;
+std::uint64_t g_sprite_copies = 0, g_no_write_prims = 0;
 
 struct NativeState {
     std::uint32_t key = 0, flags = 0;
@@ -1455,9 +1455,19 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
     if (flags & 128u) return why(3);       // destination alpha test
     if ((modes >> 28) & 2u) return why(4); // every other line masked
     const bool zte = flags & 512u;
+    std::uint32_t fbmask = w[4];
+    if ((flags & 8u) && !(flags & 1024u)) {
+        const unsigned a = (modes >> 12) & 3u, b = (modes >> 14) & 3u;
+        const unsigned c = (modes >> 16) & 3u, d = (modes >> 18) & 3u;
+        // When (A - B) * C is zero and D is Cd, every RGB bit survives.
+        // PABE could instead select the unblended source. Alpha and depth
+        // have their own write rules, including on a failed alpha test.
+        if (d == 1 && (a == b || (a >= 2 && b >= 2) || (c >= 2 && w[9] == 0 && !(skip & 1u))))
+            fbmask |= 0x00FFFFFFu;
+    }
     std::uint32_t mask = 0;
     for (int ch = 0; ch < (fpsm == PSMCT24 ? 3 : 4); ++ch) {
-        const std::uint32_t m = (w[4] >> (ch * 8)) & 0xFFu;
+        const std::uint32_t m = (fbmask >> (ch * 8)) & 0xFFu;
         if (m == 0) mask |= 1u << ch;
         else if (m != 0xFFu) return why(6);  // a mask inside a channel
     }
@@ -1475,10 +1485,9 @@ bool native_fixed(const std::uint32_t *w, bool has_depth, NativeState &out) {
             else write_z = false;
             if (afail == 3) mask &= 7u;
         } else if (afail != 0) {
-            // For unblended draws only, reduce AFAIL using the *writable*
-            // channels. CT24, for example, cannot write alpha even on a pass.
-            // A mixed write mask still needs per-pixel feedback.
-            if (flags & 8u) return why(7);
+            // Reduce AFAIL using the writable channels. Blending affects
+            // only RGB, so it cannot change alpha-only or depth-only results.
+            if ((flags & 8u) && (mask & 7u)) return why(7);
             const auto fail_mask = afail == 2 ? 0u : afail == 3 ? mask & 7u : mask;
             const bool fail_z = afail == 2 && write_z;
             if (fail_mask == mask && fail_z == write_z) {
@@ -3125,6 +3134,10 @@ void submitted() {
     if (g_sprite_copies != last_sprite_copies)
         std::fprintf(stderr, "[native] direct sprite copies: %.0f/s\n", double(g_sprite_copies - last_sprite_copies) / seconds);
     last_sprite_copies = g_sprite_copies;
+    static std::uint64_t last_no_write_prims = 0;
+    if (g_no_write_prims != last_no_write_prims)
+        std::fprintf(stderr, "[native] no-write prims skipped: %.0f/s\n", double(g_no_write_prims - last_no_write_prims) / seconds);
+    last_no_write_prims = g_no_write_prims;
     // Emit the sparse policy while the game is running. The final [gpu] summary
     // is only printed on orderly shutdown, which is inconvenient for Switch A/B
     // sessions that are terminated after a short race window.
@@ -4009,6 +4022,7 @@ void draw(const State &st, const Vertex *v, int count) {
         }
         NativeState state;
         cache.native = g_native && native_state(w, true, state);
+        cache.no_writes = cache.native && !state.draws;
         // The source alpha as a blend factor must not pass 0x80. The vertices' alpha is known here; a texture's is
         // not, and is taken to keep to 0x80, as games' textures do (one that does not blends as if it were 0x80).
         // With a texture's alpha in it: modulate gives at most the vertices' alpha, decal and highlight 2 the
@@ -4021,6 +4035,12 @@ void draw(const State &st, const Vertex *v, int count) {
             cache.why = tfx == 2 ? 12 : 1;
         }
         cache.alpha_factor = state.alpha_factor && (!texture_alpha || tfx == 0);
+    }
+    // No colour or depth sample can change. Do not start a batch or mark
+    // its targets dirty: that alone could force a later texture writeback.
+    if (cache.no_writes) {
+        ++g_no_write_prims;
+        return;
     }
     const std::uint32_t *setup = cache.setup;
     const std::uint32_t flags = cache.flags;
@@ -4475,6 +4495,7 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_no_write_prims) std::fprintf(stderr, "[gpu] no-write prims skipped: %llu\n", static_cast<unsigned long long>(g_no_write_prims));
     if (g_sprite_copies) std::fprintf(stderr, "[gpu] direct sprite copies: %llu\n", static_cast<unsigned long long>(g_sprite_copies));
     if (g_lut_tiles) std::fprintf(stderr, "[gpu] colour correction: %llu tiles as table lookups in %llu passes\n", static_cast<unsigned long long>(g_lut_tiles), static_cast<unsigned long long>(g_lut_passes));
 }

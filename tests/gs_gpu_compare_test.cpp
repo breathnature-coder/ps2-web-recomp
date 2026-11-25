@@ -328,15 +328,60 @@ int sprite_copy_scene() {
     return diff != 0;
 }
 
+// Verify every step, including depth, before another sprite can overwrite it.
+int preserve_rgb_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(SCISSOR_1, bits(63, 16) | bits(31, 48));
+    write(COLCLAMP, 1);
+    write(PRIM, 6 | 0x40); // blended sprite
+    // Vary the stored fourth byte, including for CT24 where it must survive.
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    constexpr unsigned zbp = 0x1000;
+    std::vector<std::uint8_t> actual(kMemorySize);
+    unsigned seq = 0;
+    const auto check = [&](unsigned format, unsigned mask, unsigned blend, unsigned fix,
+                           unsigned alpha, unsigned test, bool write_z, bool pabe) {
+        ++seq;
+        write(FRAME_1, bits(1, 16) | bits(format, 24) | bits(mask, 32));
+        write(ZBUF_1, bits(zbp / 32, 0) | bits(!write_z, 32));
+        write(PABE, pabe);
+        write(TEST_1, test | bits(1, 16) | bits(1, 17)); // Z always passes.
+        write(ALPHA_1, blend | bits(fix, 32));
+        write(RGBAQ, (0x00123456u + seq * 0x10203u) | bits(alpha, 24));
+        write(XYZ2, bits(seq, 32));
+        write(XYZ2, bits(64 * 16, 0) | bits(32 * 16, 16) | bits(seq, 32));
+        gpu::download(actual.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), actual.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "preserve RGB case %u: %d bytes differ, first at 0x%06zX\n", seq, diff, first);
+        return diff == 0;
+    };
+    constexpr unsigned equal_ab = 0x40; // (Cs-Cs)*As + Cd
+    constexpr unsigned zero_fix = 0x64; // (Cs-Cd)*FIX + Cd
+    constexpr unsigned rgb_only_on_fail = 1 | (6 << 1) | (0x40 << 4) | (3 << 12);
+    for (unsigned format : {PSMCT24, PSMCT32}) {
+        if (!check(format, 0x00550fa0, equal_ab, 0x80, 0xa1, 0, false, false) ||
+            !check(format, 0, zero_fix, 0, 0x12, rgb_only_on_fail, false, false) ||
+            !check(format, 0, zero_fix, 0, 0x91, rgb_only_on_fail, false, false) ||
+            !check(format, 0xff000000, equal_ab, 0, 0x62, 0, true, false) ||
+            !check(format, 0, equal_ab, 0, 0x22, 0, false, true) ||
+            !check(format, 0, zero_fix, 0x80, 0x33, 0, false, false)) return 1;
+    }
+    gpu::stats();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
-    bool sprite_copy = false;
+    bool sprite_copy = false, preserve_rgb = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
         else if (std::strcmp(argv[i], "--sprite-copy") == 0) sprite_copy = true;
         else if (std::strcmp(argv[i], "--race") == 0) g_race = true;
         else if (std::strcmp(argv[i], "--against") == 0 && i + 1 < argc) against = argv[++i];
@@ -351,6 +396,7 @@ int main(int argc, char **argv) {
         return 77;
     }
     if (sprite_copy) return sprite_copy_scene();
+    if (preserve_rgb) return preserve_rgb_scene();
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;
