@@ -425,24 +425,25 @@ int feedback_snapshot_scene(bool long_run = false) {
 
 // Switch between target reads and a backdrop in one native pass, with
 // depth writes enabled. The first two disjoint triangles share a draw.
-int mixed_feedback_scene() {
+int mixed_feedback_scene(bool blend_by_destination_alpha) {
     write(PRMODECONT, 1);
     write(XYOFFSET_1, 0);
-    write(FRAME_1, bits(1, 16) | bits(0x0f, 32));
+    write(FRAME_1, bits(1, 16) | bits(blend_by_destination_alpha ? 0 : 0x0f, 32));
     write(ZBUF_1, bits(0x1000 / 32, 0) | bits(1, 24));
     write(TEST_1, bits(1, 16) | bits(2, 17));
     write(COLCLAMP, 1);
-    write(ALPHA_1, 0x68u | bits(0x80, 32));
+    // 0x58 is Cs * Ad / 128 + Cd, rounded by the GS integer blend.
+    write(ALPHA_1, blend_by_destination_alpha ? 0x58u : 0x68u | bits(0x80, 32));
     write(SCISSOR_1, bits(63, 16) | bits(31, 48));
     upload(0, 1, PSMCT32, 0, 0, 64, 32);
     const auto vertex = [](unsigned x, unsigned y, unsigned z) {
         write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16) | bits(z, 32));
     };
     write(PRIM, 6 | 0x40);
-    write(RGBAQ, 0x80030507);
+    write(RGBAQ, blend_by_destination_alpha ? 0x00030507 : 0x80030507);
     vertex(0, 0, 1); vertex(32, 16, 1);
     write(PRIM, 3 | 0x40);
-    write(RGBAQ, 0x80171301);
+    write(RGBAQ, blend_by_destination_alpha ? 0xff171301 : 0x80171301);
     const auto triangle = [&](unsigned x, unsigned z) {
         vertex(x, 0, z); vertex(x + 8, 0, z); vertex(x, 8, z);
     };
@@ -533,7 +534,7 @@ int sprite_alpha_scene(bool checkpoints) {
 int main(int argc, char **argv) {
     int scenes = 40;
     bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
-    bool long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
+    bool dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
@@ -541,6 +542,7 @@ int main(int argc, char **argv) {
         else if (std::strcmp(argv[i], "--sprite-alpha") == 0) sprite_alpha = true;
         else if (std::strcmp(argv[i], "--sprite-alpha-checkpoints") == 0) sprite_alpha = alpha_checkpoints = true;
         else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
+        else if (std::strcmp(argv[i], "--dst-alpha-feedback") == 0) dst_alpha_feedback = true;
         else if (std::strcmp(argv[i], "--mixed-feedback") == 0) mixed_feedback = true;
         else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
         else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
@@ -561,7 +563,7 @@ int main(int argc, char **argv) {
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
     if (feedback_snapshot || long_feedback) return feedback_snapshot_scene(long_feedback);
-    if (mixed_feedback) return mixed_feedback_scene();
+    if (mixed_feedback || dst_alpha_feedback) return mixed_feedback_scene(dst_alpha_feedback);
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;

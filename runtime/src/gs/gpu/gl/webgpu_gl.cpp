@@ -627,25 +627,79 @@ WGPUFuture wgpuAdapterRequestDevice(WGPUAdapter, WGPUDeviceDescriptor const *, W
 
 WGPUQueue wgpuDeviceGetQueue(WGPUDevice) { return &g_queue; }
 
+// Query the active context, since EGL may expose entry points absent from its driver.
+static bool has_gl_extension(const char *wanted) {
+    using GetStringi = const unsigned char *(*)(GLenum, GLuint);
+    const auto get_string = reinterpret_cast<GetStringi>(eglGetProcAddress("glGetStringi"));
+    GLint count = 0;
+    glGetIntegerv(0x821D, &count); // GL_NUM_EXTENSIONS
+    for (GLint i = 0; get_string && i < count; ++i) {
+        const auto *name = reinterpret_cast<const char *>(get_string(0x1F03, static_cast<GLuint>(i)));
+        if (name && std::strcmp(name, wanted) == 0) return true;
+    }
+    return false;
+}
+
+// The checked-in GLSL comes from the same WGSL as WebGPU. Specialize only its
+// backdrop load and output declaration; the integer GS blend remains identical.
+static GLuint framebuffer_fetch_program(const char *entry, std::uint32_t scale, bool coherent) {
+    const char *fs = find_shader(entry, scale), *vs = find_shader(std::string(entry) + "@vs", scale);
+    if (!fs || !vs) return 0;
+    std::string source(fs);
+    const std::string output = "layout(location = 0) out vec4 _fs2p_location0;";
+    const auto declaration = source.find(output);
+    const auto load = source.find("vec4 there = ");
+    const auto end = source.find(';', load);
+    if (declaration == std::string::npos || end == std::string::npos ||
+        source.substr(load, end - load).find("texelFetch(_group_1_binding_0_fs,") == std::string::npos) return 0;
+    source.replace(load, end - load, "vec4 there = _fs2p_location0");
+    source.replace(declaration, output.size(), coherent ? "layout(location = 0) inout vec4 _fs2p_location0;" :
+                                                        "layout(noncoherent, location = 0) inout vec4 _fs2p_location0;");
+    source.insert(source.find('\n') + 1, coherent ? "#extension GL_EXT_shader_framebuffer_fetch : require\n" :
+                                                  "#extension GL_EXT_shader_framebuffer_fetch_non_coherent : require\n");
+    const GLuint fragment = compile(GL_FRAGMENT_SHADER, source.c_str(), entry);
+    if (!fragment) return 0;
+    const GLuint vertex = compile(GL_VERTEX_SHADER, vs, entry);
+    if (!vertex) {
+        glDeleteShader(fragment);
+        return 0;
+    }
+    return link({vertex, fragment}, entry);
+}
+
+bool ps2GlEnableFramebufferFetch(std::uint32_t scale, bool *coherent_out) {
+    const bool coherent = has_gl_extension("GL_EXT_shader_framebuffer_fetch");
+    decltype(g.texture_barrier) barrier = nullptr;
+    if (!coherent) {
+        if (!has_gl_extension("GL_EXT_shader_framebuffer_fetch_non_coherent")) return false;
+        barrier = eglGetProcAddress("glFramebufferFetchBarrierEXT");
+        if (!barrier) return false;
+    }
+    const GLuint color = framebuffer_fetch_program("native_feedback_fs", scale, coherent);
+    if (!color) return false;
+    const GLuint depth = framebuffer_fetch_program("native_feedback_depth_fs", scale, coherent);
+    if (!depth) {
+        glDeleteProgram(color);
+        return false;
+    }
+    // Publish the pair only after both variants link. On failure ordinary
+    // pipeline creation still obtains the snapshot programs.
+    *coherent_out = coherent;
+    g.texture_barrier = barrier;
+    g_programs.emplace(std::make_pair("native_fetch_fs", scale * 100), color);
+    g_programs.emplace(std::make_pair("native_fetch_depth_fs", scale * 100), depth);
+    return true;
+}
+
 // Only called on explicit opt-in, with the renderer's context current. Some
 // EGL implementations return a procedure even when the extension is absent.
 bool ps2GlEnableFeedbackBarrier() {
     constexpr GLenum major_version = 0x821B, minor_version = 0x821C;
-    constexpr GLenum num_extensions = 0x821D, extensions = 0x1F03;
     GLint major = 0, minor = 0;
     glGetIntegerv(major_version, &major);
     glGetIntegerv(minor_version, &minor);
     bool supported = major > 4 || (major == 4 && minor >= 5);
-    if (!supported) {
-        using GetStringi = const unsigned char *(*)(GLenum, GLuint);
-        const auto get_string = reinterpret_cast<GetStringi>(eglGetProcAddress("glGetStringi"));
-        GLint count = 0;
-        glGetIntegerv(num_extensions, &count);
-        for (GLint i = 0; get_string && i < count && !supported; ++i) {
-            const auto *name = reinterpret_cast<const char *>(get_string(extensions, static_cast<GLuint>(i)));
-            supported = name && std::strcmp(name, "GL_ARB_texture_barrier") == 0;
-        }
-    }
+    if (!supported) supported = has_gl_extension("GL_ARB_texture_barrier");
     g.texture_barrier = supported ? eglGetProcAddress("glTextureBarrier") : nullptr;
     return g.texture_barrier != nullptr;
 }

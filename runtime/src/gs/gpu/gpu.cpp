@@ -36,6 +36,7 @@ extern const char kNativeShader[];
 extern "C" void ps2GlDiscardOnWrite(WGPUBuffer buffer);
 extern "C" void ps2GlSetDecodeQueueReuse(bool enabled);
 extern "C" bool ps2GlEnableFeedbackBarrier();
+extern "C" bool ps2GlEnableFramebufferFetch(std::uint32_t scale, bool *coherent);
 extern "C" void ps2GlFeedbackBarrier(WGPUCommandEncoder encoder);
 extern "C" bool ps2GlCopyFeedbackInPass(WGPUCommandEncoder encoder, WGPUTexture source, WGPUTexture backdrop,
                                         std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height);
@@ -1262,7 +1263,8 @@ struct NativeState {
 
 constexpr std::size_t kMaxSurfaces = 24;
 
-bool g_native = false, g_in_place_feedback = false;
+bool g_native = false, g_in_place_feedback = false, g_framebuffer_fetch = false, g_coherent_fetch = false;
+std::uint64_t g_fetch_draws = 0;
 std::uint64_t g_in_place_draws = 0, g_texture_barriers = 0;
 std::vector<std::unique_ptr<Surface>> g_surfaces, g_retired;
 std::vector<NativePass> g_native_passes;
@@ -1610,6 +1612,8 @@ bool native_state(const std::uint32_t *w, bool has_depth, NativeState &out) {
     return true;
 }
 
+constexpr std::uint32_t kFramebufferFetch = 1u << 18;
+
 WGPURenderPipeline native_pipeline(std::uint32_t key) {
     const auto found = g_native_pipelines.find(key);
     if (found != g_native_pipelines.end()) return found->second;
@@ -1634,7 +1638,9 @@ WGPURenderPipeline native_pipeline(std::uint32_t key) {
     if (((key >> 8) & 1u) && !feedback) target.blend = &blend;
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = g_native_module;
-    fragment.entryPoint = view(feedback ? ((key >> 16) & 1u ? "native_feedback_depth_fs" : "native_feedback_fs") : (key >> 16) & 1u ? "native_depth_fs" : "native_fs");
+    const bool fetch = key & kFramebufferFetch;
+    fragment.entryPoint = view(fetch ? ((key >> 16) & 1u ? "native_fetch_depth_fs" : "native_fetch_fs") :
+                               feedback ? ((key >> 16) & 1u ? "native_feedback_depth_fs" : "native_feedback_fs") : (key >> 16) & 1u ? "native_depth_fs" : "native_fs");
     fragment.constantCount = 1;
     fragment.constants = &constant;
     fragment.targetCount = 1;
@@ -2055,13 +2061,13 @@ bool flush_native(std::uint32_t prims) {
     // Cache the feedback partition computed during native eligibility checking.
     // A zero entry means the range was not evaluated in the prepass.
     static std::vector<std::uint32_t> feedback_ends;
-    feedback_ends.assign(prims, 0);
+    if (!g_coherent_fetch) feedback_ends.assign(prims, 0);
     static std::vector<Outline> run_outlines;  // reused across batches and state runs
     std::uint32_t planned_feedback_groups = 0;
     // Draws that read the pixel already there cost a copy of the target and a new pass per group of primitives that
     // keep clear of each other. Where a batch's primitives lie all over each other that is more than handing the
     // batch to the compute rasterizer costs.
-    {
+    if (!g_coherent_fetch) {
         std::uint32_t groups = 0, among = 0;
         for (std::uint32_t i = 0; i < prims;) {
             const std::uint32_t *rec = b.prims.data() + i * kPrimWords;
@@ -2170,8 +2176,6 @@ bool flush_native(std::uint32_t prims) {
         if (native_debug()) for (std::uint32_t q = i; q < j; ++q) std::fprintf(stderr, "[prim] %u,%u-%u,%u z %06X tex %04X/%u/%02X %ux%u clamp %X dec %X\n", b.prims[q * kPrimWords + 2] & 0xFFFF, b.prims[q * kPrimWords + 2] >> 16, b.prims[q * kPrimWords + 3] & 0xFFFF, b.prims[q * kPrimWords + 3] >> 16, b.prims[q * kPrimWords + 24], w[12], w[13], w[14], 1u << (w[15] & 0xFF), 1u << (w[15] >> 8), (w[7] >> 24) & 0xF, w[24]);
         if (native_debug()) std::fprintf(stderr, "[native] prims %u..%u kind %u key %05X flags %05X modes %08X fpsm %02X tpsm %02X sc %u,%u-%u,%u box %d,%d-%d,%d draws %d\n", i, j, rec[1], state.key, w[0], w[7], w[3], w[14], x0, y0, x1, y1, b.minx, b.miny, b.maxx, b.maxy, state.draws);
         if (state.draws && x0 < x1 && y0 < y1) {
-            // One state run uses the same pipeline for every feedback group.
-            const WGPURenderPipeline pipeline = native_pipeline(state.key);
             std::array<std::uint32_t, kParamStride / 4> record{};
             std::memcpy(record.data(), w, kSetupWords * 4);
             record[0] = state.flags;
@@ -2180,11 +2184,17 @@ bool flush_native(std::uint32_t prims) {
             record[34] = color->width;
             record[35] = color->height;
             record[36] = state.premultiply;
-            if (!state.feedback) {
+            if (!state.feedback || g_coherent_fetch) {
+                const auto pipeline = native_pipeline(state.key | (state.feedback ? kFramebufferFetch : 0u));
+                if (state.feedback) {
+                    ++g_fetch_draws;
+                    g_feedback_draws += j - i;
+                }
                 g_param_records.push_back(record);
                 pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (j - i) * (rec[1] ? 6u : 3u), x0, y0, x1 - x0,
                                       y1 - y0, state.constant});
             } else {
+                WGPURenderPipeline snapshot_pipeline = nullptr, fetch_pipeline = nullptr;
                 // The draw's primitives go in groups of which no two can cover the same pixel: each group reads the
                 // target as the groups before it left it, copied to the backdrop over the group's box.
                 std::uint32_t from = i;
@@ -2211,7 +2221,9 @@ bool flush_native(std::uint32_t prims) {
                         // A single triangle or a group of disjoint axis-aligned sprites
                         // shades a sample at most once. Keep the snapshot for groups
                         // of triangles whose edges use floating-point coverage tests.
-                        const bool in_place = g_in_place_feedback && (to == from + 1 || rec[1] == 1);
+                        const bool single_coverage = to == from + 1 || rec[1] == 1;
+                        const bool fetch = g_framebuffer_fetch && single_coverage;
+                        const bool in_place = single_coverage && (g_in_place_feedback || fetch);
                         if (!in_place) {
                             ensure_backdrop(*color);
                             pass.draws.push_back({nullptr, 0, 0, cx0, cy0, cx1 - cx0, cy1 - cy0, 0.0f, false});
@@ -2219,8 +2231,11 @@ bool flush_native(std::uint32_t prims) {
                         // The feedback group's bounding box already encloses every
                         // primitive in this draw and is clipped to the setup
                         // scissor. Use it for rasterization as well as copy.
-                        pass.draws.push_back({pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
-                                              cy1 - cy0, 0.0f, true, in_place});
+                        auto &group_pipeline = fetch ? fetch_pipeline : snapshot_pipeline;
+                        if (!group_pipeline) group_pipeline = native_pipeline(state.key | (fetch ? kFramebufferFetch : 0u));
+                        pass.draws.push_back({group_pipeline, static_cast<std::uint32_t>(g_param_records.size() - 1), (to - from) * (rec[1] ? 6u : 3u), cx0, cy0, cx1 - cx0,
+                                              cy1 - cy0, 0.0f, !fetch, in_place});
+                        if (fetch) ++g_fetch_draws;
                         g_feedback_draws += to - from;
                     }
                     from = to;
@@ -3375,7 +3390,14 @@ void submitted() {
                      static_cast<double>(g_feedback_pass_restarts - last_pass_restarts) / seconds,
                      static_cast<double>(g_feedback_copies_merged - last_merged) / seconds, g_scale);
     static std::uint64_t last_direct = 0, last_barriers = 0;
-    if (g_in_place_feedback) {
+    if (g_framebuffer_fetch) {
+        static std::uint64_t last_fetch = 0;
+        std::fprintf(stderr, "[native] framebuffer fetch: %.0f draws/s, %.0f barriers/s, %.0f snapshot copies/s\n",
+                     double(g_fetch_draws - last_fetch) / seconds, double(g_texture_barriers - last_barriers) / seconds,
+                     double(feedback_copies) / seconds);
+        last_fetch = g_fetch_draws;
+        last_barriers = g_texture_barriers;
+    } else if (g_in_place_feedback) {
         std::fprintf(stderr, "[native] in-place feedback: %.0f draws/s, %.0f texture barriers/s\n",
                      double(g_in_place_draws - last_direct) / seconds, double(g_texture_barriers - last_barriers) / seconds);
         last_direct = g_in_place_draws;
@@ -3899,13 +3921,6 @@ bool init(Mode m) {
     const bool want_native = native_spec && std::atoi(native_spec) != 0;
 #endif
     g_native = want_native && wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
-#ifdef PS2_GPU_GL
-    const char *barrier = std::getenv("PS2_GL_FEEDBACK_BARRIER");
-    if (g_native && barrier && std::atoi(barrier) == 1) {
-        g_in_place_feedback = ps2GlEnableFeedbackBarrier();
-        std::fprintf(stderr, "[gl] feedback texture barrier: %s\n", g_in_place_feedback ? "enabled" : "unavailable, using snapshots");
-    }
-#endif
     if (want_native && !g_native) std::fprintf(stderr, "[gpu] no dual source blending: everything goes through the compute rasterizer\n");
     WGPUFeatureName features[2];
     if (g_timestamps) features[dd.requiredFeatureCount++] = WGPUFeatureName_TimestampQuery;
@@ -3938,6 +3953,18 @@ bool init(Mode m) {
         }
     }
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
+#ifdef PS2_GPU_GL
+    const char *fetch = std::getenv("PS2_GL_FRAMEBUFFER_FETCH");
+    if (g_native && fetch && std::atoi(fetch) == 1) {
+        g_framebuffer_fetch = ps2GlEnableFramebufferFetch(g_scale, &g_coherent_fetch);
+        std::fprintf(stderr, "[gl] framebuffer fetch: %s\n", !g_framebuffer_fetch ? "unavailable" : g_coherent_fetch ? "coherent" : "noncoherent");
+    }
+    const char *barrier = std::getenv("PS2_GL_FEEDBACK_BARRIER");
+    if (g_native && !g_framebuffer_fetch && barrier && std::atoi(barrier) == 1) {
+        g_in_place_feedback = ps2GlEnableFeedbackBarrier();
+        std::fprintf(stderr, "[gl] feedback texture barrier: %s\n", g_in_place_feedback ? "enabled" : "unavailable, using snapshots");
+    }
+#endif
     g_copy_words = (1u << 20) * g_scale * g_scale;
     if (const char *tile = std::getenv("PS2_TILE")) {
         const int t = std::atoi(tile);
@@ -4619,6 +4646,10 @@ void stats() {
                      static_cast<unsigned long long>(g_native_batches), static_cast<unsigned long long>(g_native_prims), static_cast<unsigned long long>(g_native_draws),
                      static_cast<unsigned long long>(g_compute_batches), static_cast<unsigned long long>(g_compute_prims), static_cast<unsigned long long>(g_stores),
                      static_cast<unsigned long long>(g_loads), g_surfaces.size(), g_native_pipelines.size());
+    if (g_framebuffer_fetch)
+        std::fprintf(stderr, "[gpu] framebuffer fetch: %llu draws, %llu barriers, %llu snapshot copies\n",
+                     static_cast<unsigned long long>(g_fetch_draws), static_cast<unsigned long long>(g_texture_barriers),
+                     static_cast<unsigned long long>(g_feedback_copies));
     if (g_in_place_feedback)
         std::fprintf(stderr, "[gpu] in-place feedback: %llu draws, %llu barriers, %llu snapshot copies\n",
                      static_cast<unsigned long long>(g_in_place_draws), static_cast<unsigned long long>(g_texture_barriers),

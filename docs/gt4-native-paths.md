@@ -17,6 +17,16 @@ The startup log reports capability selection and
 copies. Compare render time and frame times at the same scene and clocks to
 measure the cost of the barriers on the Switch driver.
 
+`@env PS2_GL_FRAMEBUFFER_FETCH=1` asks the GL renderer to read the destination
+pixel through the framebuffer-fetch shader input. The default value is 0.
+With coherent fetch, one draw can handle overlapping primitives in submission
+order. With only noncoherent fetch, single triangles and disjoint sprites use
+framebuffer fetch barriers. Groups of multiple triangles keep their snapshot.
+Startup reports the selected mode after linking both the colour and depth
+shaders. If fetch is unavailable, the renderer follows the existing barrier
+setting and snapshot path. The per-second `[native] framebuffer fetch` line
+reports draws, barriers and remaining copies.
+
 ## Current foundation
 
 - `recomp/vurecomp.cpp` generates C++ from captured VU1 code; `scripts/port.sh`
