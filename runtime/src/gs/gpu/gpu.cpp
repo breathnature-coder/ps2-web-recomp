@@ -2998,30 +2998,99 @@ bool draw_rects_overlap(const NativeDraw &a, const NativeDraw &b) {
 // Keep separated scissors separate so a draw in a gap does not trigger a
 // barrier. On overflow, enlarge the last entry: false overlaps remain safe.
 struct DrawRegions {
-    struct Rect { std::uint32_t left, top, right, bottom; };
-    std::array<Rect, 8> regions;
+    struct Footprint {
+        Outline shape;
+        bool precise;
+    };
+    static constexpr unsigned kMaxFootprints = 128;
+    std::array<Footprint, kMaxFootprints> footprints;
     unsigned count = 0;
+    bool collapsed = false;
+
+    static Outline rectangle(float left, float top, float right, float bottom) {
+        Outline o{};
+        const float xs[] = {left, right, right, left};
+        const float ys[] = {top, top, bottom, bottom};
+        std::copy(xs, xs + 4, o.x);
+        std::copy(ys, ys + 4, o.y);
+        o.min_x = left;
+        o.max_x = right;
+        o.min_y = top;
+        o.max_y = bottom;
+        o.corners = 4;
+        return o;
+    }
+
+    void clear() {
+        count = 0;
+        collapsed = false;
+    }
+
+    static bool bounds_meet(const Outline &a, const Outline &b) {
+        return a.max_x > b.min_x && b.max_x > a.min_x &&
+               a.max_y > b.min_y && b.max_y > a.min_y;
+    }
+
+    template <typename Visit>
+    static void visit_draw(const NativeDraw &draw, Visit visit) {
+        if (!draw.in_place) {
+            visit(rectangle(static_cast<float>(draw.x), static_cast<float>(draw.y),
+                            static_cast<float>(draw.x + draw.w), static_cast<float>(draw.y + draw.h)), false);
+            return;
+        }
+        const auto &record = g_param_records[draw.param];
+        const std::uint32_t first = record[32];
+        const std::uint32_t kind = record[33];
+        const std::uint32_t per_primitive = kind ? 6u : 3u;
+        for (std::uint32_t n = 0; n < draw.vertices / per_primitive; ++n) {
+            const auto *primitive = g_arena.data() + first + n * kPrimWords;
+            visit(outline(primitive), true);
+        }
+    }
 
     bool overlaps(const NativeDraw &draw) const {
-        for (unsigned i = 0; i < count; ++i) {
-            const Rect &r = regions[i];
-            if (draw.x < r.right && r.left < draw.x + draw.w &&
-                draw.y < r.bottom && r.top < draw.y + draw.h) return true;
-        }
-        return false;
+        bool result = false;
+        visit_draw(draw, [&](const Outline &shape, bool precise) {
+            for (unsigned i = 0; i < count && !result; ++i) {
+                const auto &prior = footprints[i];
+                if (!bounds_meet(shape, prior.shape)) continue;
+                result = precise && prior.precise ? outlines_meet(shape, prior.shape) : true;
+            }
+        });
+        return result;
     }
 
     void add(const NativeDraw &draw) {
-        const Rect next{draw.x, draw.y, draw.x + draw.w, draw.y + draw.h};
-        if (count < regions.size()) {
-            regions[count++] = next;
+        if (collapsed) {
+            visit_draw(draw, [&](const Outline &shape, bool) {
+                auto &box = footprints[0].shape;
+                box.min_x = std::min(box.min_x, shape.min_x);
+                box.min_y = std::min(box.min_y, shape.min_y);
+                box.max_x = std::max(box.max_x, shape.max_x);
+                box.max_y = std::max(box.max_y, shape.max_y);
+                box = rectangle(box.min_x, box.min_y, box.max_x, box.max_y);
+            });
             return;
         }
-        Rect &r = regions.back();
-        r.left = std::min(r.left, next.left);
-        r.top = std::min(r.top, next.top);
-        r.right = std::max(r.right, next.right);
-        r.bottom = std::max(r.bottom, next.bottom);
+        bool overflow = false;
+        visit_draw(draw, [&](const Outline &shape, bool precise) {
+            if (overflow) return;
+            if (count < footprints.size()) {
+                footprints[count++] = {shape, precise};
+                return;
+            }
+            float left = shape.min_x, top = shape.min_y, right = shape.max_x, bottom = shape.max_y;
+            for (unsigned i = 0; i < count; ++i) {
+                left = std::min(left, footprints[i].shape.min_x);
+                top = std::min(top, footprints[i].shape.min_y);
+                right = std::max(right, footprints[i].shape.max_x);
+                bottom = std::max(bottom, footprints[i].shape.max_y);
+            }
+            footprints[0] = {rectangle(left, top, right, bottom), false};
+            count = 1;
+            collapsed = true;
+            overflow = true;
+        });
     }
 };
 #endif
@@ -3095,7 +3164,8 @@ struct FeedbackAccess {
         ps2GlFeedbackBarrier(enc);
         ++g_texture_barriers;
         unknown_writes = false;
-        writes.count = reads.count = 0;
+        writes.clear();
+        reads.clear();
     }
 
     void before_draw(WGPUCommandEncoder enc, const NativeDraw &d) {
@@ -3119,7 +3189,7 @@ struct FeedbackAccess {
             finish_reads(enc);
             color = next;
             unknown_writes = true;
-            writes.count = 0;
+            writes.clear();
         } else if (color && cmd.pipeline == kSurfaceCopy) {
             const SurfaceCopy &copy = g_surface_copies[cmd.x];
             if (copy.source == color || copy.destination == color) finish_reads(enc);

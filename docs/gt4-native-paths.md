@@ -10,8 +10,10 @@ established for a new native path or deko3d backend.
 triangles and groups of disjoint sprites when the GL context supports OpenGL
 4.5 or ARB_texture_barrier. The default value is 0. Groups of multiple
 triangles use snapshots. Draws with disjoint feedback accesses can share one
-barrier interval. The encoder tracks written and sampled rectangles separately.
-When its rectangle list fills, it combines bounds conservatively. Overlap with an in-place read,
+barrier interval. The encoder tracks write rectangles and exact feedback primitive outlines
+separately. It uses separating axes to reject triangles whose bounding boxes
+overlap while the triangles themselves do not. When its outline list fills, it
+combines bounds conservatively. Overlap with an in-place read,
 a snapshot copy, or a store that samples the colour attachment can close the
 interval. Within one submission, depth-only passes and compute dispatches
 that leave the colour texture alone preserve the tracked rectangles.

@@ -374,7 +374,7 @@ int preserve_rgb_scene() {
 
 // Alternate unused Z bases to form separate native batches on the same colour
 // attachment. The partial mask forces feedback and makes stale snapshots visible.
-int feedback_snapshot_scene(bool long_run, bool switch_depth) {
+int feedback_snapshot_scene(bool long_run, bool switch_depth, bool geometry = false) {
     write(PRMODECONT, 1);
     write(XYOFFSET_1, 0);
     write(TEST_1, switch_depth ? bits(1, 16) | bits(1, 17) : 0);
@@ -400,6 +400,39 @@ int feedback_snapshot_scene(bool long_run, bool switch_depth) {
         if (diff) std::fprintf(stderr, "feedback snapshot after sprite %u: %d bytes differ, first at 0x%06zX\n", sequence, diff, first);
         return diff == 0;
     };
+    if (geometry) {
+        write(TEST_1, bits(1, 16) | bits(1, 17));
+        write(ALPHA_1, 0x68u | bits(0x80, 32));
+        write(FRAME_1, bits(1, 16) | bits(0x0f, 32));
+        write(SCISSOR_1, bits(63, 16) | bits(63, 48));
+        unsigned triangle_index = 0;
+        const auto triangle = [&](unsigned x, unsigned y, bool lower_right) {
+            ++triangle_index;
+            write(ZBUF_1, bits((triangle_index & 1u) ? 32 : 64, 0));
+            write(PRIM, 3 | 0x40);
+            write(RGBAQ, 0x80030201u + triangle_index * 0x010101u);
+            const auto vertex = [&](unsigned px, unsigned py) {
+                write(XYZ2, bits(px * 16, 0) | bits(py * 16, 16) | bits(triangle_index, 32));
+            };
+            if (lower_right) {
+                vertex(x + 32, y + 32);
+                vertex(x + 32, y + 16);
+                vertex(x + 16, y + 32);
+            } else {
+                vertex(x, y);
+                vertex(x + 32, y);
+                vertex(x, y + 32);
+            }
+        };
+        for (unsigned y = 0; y < 64; y += 32)
+            for (unsigned x = 0; x < 64; x += 32) {
+                triangle(x, y, false);
+                triangle(x, y, true);
+            }
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
     if (switch_depth) {
         // Each sprite uses the same colour but a different depth attachment
         // from the preceding draw. The final fetch reads a just-written pixel.
@@ -543,13 +576,14 @@ int sprite_alpha_scene(bool checkpoints) {
 int main(int argc, char **argv) {
     int scenes = 40;
     bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
-    bool switch_depth = false, dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
+    bool geometry_feedback = false, switch_depth = false, dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
         else if (std::strcmp(argv[i], "--sprite-alpha") == 0) sprite_alpha = true;
         else if (std::strcmp(argv[i], "--sprite-alpha-checkpoints") == 0) sprite_alpha = alpha_checkpoints = true;
+        else if (std::strcmp(argv[i], "--feedback-geometry") == 0) geometry_feedback = true;
         else if (std::strcmp(argv[i], "--feedback-depth-switch") == 0) switch_depth = true;
         else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
         else if (std::strcmp(argv[i], "--dst-alpha-feedback") == 0) dst_alpha_feedback = true;
@@ -572,7 +606,7 @@ int main(int argc, char **argv) {
     if (sprite_alpha) return sprite_alpha_scene(alpha_checkpoints);
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
-    if (feedback_snapshot || long_feedback || switch_depth) return feedback_snapshot_scene(long_feedback, switch_depth);
+    if (feedback_snapshot || long_feedback || switch_depth || geometry_feedback) return feedback_snapshot_scene(long_feedback, switch_depth, geometry_feedback);
     if (mixed_feedback || dst_alpha_feedback) return mixed_feedback_scene(dst_alpha_feedback);
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
