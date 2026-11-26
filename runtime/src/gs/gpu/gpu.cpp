@@ -3118,14 +3118,15 @@ const NativePass *next_native_pass(std::size_t command, const NativePass &first)
     return next.color == first.color && next.depth == first.depth ? &next : nullptr;
 }
 
-// Look through at most eight feedback groups and one ordinary draw. A copy
+// Look through at most eight feedback groups and eight ordinary draws. A copy
 // marker and its scissored feedback draw are always in the same NativePass.
 // Moving a later read earlier is valid only if every intervening colour write
 // misses its rectangle. The encoder still emits all draws in their original order.
 unsigned plan_feedback_snapshot(NativeDraw &copy, std::size_t command, std::size_t draw, bool merge) {
     const NativePass &first = g_native_passes[g_commands[command].x];
     const NativePass *pass = &first;
-    const NativeDraw *ordinary = nullptr;
+    std::array<NativeDraw, 8> ordinary{};
+    unsigned ordinary_count = 0;
     std::uint64_t pixels = static_cast<std::uint64_t>(copy.w) * copy.h;
     unsigned covered = 0;
     draw += 2;
@@ -3139,12 +3140,16 @@ unsigned plan_feedback_snapshot(NativeDraw &copy, std::size_t command, std::size
         }
         const NativeDraw &next = pass->draws[draw];
         if (next.pipeline) {
-            if (ordinary || next.feedback || (next.w == first.color->width && next.h == first.color->height)) break;
-            ordinary = &next;
+            if (ordinary_count == ordinary.size() || next.feedback ||
+                (next.w == first.color->width && next.h == first.color->height)) break;
+            ordinary[ordinary_count++] = next;
             ++draw;
             continue;
         }
-        if ((ordinary && draw_rects_overlap(*ordinary, next)) || !extend_feedback_copy(copy, next, pixels)) break;
+        bool intervening_write = false;
+        for (unsigned i = 0; i < ordinary_count; ++i)
+            intervening_write |= draw_rects_overlap(ordinary[i], next);
+        if (intervening_write || !extend_feedback_copy(copy, next, pixels)) break;
         ++covered;
         draw += 2;
     }
