@@ -279,14 +279,350 @@ int differences(const std::uint8_t *a, const std::uint8_t *b, std::size_t n, std
     return count;
 }
 
+// Copy from a page inside a freshly rendered target, with scissoring, then
+// verify that an intervening upload is visible to the next reader.
+int sprite_copy_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(ZBUF_1, bits(1, 32));
+    write(TEST_1, 0);
+    write(COLCLAMP, 1);
+    const auto sprite = [](int x, int y, int width, int height, int u, int v, int phase) {
+        write(UV, bits(u * 16 + phase, 0) | bits(v * 16 + phase, 16));
+        write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16));
+        write(UV, bits((u + width) * 16 + phase, 0) | bits((v + height) * 16 + phase, 16));
+        write(XYZ2, bits((x + width) * 16, 0) | bits((y + height) * 16, 16));
+    };
+    const auto texture = [](unsigned bp, unsigned function) {
+        write(TEX0_1, bp | bits(4, 14) | bits(8, 26) | bits(7, 30) | bits(1, 34) | bits(function, 35));
+    };
+    constexpr unsigned source_page = 5 * 32; // (64,32) with a pitch of four pages.
+    upload(0x2000, 4, PSMCT32, 0, 0, 128, 64);
+    write(PRIM, 6 | 0x110); // sprite with fixed texture coordinates
+    for (unsigned i = 0; i < 8; ++i) {
+        write(SCISSOR_1, bits(255, 16) | bits(127, 48));
+        write(FRAME_1, bits(4, 16));
+        texture(0x2000, 0);
+        write(RGBAQ, 0x80808080 - i * 0x010203);
+        sprite(64, 32, 64, 32, 0, 0, 0);
+        write(FRAME_1, bits(0x1000 / 32, 0) | bits(4, 16));
+        texture(source_page, i % 2);
+        write(RGBAQ, 0x80808080);
+        write(SCISSOR_1, bits(3, 0) | bits(210, 16) | bits(5, 32) | bits(90, 48));
+        sprite(2 + i * 17, 2, i % 2 ? 41 : 32, 16, 3, 7, i % 2 ? 8 : 0);
+    }
+    upload(source_page, 4, PSMCT32, 0, 0, 64, 16);
+    texture(source_page, 1);
+    sprite(33, 25, 32, 16, 0, 0, 0);
+    write(TEX1_1, bits(1, 5));
+    sprite(48, 32, 32, 16, 0, 0, 8);
+    write(TEX1_1, 0);
+    write(FRAME_1, bits(0x1000 / 32, 0) | bits(4, 16) | bits(0xff00, 32));
+    sprite(78, 44, 32, 16, 3, 2, 0);
+    std::vector<std::uint8_t> result(kMemorySize);
+    gpu::download(result.data());
+    std::size_t first = 0;
+    const int diff = differences(memory(), result.data(), kMemorySize, first);
+    if (diff) std::fprintf(stderr, "sprite copy: %d bytes differ, first at 0x%06zX\n", diff, first);
+    gpu::stats();
+    return diff != 0;
+}
+
+// Verify every step, including depth, before another sprite can overwrite it.
+int preserve_rgb_scene() {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(SCISSOR_1, bits(63, 16) | bits(31, 48));
+    write(COLCLAMP, 1);
+    write(PRIM, 6 | 0x40); // blended sprite
+    // Vary the stored fourth byte, including for CT24 where it must survive.
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    constexpr unsigned zbp = 0x1000;
+    std::vector<std::uint8_t> actual(kMemorySize);
+    unsigned seq = 0;
+    const auto check = [&](unsigned format, unsigned mask, unsigned blend, unsigned fix,
+                           unsigned alpha, unsigned test, bool write_z, bool pabe) {
+        ++seq;
+        write(FRAME_1, bits(1, 16) | bits(format, 24) | bits(mask, 32));
+        write(ZBUF_1, bits(zbp / 32, 0) | bits(!write_z, 32));
+        write(PABE, pabe);
+        write(TEST_1, test | bits(1, 16) | bits(1, 17)); // Z always passes.
+        write(ALPHA_1, blend | bits(fix, 32));
+        write(RGBAQ, (0x00123456u + seq * 0x10203u) | bits(alpha, 24));
+        write(XYZ2, bits(seq, 32));
+        write(XYZ2, bits(64 * 16, 0) | bits(32 * 16, 16) | bits(seq, 32));
+        gpu::download(actual.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), actual.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "preserve RGB case %u: %d bytes differ, first at 0x%06zX\n", seq, diff, first);
+        return diff == 0;
+    };
+    constexpr unsigned equal_ab = 0x40; // (Cs-Cs)*As + Cd
+    constexpr unsigned zero_fix = 0x64; // (Cs-Cd)*FIX + Cd
+    constexpr unsigned rgb_only_on_fail = 1 | (6 << 1) | (0x40 << 4) | (3 << 12);
+    for (unsigned format : {PSMCT24, PSMCT32}) {
+        if (!check(format, 0x00550fa0, equal_ab, 0x80, 0xa1, 0, false, false) ||
+            !check(format, 0, zero_fix, 0, 0x12, rgb_only_on_fail, false, false) ||
+            !check(format, 0, zero_fix, 0, 0x91, rgb_only_on_fail, false, false) ||
+            !check(format, 0xff000000, equal_ab, 0, 0x62, 0, true, false) ||
+            !check(format, 0, equal_ab, 0, 0x22, 0, false, true) ||
+            !check(format, 0, zero_fix, 0x80, 0x33, 0, false, false)) return 1;
+    }
+    gpu::stats();
+    return 0;
+}
+
+// Alternate unused Z bases to form separate native batches on the same colour
+// attachment. The partial mask forces feedback and makes stale snapshots visible.
+int feedback_snapshot_scene(bool long_run, bool switch_depth, bool geometry = false, bool footprint_overflow = false,
+                            bool multi_ordinary = false) {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(TEST_1, switch_depth ? bits(1, 16) | bits(1, 17) : 0);
+    write(COLCLAMP, 1);
+    write(ALPHA_1, 0x68u | bits(0x80, 32)); // Cs + Cd
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    unsigned sequence = 0;
+    const auto sprite = [&](unsigned x, bool feedback, unsigned width = 8) {
+        ++sequence;
+        write(ZBUF_1, bits((sequence & 1u) ? 32 : 64, 0) | bits(!switch_depth, 32));
+        write(FRAME_1, bits(1, 16) | bits(feedback ? 0x0fu : 0u, 32));
+        write(SCISSOR_1, bits(x, 0) | bits(x + width - 1, 16) | bits(7, 48));
+        write(PRIM, feedback ? 6u | 0x40u : 6u);
+        write(RGBAQ, 0x80030201u + sequence * 0x010101u);
+        write(XYZ2, bits(x * 16, 0));
+        write(XYZ2, bits((x + width) * 16, 0) | bits(8 * 16, 16) | bits(sequence, 32));
+    };
+    std::vector<std::uint8_t> result(kMemorySize);
+    const auto matches = [&] {
+        gpu::download(result.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), result.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "feedback snapshot after sprite %u: %d bytes differ, first at 0x%06zX\n", sequence, diff, first);
+        return diff == 0;
+    };
+    if (geometry) {
+        write(TEST_1, bits(1, 16) | bits(1, 17));
+        write(ALPHA_1, 0x68u | bits(0x80, 32));
+        write(FRAME_1, bits(1, 16) | bits(0x0f, 32));
+        write(SCISSOR_1, bits(63, 16) | bits(63, 48));
+        unsigned triangle_index = 0;
+        const auto triangle = [&](unsigned x, unsigned y, bool lower_right) {
+            ++triangle_index;
+            write(ZBUF_1, bits((triangle_index & 1u) ? 32 : 64, 0));
+            write(PRIM, 3 | 0x40);
+            write(RGBAQ, 0x80030201u + triangle_index * 0x010101u);
+            const auto vertex = [&](unsigned px, unsigned py) {
+                write(XYZ2, bits(px * 16, 0) | bits(py * 16, 16) | bits(triangle_index, 32));
+            };
+            if (lower_right) {
+                vertex(x + 32, y + 32);
+                vertex(x + 32, y + 16);
+                vertex(x + 16, y + 32);
+            } else {
+                vertex(x, y);
+                vertex(x + 32, y);
+                vertex(x, y + 32);
+            }
+        };
+        if (footprint_overflow) {
+            // 160 disjoint primitives exceed DrawRegions' 128-footprint cap
+            // in one draw, exercising its conservative collapse path.
+            for (unsigned i = 0; i < 160; ++i) {
+                const unsigned x = 1 + (i % 16) * 4;
+                const unsigned y = 1 + (i / 16) * 3;
+                ++triangle_index;
+                write(ZBUF_1, bits((triangle_index & 1u) ? 32 : 64, 0));
+                write(PRIM, 3 | 0x40);
+                write(RGBAQ, 0x80030201u + triangle_index * 0x010101u);
+                write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16) | bits(triangle_index, 32));
+                write(XYZ2, bits((x + 2) * 16, 0) | bits(y * 16, 16) | bits(triangle_index, 32));
+                write(XYZ2, bits(x * 16, 0) | bits((y + 2) * 16, 16) | bits(triangle_index, 32));
+            }
+        } else {
+            for (unsigned y = 0; y < 64; y += 32)
+                for (unsigned x = 0; x < 64; x += 32) {
+                    triangle(x, y, false);
+                    triangle(x, y, true);
+                }
+        }
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
+    if (switch_depth) {
+        // Each sprite uses the same colour but a different depth attachment
+        // from the preceding draw. The final fetch reads a just-written pixel.
+        for (unsigned x = 0; x < 48; x += 8) sprite(x, true);
+        sprite(40, true);
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
+    if (multi_ordinary) {
+        sprite(0, true);
+        sprite(24, false);
+        sprite(40, false);
+        sprite(8, true);
+        sprite(32, false);
+        sprite(48, false);
+        sprite(16, true);
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
+    if (long_run) {
+        // More disjoint draws than the encoder retains in one barrier interval.
+        for (unsigned x = 0; x < 48; x += 2) sprite(x, true, 2);
+        sprite(46, false, 2); // write over the last in-place read
+        sprite(46, true, 2);  // now read the ordinary draw's result
+        if (!matches()) return 1;
+        gpu::stats();
+        return 0;
+    }
+    sprite(0, true);
+    sprite(24, false); // clear of the next read: the first two snapshots can share a copy
+    sprite(8, true);
+    sprite(8, true);   // reads the just-written pixels: requires a fresh snapshot
+    sprite(16, true);
+    if (!matches()) return 1;
+    sprite(0, true);
+    sprite(8, false);  // writes the next read: the copy must stay after this draw
+    sprite(8, true);
+    if (!matches()) return 1;
+    gpu::stats();
+    return 0;
+}
+
+// Switch between target reads and a backdrop in one native pass, with
+// depth writes enabled. The first two disjoint triangles share a draw.
+int mixed_feedback_scene(bool blend_by_destination_alpha) {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(FRAME_1, bits(1, 16) | bits(blend_by_destination_alpha ? 0 : 0x0f, 32));
+    write(ZBUF_1, bits(0x1000 / 32, 0) | bits(1, 24));
+    write(TEST_1, bits(1, 16) | bits(2, 17));
+    write(COLCLAMP, 1);
+    // 0x58 is Cs * Ad / 128 + Cd, rounded by the GS integer blend.
+    write(ALPHA_1, blend_by_destination_alpha ? 0x58u : 0x68u | bits(0x80, 32));
+    write(SCISSOR_1, bits(63, 16) | bits(31, 48));
+    upload(0, 1, PSMCT32, 0, 0, 64, 32);
+    const auto vertex = [](unsigned x, unsigned y, unsigned z) {
+        write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16) | bits(z, 32));
+    };
+    write(PRIM, 6 | 0x40);
+    write(RGBAQ, blend_by_destination_alpha ? 0x00030507 : 0x80030507);
+    vertex(0, 0, 1); vertex(32, 16, 1);
+    write(PRIM, 3 | 0x40);
+    write(RGBAQ, blend_by_destination_alpha ? 0xff171301 : 0x80171301);
+    const auto triangle = [&](unsigned x, unsigned z) {
+        vertex(x, 0, z); vertex(x + 8, 0, z); vertex(x, 8, z);
+    };
+    triangle(0, 2);
+    triangle(16, 2);
+    triangle(0, 3);
+    write(PRIM, 6 | 0x40);
+    write(RGBAQ, 0x80220513);
+    vertex(0, 0, 4); vertex(8, 8, 4);
+    vertex(16, 0, 4); vertex(24, 8, 4);
+    std::vector<std::uint8_t> actual(kMemorySize);
+    gpu::download(actual.data());
+    std::size_t first = 0;
+    const int diff = differences(memory(), actual.data(), kMemorySize, first);
+    if (diff) {
+        std::fprintf(stderr, "mixed feedback: %d bytes differ, first at 0x%06zX\n", diff, first);
+        return 1;
+    }
+    gpu::stats();
+    return 0;
+}
+
+// Both sprite vertices can have different RGBAQ values. The second supplies
+// the colour, unless the texture function contributes the fragment alpha.
+int sprite_alpha_scene(bool checkpoints) {
+    write(PRMODECONT, 1);
+    write(XYOFFSET_1, 0);
+    write(SCISSOR_1, bits(191, 16) | bits(127, 48));
+    write(COLCLAMP, 1);
+    write(FRAME_1, bits(3, 16));
+    write(ZBUF_1, bits(0x1000 / 32, 0) | bits(1, 24));
+    write(ALPHA_1, 0x68u | bits(0x80, 32)); // Cs + Cd when blending is enabled
+    upload(0, 3, PSMCT32, 0, 0, 192, 128);
+    upload(0x2000, 1, PSMCT32, 0, 0, 32, 16);
+    unsigned serial = 0;
+    const auto sprite = [&](unsigned x, unsigned alpha) {
+        ++serial;
+        write(RGBAQ, bits(alpha ^ 0xffu, 24));
+        write(UV, 0);
+        write(XYZ2, bits(x * 16, 0) | bits(serial, 32));
+        write(RGBAQ, (0x130501u + serial * 0x010203u) | bits(alpha, 24));
+        write(UV, bits(64 * 16, 0) | bits(128 * 16, 16));
+        write(XYZ2, bits((x + 64) * 16, 0) | bits(128 * 16, 16) | bits(serial, 32));
+    };
+    std::vector<std::uint8_t> actual(kMemorySize);
+    const auto matches = [&] {
+        gpu::download(actual.data());
+        std::size_t first = 0;
+        const int diff = differences(memory(), actual.data(), kMemorySize, first);
+        if (diff) std::fprintf(stderr, "sprite alpha after %u: %d bytes differ, first at 0x%06zX\n", serial, diff, first);
+        return diff == 0;
+    };
+    constexpr unsigned ztest = (1u << 16) | (2u << 17);
+    write(PABE, 1);
+    write(TEST_1, ztest);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        write(PRIM, 6 | 0x40 | (mode ? 0x110 : 0));
+        write(TEX0_1, 0x2000u | bits(1, 14) | bits(5, 26) | bits(4, 30) | bits(mode == 2, 34) | bits(1, 35));
+        write(FBA_1, mode == 1);
+        // Same GS setup throughout this group, including threshold crossings.
+        for (unsigned alpha : {0x7fu, 0x80u, 0u, 0xffu}) {
+            sprite(0, alpha);
+            if (checkpoints && !matches()) return 1;
+        }
+    }
+    write(PABE, 0);
+    write(PRIM, 6);
+    for (unsigned test = 0; test < 8; ++test) {
+        for (unsigned fail = 0; fail < 4; ++fail) {
+            write(TEST_1, ztest | 1u | (test << 1) | (0x80u << 4) | (fail << 12));
+            sprite(0, 0x7f);
+            sprite(64, 0x80);
+            sprite(128, 0x81);
+            if (checkpoints && !matches()) return 1;
+        }
+    }
+    // Texture alpha varies within this sprite, across the reference value.
+    write(PRIM, 6 | 0x110);
+    write(TEST_1, ztest | 1u | (6u << 1) | (0x80u << 4) | (3u << 12));
+    sprite(0, 0xff);
+    if (!matches()) return 1;
+    gpu::stats();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     int scenes = 40;
+    bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
+    bool geometry_feedback = false, footprint_overflow = false, multi_ordinary_feedback = false;
+    bool switch_depth = false, dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (std::strcmp(argv[i], "--sprite-alpha") == 0) sprite_alpha = true;
+        else if (std::strcmp(argv[i], "--sprite-alpha-checkpoints") == 0) sprite_alpha = alpha_checkpoints = true;
+        else if (std::strcmp(argv[i], "--feedback-geometry") == 0) geometry_feedback = true;
+        else if (std::strcmp(argv[i], "--feedback-footprint-overflow") == 0) footprint_overflow = true;
+        else if (std::strcmp(argv[i], "--feedback-multi-ordinary") == 0) multi_ordinary_feedback = true;
+        else if (std::strcmp(argv[i], "--feedback-depth-switch") == 0) switch_depth = true;
+        else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
+        else if (std::strcmp(argv[i], "--dst-alpha-feedback") == 0) dst_alpha_feedback = true;
+        else if (std::strcmp(argv[i], "--mixed-feedback") == 0) mixed_feedback = true;
+        else if (std::strcmp(argv[i], "--feedback-snapshot") == 0) feedback_snapshot = true;
+        else if (std::strcmp(argv[i], "--preserve-rgb") == 0) preserve_rgb = true;
+        else if (std::strcmp(argv[i], "--sprite-copy") == 0) sprite_copy = true;
         else if (std::strcmp(argv[i], "--race") == 0) g_race = true;
         else if (std::strcmp(argv[i], "--against") == 0 && i + 1 < argc) against = argv[++i];
         else if (std::strcmp(argv[i], "--tolerance") == 0 && i + 1 < argc) tolerance = std::atoi(argv[++i]);
@@ -299,6 +635,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no GPU renderer available\n");
         return 77;
     }
+    if (sprite_alpha) return sprite_alpha_scene(alpha_checkpoints);
+    if (sprite_copy) return sprite_copy_scene();
+    if (preserve_rgb) return preserve_rgb_scene();
+    if (feedback_snapshot || long_feedback || switch_depth || geometry_feedback || footprint_overflow || multi_ordinary_feedback)
+        return feedback_snapshot_scene(long_feedback, switch_depth, geometry_feedback || footprint_overflow,
+                                       footprint_overflow, multi_ordinary_feedback);
+    if (mixed_feedback || dst_alpha_feedback) return mixed_feedback_scene(dst_alpha_feedback);
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
     std::FILE *against_file = against ? std::fopen(against, "rb") : nullptr;

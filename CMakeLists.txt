@@ -105,6 +105,9 @@ if(NOT PS2_GPU_RESOLVED STREQUAL "none")
         target_include_directories(ps2runtime PRIVATE "${PS2_WGPU_DIR}/include")
         target_compile_definitions(ps2runtime PUBLIC PS2_GPU_GL)
         if(NINTENDO_SWITCH)
+            # Device A/B testing showed a severe GT4 regression with the decoded cache enabled.
+            # Keep an explicit PS2_DECODE_CACHE=1 override for further profiling.
+            target_compile_definitions(ps2runtime PRIVATE PS2_DECODE_CACHE_DEFAULT_OFF)
             # devkitPro's switch-mesa (Mesa 20.1) by default. PS2_SWITCH_GL=mesa-switch
             # links a newer Mesa port instead (danfromtico/mesa-switch, Mesa 26: nvc0,
             # or Zink on NVK Vulkan), through the CMake package it installs. Its
@@ -147,7 +150,16 @@ endif()
 option(PS2_BUILD_TESTS "Build native synthetic runtime tests (no game data required)" OFF)
 if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
     enable_testing()
-    foreach(name IN ITEMS sif_scratchpad kernel_exit_delete_thread gt3_initialization gt3_state)
+    add_executable(decoded_arena_test tests/decoded_arena_test.cpp)
+    target_include_directories(decoded_arena_test PRIVATE runtime/src)
+    add_test(NAME decoded_arena COMMAND decoded_arena_test)
+    add_executable(gs_path_profile_test tests/gs_path_profile_test.cpp)
+    target_include_directories(gs_path_profile_test PRIVATE runtime/src)
+    add_test(NAME gs_path_profile COMMAND gs_path_profile_test)
+    add_executable(gs_stale_rows_test tests/gs_stale_rows_test.cpp)
+    target_include_directories(gs_stale_rows_test PRIVATE runtime/src)
+    add_test(NAME gs_stale_rows COMMAND gs_stale_rows_test)
+    foreach(name IN ITEMS gs_upload_span sif_scratchpad kernel_exit_delete_thread gt3_initialization gt3_state)
         add_executable(${name}_test tests/${name}_test.cpp)
         target_include_directories(${name}_test PRIVATE runtime/src)
         target_link_libraries(${name}_test PRIVATE ps2runtime)
@@ -164,11 +176,115 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
         # bytes per scene), so this only checks that it runs; compare two GPU
         # renderers with each other through scripts/compare_gpu_backends.sh.
         add_test(NAME gs_gpu_compare COMMAND gs_gpu_compare_test 40)
+        add_test(NAME gs_feedback_snapshot COMMAND gs_gpu_compare_test --feedback-snapshot)
+        set_tests_properties(gs_feedback_snapshot PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
+        if(PS2_GPU_RESOLVED STREQUAL "gl")
+            set_tests_properties(gs_feedback_snapshot PROPERTIES PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
+            foreach(scale IN ITEMS 1 2 3)
+                add_test(NAME gs_sprite_alpha_${scale} COMMAND gs_gpu_compare_test --sprite-alpha)
+                set_tests_properties(gs_sprite_alpha_${scale} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_SCALE=${scale}"
+                    PASS_REGULAR_EXPRESSION "feedback snapshots: 8 copies, 0 merged")
+                add_test(NAME gs_feedback_fetch_${scale} COMMAND gs_gpu_compare_test --dst-alpha-feedback)
+                set_tests_properties(gs_feedback_fetch_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|noncoherent)"
+                    PASS_REGULAR_EXPRESSION "framebuffer fetch: 3 draws, 0 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_fetch_noncoherent_${scale} COMMAND gs_gpu_compare_test --dst-alpha-feedback)
+                set_tests_properties(gs_feedback_fetch_noncoherent_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale};MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
+                    SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
+                    PASS_REGULAR_EXPRESSION "framebuffer fetch: 3 draws, 3 barriers, 1 snapshot copies")
+                add_test(NAME gs_feedback_barrier_geometry_${scale} COMMAND gs_gpu_compare_test --feedback-geometry)
+                set_tests_properties(gs_feedback_barrier_geometry_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 8 draws, 2 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_fetch_geometry_${scale} COMMAND gs_gpu_compare_test --feedback-geometry)
+                set_tests_properties(gs_feedback_fetch_geometry_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale};MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
+                    SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
+                    PASS_REGULAR_EXPRESSION "framebuffer fetch: 8 draws, 1 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_footprint_overflow_${scale} COMMAND gs_gpu_compare_test --feedback-footprint-overflow)
+                set_tests_properties(gs_feedback_footprint_overflow_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 160 draws, 3 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_multi_ordinary_${scale} COMMAND gs_gpu_compare_test --feedback-multi-ordinary)
+                set_tests_properties(gs_feedback_multi_ordinary_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_SCALE=${scale}"
+                    PASS_REGULAR_EXPRESSION "feedback snapshots: 1 copies, 2 merged")
+                add_test(NAME gs_feedback_barrier_depth_switch_${scale} COMMAND gs_gpu_compare_test --feedback-depth-switch)
+                set_tests_properties(gs_feedback_barrier_depth_switch_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 7 draws, 3 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_fetch_depth_switch_${scale} COMMAND gs_gpu_compare_test --feedback-depth-switch)
+                set_tests_properties(gs_feedback_fetch_depth_switch_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale};MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
+                    SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
+                    PASS_REGULAR_EXPRESSION "framebuffer fetch: 7 draws, 2 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_barrier_${scale} COMMAND gs_gpu_compare_test --feedback-snapshot)
+                set_tests_properties(gs_feedback_barrier_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 6 draws, 6 barriers, 0 snapshot copies")
+            endforeach()
+            add_test(NAME gs_feedback_fetch_noncoherent_long COMMAND gs_gpu_compare_test --long-feedback)
+            set_tests_properties(gs_feedback_fetch_noncoherent_long PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
+                SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
+                PASS_REGULAR_EXPRESSION "framebuffer fetch: 25 draws, 2 barriers, 0 snapshot copies")
+            add_test(NAME gs_feedback_fetch_texture_barrier COMMAND gs_gpu_compare_test --long-feedback)
+            set_tests_properties(gs_feedback_fetch_texture_barrier PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;MESA_GL_VERSION_OVERRIDE=4.3;MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch -GL_EXT_shader_framebuffer_fetch_non_coherent"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                PASS_REGULAR_EXPRESSION "in-place feedback: 25 draws, 4 barriers, 0 snapshot copies")
+            add_test(NAME gs_feedback_fetch_fallback COMMAND gs_gpu_compare_test --feedback-snapshot)
+            set_tests_properties(gs_feedback_fetch_fallback PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_GL_FEEDBACK_BARRIER=0;MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch -GL_EXT_shader_framebuffer_fetch_non_coherent"
+                PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
+            add_test(NAME gs_feedback_barrier_long COMMAND gs_gpu_compare_test --long-feedback)
+            set_tests_properties(gs_feedback_barrier_long PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                PASS_REGULAR_EXPRESSION "in-place feedback: 25 draws, 4 barriers, 0 snapshot copies")
+            add_test(NAME gs_feedback_barrier_mixed COMMAND gs_gpu_compare_test --mixed-feedback)
+            set_tests_properties(gs_feedback_barrier_mixed PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                PASS_REGULAR_EXPRESSION "in-place feedback: 3 draws, [0-9]+ barriers, 1 snapshot copies")
+            add_test(NAME gs_feedback_barrier_fallback COMMAND gs_gpu_compare_test --feedback-snapshot)
+            set_tests_properties(gs_feedback_barrier_fallback PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;MESA_GL_VERSION_OVERRIDE=4.3;MESA_EXTENSION_OVERRIDE=-GL_ARB_texture_barrier"
+                SKIP_REGULAR_EXPRESSION "feedback texture barrier: enabled"
+                PASS_REGULAR_EXPRESSION "feedback snapshots: 4 copies, 2 merged")
+        endif()
+        add_test(NAME gs_sprite_alpha_checkpoints COMMAND gs_gpu_compare_test --sprite-alpha-checkpoints)
+        set_tests_properties(gs_sprite_alpha_checkpoints PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME gs_preserve_rgb COMMAND gs_gpu_compare_test --preserve-rgb)
+        set_tests_properties(gs_preserve_rgb PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
+        add_test(NAME gs_sprite_copy COMMAND gs_gpu_compare_test --sprite-copy)
+        add_test(NAME gs_sprite_copy_forced COMMAND gs_gpu_compare_test --sprite-copy)
+        set_tests_properties(gs_sprite_copy_forced PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_NATIVE_SYNC=1")
+        set_tests_properties(gs_sprite_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SMALL=0")
         # GT4's colour correction as it draws it, against the table lookup it is.
         add_executable(gs_gt4_lut_test tests/gs_gt4_lut_test.cpp)
         target_include_directories(gs_gt4_lut_test PRIVATE runtime/src)
         target_link_libraries(gs_gt4_lut_test PRIVATE ps2runtime)
         add_test(NAME gs_gt4_lut COMMAND gs_gt4_lut_test)
+        add_executable(gs_sparse_load_test tests/gs_sparse_load_test.cpp)
+        target_include_directories(gs_sparse_load_test PRIVATE runtime/src)
+        target_link_libraries(gs_sparse_load_test PRIVATE ps2runtime)
+        add_test(NAME gs_sparse_load_off COMMAND gs_sparse_load_test)
+        add_test(NAME gs_sparse_load_on COMMAND gs_sparse_load_test)
+        add_test(NAME gs_sparse_load_forced COMMAND gs_sparse_load_test)
+        add_test(NAME gs_sparse_load_min_gap COMMAND gs_sparse_load_test)
+        add_test(NAME gs_sparse_load_min_gap_forced COMMAND gs_sparse_load_test)
+        set_tests_properties(gs_sparse_load_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SPARSE_LOAD=0")
+        set_tests_properties(gs_sparse_load_on PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SPARSE_LOAD=1")
+        set_tests_properties(gs_sparse_load_min_gap PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SPARSE_LOAD=2")
+        set_tests_properties(gs_sparse_load_min_gap_forced PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SPARSE_LOAD=2;PS2_NATIVE_SYNC=1")
+        set_tests_properties(gs_sparse_load_forced PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_NATIVE_SPARSE_LOAD=1;PS2_NATIVE_SYNC=1")
         set_tests_properties(gs_gt4_lut PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(gs_gpu_compare PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "PS2_COMPARE_MIN_PERCENT=0")
     endif()
