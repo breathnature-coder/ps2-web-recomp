@@ -374,7 +374,7 @@ int preserve_rgb_scene() {
 
 // Alternate unused Z bases to form separate native batches on the same colour
 // attachment. The partial mask forces feedback and makes stale snapshots visible.
-int feedback_snapshot_scene(bool long_run, bool switch_depth, bool geometry = false) {
+int feedback_snapshot_scene(bool long_run, bool switch_depth, bool geometry = false, bool footprint_overflow = false) {
     write(PRMODECONT, 1);
     write(XYOFFSET_1, 0);
     write(TEST_1, switch_depth ? bits(1, 16) | bits(1, 17) : 0);
@@ -424,11 +424,27 @@ int feedback_snapshot_scene(bool long_run, bool switch_depth, bool geometry = fa
                 vertex(x, y + 32);
             }
         };
-        for (unsigned y = 0; y < 64; y += 32)
-            for (unsigned x = 0; x < 64; x += 32) {
-                triangle(x, y, false);
-                triangle(x, y, true);
+        if (footprint_overflow) {
+            // 160 disjoint primitives exceed DrawRegions' 128-footprint cap
+            // in one draw, exercising its conservative collapse path.
+            for (unsigned i = 0; i < 160; ++i) {
+                const unsigned x = 1 + (i % 16) * 4;
+                const unsigned y = 1 + (i / 16) * 3;
+                ++triangle_index;
+                write(ZBUF_1, bits((triangle_index & 1u) ? 32 : 64, 0));
+                write(PRIM, 3 | 0x40);
+                write(RGBAQ, 0x80030201u + triangle_index * 0x010101u);
+                write(XYZ2, bits(x * 16, 0) | bits(y * 16, 16) | bits(triangle_index, 32));
+                write(XYZ2, bits((x + 2) * 16, 0) | bits(y * 16, 16) | bits(triangle_index, 32));
+                write(XYZ2, bits(x * 16, 0) | bits((y + 2) * 16, 16) | bits(triangle_index, 32));
             }
+        } else {
+            for (unsigned y = 0; y < 64; y += 32)
+                for (unsigned x = 0; x < 64; x += 32) {
+                    triangle(x, y, false);
+                    triangle(x, y, true);
+                }
+        }
         if (!matches()) return 1;
         gpu::stats();
         return 0;
@@ -576,7 +592,7 @@ int sprite_alpha_scene(bool checkpoints) {
 int main(int argc, char **argv) {
     int scenes = 40;
     bool sprite_copy = false, preserve_rgb = false, feedback_snapshot = false, mixed_feedback = false;
-    bool geometry_feedback = false, switch_depth = false, dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
+    bool geometry_feedback = false, footprint_overflow = false, switch_depth = false, dst_alpha_feedback = false, long_feedback = false, sprite_alpha = false, alpha_checkpoints = false;
     const char *dump = nullptr, *against = nullptr;
     int tolerance = 2, allow = 64;
     for (int i = 1; i < argc; ++i) {
@@ -584,6 +600,7 @@ int main(int argc, char **argv) {
         else if (std::strcmp(argv[i], "--sprite-alpha") == 0) sprite_alpha = true;
         else if (std::strcmp(argv[i], "--sprite-alpha-checkpoints") == 0) sprite_alpha = alpha_checkpoints = true;
         else if (std::strcmp(argv[i], "--feedback-geometry") == 0) geometry_feedback = true;
+        else if (std::strcmp(argv[i], "--feedback-footprint-overflow") == 0) footprint_overflow = true;
         else if (std::strcmp(argv[i], "--feedback-depth-switch") == 0) switch_depth = true;
         else if (std::strcmp(argv[i], "--long-feedback") == 0) long_feedback = true;
         else if (std::strcmp(argv[i], "--dst-alpha-feedback") == 0) dst_alpha_feedback = true;
@@ -606,7 +623,8 @@ int main(int argc, char **argv) {
     if (sprite_alpha) return sprite_alpha_scene(alpha_checkpoints);
     if (sprite_copy) return sprite_copy_scene();
     if (preserve_rgb) return preserve_rgb_scene();
-    if (feedback_snapshot || long_feedback || switch_depth || geometry_feedback) return feedback_snapshot_scene(long_feedback, switch_depth, geometry_feedback);
+    if (feedback_snapshot || long_feedback || switch_depth || geometry_feedback || footprint_overflow)
+        return feedback_snapshot_scene(long_feedback, switch_depth, geometry_feedback || footprint_overflow, footprint_overflow);
     if (mixed_feedback || dst_alpha_feedback) return mixed_feedback_scene(dst_alpha_feedback);
     std::vector<std::uint8_t> gpu_memory(kMemorySize);
     std::FILE *dump_file = dump ? std::fopen(dump, "wb") : nullptr;
