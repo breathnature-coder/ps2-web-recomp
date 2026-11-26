@@ -194,6 +194,16 @@ if(PS2_BUILD_TESTS AND NOT EMSCRIPTEN AND NOT NINTENDO_SWITCH)
                     ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale};MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
                     SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
                     PASS_REGULAR_EXPRESSION "framebuffer fetch: 3 draws, 3 barriers, 1 snapshot copies")
+                add_test(NAME gs_feedback_barrier_depth_switch_${scale} COMMAND gs_gpu_compare_test --feedback-depth-switch)
+                set_tests_properties(gs_feedback_barrier_depth_switch_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"
+                    SKIP_REGULAR_EXPRESSION "feedback texture barrier: unavailable"
+                    PASS_REGULAR_EXPRESSION "in-place feedback: 7 draws, 3 barriers, 0 snapshot copies")
+                add_test(NAME gs_feedback_fetch_depth_switch_${scale} COMMAND gs_gpu_compare_test --feedback-depth-switch)
+                set_tests_properties(gs_feedback_fetch_depth_switch_${scale} PROPERTIES SKIP_RETURN_CODE 77
+                    ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FRAMEBUFFER_FETCH=1;PS2_SCALE=${scale};MESA_EXTENSION_OVERRIDE=-GL_EXT_shader_framebuffer_fetch"
+                    SKIP_REGULAR_EXPRESSION "framebuffer fetch: (unavailable|coherent)"
+                    PASS_REGULAR_EXPRESSION "framebuffer fetch: 7 draws, 2 barriers, 0 snapshot copies")
                 add_test(NAME gs_feedback_barrier_${scale} COMMAND gs_gpu_compare_test --feedback-snapshot)
                 set_tests_properties(gs_feedback_barrier_${scale} PROPERTIES SKIP_RETURN_CODE 77
                     ENVIRONMENT "PS2_NATIVE_SMALL=0;PS2_GL_FEEDBACK_BARRIER=1;PS2_SCALE=${scale}"

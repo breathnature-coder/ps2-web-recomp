@@ -3082,9 +3082,62 @@ unsigned plan_feedback_snapshot(NativeDraw &copy, std::size_t command, std::size
     return covered;
 }
 
+// Texture feedback dependencies belong to the colour image, even when a
+// depth store or an unrelated compute dispatch separates its render passes.
+struct FeedbackAccess {
+#ifdef PS2_GPU_GL
+    bool enabled = g_in_place_feedback || (g_framebuffer_fetch && !g_coherent_fetch);
+    Surface *color = nullptr;
+    bool unknown_writes = true;
+    DrawRegions writes, reads;
+
+    void barrier(WGPUCommandEncoder enc) {
+        ps2GlFeedbackBarrier(enc);
+        ++g_texture_barriers;
+        unknown_writes = false;
+        writes.count = reads.count = 0;
+    }
+
+    void before_draw(WGPUCommandEncoder enc, const NativeDraw &d) {
+        if ((d.in_place && (unknown_writes || writes.overlaps(d))) || reads.overlaps(d)) barrier(enc);
+        if (!unknown_writes) writes.add(d);
+        if (d.in_place && g_in_place_feedback) {
+            reads.add(d);
+            ++g_in_place_draws;
+        }
+    }
+
+    void finish_reads(WGPUCommandEncoder enc) {
+        if (reads.count) barrier(enc);
+    }
+
+    void before(WGPUCommandEncoder enc, const Command &cmd) {
+        if (!enabled) return;
+        if (cmd.pipeline == kNative) {
+            Surface *next = g_native_passes[cmd.x].color;
+            if (!next || next == color) return;
+            finish_reads(enc);
+            color = next;
+            unknown_writes = true;
+            writes.count = 0;
+        } else if (color && cmd.pipeline == kSurfaceCopy) {
+            const SurfaceCopy &copy = g_surface_copies[cmd.x];
+            if (copy.source == color || copy.destination == color) finish_reads(enc);
+            if (copy.destination == color) unknown_writes = true;
+        } else if (color && cmd.target == color) {
+            // A store samples the colour texture, but does not write to it.
+            finish_reads(enc);
+        }
+    }
+#else
+    void before(WGPUCommandEncoder, const Command &) {}
+    void finish_reads(WGPUCommandEncoder) {}
+#endif
+};
+
 // The render passes of the native renderer from command i on; successive ones on the same targets share a pass.
 // Returns the last command taken.
-std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
+std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge, [[maybe_unused]] FeedbackAccess &access) {
     const NativePass &first = g_native_passes[g_commands[i].x];
     WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     WGPURenderPassDepthStencilAttachment depth = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
@@ -3107,20 +3160,6 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
     float constant = 0.0f;
     std::uint32_t last_x = ~0u, last_y = ~0u, last_w = ~0u, last_h = ~0u;
     WGPUBindGroup feedback_group_bound = nullptr;
-#ifdef PS2_GPU_GL
-    // EXT framebuffer fetch synchronizes earlier writes with subsequently
-    // fetched samples. ARB texture feedback also protects an earlier read
-    // against another write to the same texel within one interval.
-    const bool direct_reads = g_in_place_feedback || (g_framebuffer_fetch && !g_coherent_fetch);
-    bool unknown_writes = true;
-    DrawRegions writes, reads;
-    const auto barrier = [&] {
-        ps2GlFeedbackBarrier(enc);
-        ++g_texture_barriers;
-        unknown_writes = false;
-        writes.count = reads.count = 0;
-    };
-#endif
     unsigned covered_copies = 0;
     for (;;) {
         const auto &draws = g_native_passes[g_commands[i].x].draws;
@@ -3128,7 +3167,7 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
             const auto &d = draws[draw];
             if (!d.pipeline) {
 #ifdef PS2_GPU_GL
-                if (reads.count) barrier();
+                access.finish_reads(enc);
 #endif
                 if (covered_copies) {
                     --covered_copies;
@@ -3196,25 +3235,13 @@ std::size_t encode_native(WGPUCommandEncoder enc, std::size_t i, bool merge) {
                 wgpuRenderPassEncoderSetBlendConstant(rp, &c);
             }
 #ifdef PS2_GPU_GL
-            if (direct_reads) {
-                if ((d.in_place && (unknown_writes || writes.overlaps(d))) ||
-                    reads.overlaps(d))
-                    barrier();
-                if (!unknown_writes) writes.add(d);
-                if (d.in_place && g_in_place_feedback) {
-                    reads.add(d);
-                    ++g_in_place_draws;
-                }
-            }
+            if (access.enabled && first.color) access.before_draw(enc, d);
 #endif
             wgpuRenderPassEncoderDraw(rp, d.vertices, 1, 0, 0);
         }
         if (!merge || !next_native_pass(i, first)) break;
         ++i;
     }
-#ifdef PS2_GPU_GL
-    if (reads.count) barrier();
-#endif
     if (rp) {
         wgpuRenderPassEncoderEnd(rp);
         wgpuRenderPassEncoderRelease(rp);
@@ -3520,15 +3547,17 @@ void profile_submit() {
         wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     std::vector<std::uint32_t> measured_commands;
+    FeedbackAccess access;
     measured_commands.reserve(std::min<std::size_t>(g_commands.size(), kMax));
     for (std::uint32_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        access.before(enc, c);
         if (c.pipeline == kSurfaceCopy) {
             encode_surface_copy(enc, g_surface_copies[c.x]);
             continue;
         }
         if (c.pipeline == kNative) {
-            encode_native(enc, i, false);  // not timed
+            encode_native(enc, i, false, access);  // not timed
             continue;
         }
         WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
@@ -3551,6 +3580,7 @@ void profile_submit() {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
+    access.finish_reads(enc);
     const auto n = static_cast<std::uint32_t>(measured_commands.size());
     if (n) {
         wgpuCommandEncoderResolveQuerySet(enc, g_profile_queries, 0, n * 2, g_profile_resolve, 0);
@@ -3639,9 +3669,11 @@ void submit(WGPUTextureView present_view = nullptr) {
     Pipeline current = kPipelines;
     Surface *bound_target = nullptr;
     ++g_submits;
+    FeedbackAccess access;
     ++g_total_passes;
     for (std::size_t i = 0; i < g_commands.size(); ++i) {
         const Command &c = g_commands[i];
+        access.before(enc, c);
         if (c.pipeline == kNative || c.pipeline == kSurfaceCopy) {
             if (pass) {
                 wgpuComputePassEncoderEnd(pass);
@@ -3649,7 +3681,7 @@ void submit(WGPUTextureView present_view = nullptr) {
                 pass = nullptr;
             }
             if (c.pipeline == kSurfaceCopy) encode_surface_copy(enc, g_surface_copies[c.x]);
-            else i = encode_native(enc, i, true);
+            else i = encode_native(enc, i, true, access);
             continue;
         }
         if (!pass) {
@@ -3678,6 +3710,7 @@ void submit(WGPUTextureView present_view = nullptr) {
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
+    access.finish_reads(enc);
     if (measure && !first_compute_pass) {
         wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
         wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);

@@ -12,7 +12,9 @@ triangles and groups of disjoint sprites when the GL context supports OpenGL
 triangles use snapshots. Draws with disjoint feedback accesses can share one
 barrier interval. The encoder tracks written and sampled rectangles separately.
 When its rectangle list fills, it combines bounds conservatively. Overlap with an in-place read,
-a snapshot copy, or leaving the compatible passes can close the interval.
+a snapshot copy, or a store that samples the colour attachment can close the
+interval. Within one submission, depth-only passes and compute dispatches
+that leave the colour texture alone preserve the tracked rectangles.
 The startup log reports capability selection and
 `--stats` reports in-place draws and barriers per second alongside snapshot
 copies. Compare render time and frame times at the same scene and clocks to
